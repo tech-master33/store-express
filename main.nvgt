@@ -1,0 +1,714 @@
+/* ============================================================================
+   Store Express  -  main.nvgt
+   ----------------------------------------------------------------------------
+   The entry point. Creates the window, builds every module in dependency order,
+   runs the frame loop, dispatches keyboard input, and closes the program
+   cleanly.
+
+   RUN IT WITH:   nvgt.exe main.nvgt
+   from inside this project folder.
+
+   A NOTE ON FRAME PROCESSING
+   --------------------------
+   The design brief asked for an explicit process_game_window() directive each
+   frame to stop the computer freezing. NVGT has no such function: it is not in
+   the 918 page reference, not in the engine binary, and not in any shipped
+   include. The real equivalent, and what the official documentation mandates
+   for every main loop, is wait(5). On the main thread wait() pumps the window
+   and input events, performs incremental garbage collection and refreshes the
+   window, and it yields the CPU. process_frame() below is that pump, wrapped in
+   one named directive so every module calls the same thing and no loop can
+   forget it.
+
+   THE KEY MAP
+   -----------
+   Walking        arrows, relative to the way you are facing; hold Shift to run
+   Turning        Q and E, a quarter turn at a time
+   Enter          use whatever you are standing next to
+   Space          swing the fly swatter, and confirm a hardware setup
+   H              while a device is installing itself, repeat what it wants
+   P              press the portable panic button
+   Shift+P        your phone
+   Backslash      your phone as well
+   G              go-to, a list of every place in the room you are in
+   T              the time            M   the money
+   C              where you are       B   who is in the shop, and what is around
+   Z              overhead camera up and back down
+   Escape         the pause menu
+   F1             the whole key list, read out
+   The debug keys are listed in speak_help() and they all work in any build.
+   ========================================================================= */
+
+/* chip.nvgt comes straight after core.nvgt, and hardware.nvgt directly above
+   mechanics.nvgt: the speech chips need nothing but the config reader and the
+   log, and the devices that use them need the rooms and the clock state. */
+#include "audio.nvgt"
+#include "core.nvgt"
+#include "chip.nvgt"
+#include "rooms.nvgt"
+#include "money.nvgt"
+#include "shop.nvgt"
+#include "staff.nvgt"
+#include "people.nvgt"
+#include "trouble.nvgt"
+#include "hardware.nvgt"
+#include "mechanics.nvgt"
+
+/* ---------------------------------------------------------------- frame pump */
+
+void process_frame() {
+	/* The NVGT frame-processing directive: event pump, incremental GC and
+	   window refresh, with the CPU yielded for 5ms. Never omit this from a
+	   loop on the main thread. */
+	wait(5);
+}
+
+/* ------------------------------------------------------------------ the help */
+
+void speak_help() {
+	say("Store Express controls. "
+		+ "Arrow keys walk relative to the way you are facing. Up is forward, down is back, "
+		+ "left and right step sideways. Hold an arrow to keep walking, and hold shift as well to run. "
+		+ "Q and E turn you left and right, a quarter turn at a time. "
+		+ "G opens go-to, a list of every place in the room. "
+		+ "Enter uses whatever you are standing next to. "
+		+ "Space swings the fly swatter at a shoplifter, three tiles whichever way you are facing. "
+		+ "P presses the panic button, and shift P takes out your phone. Backslash does the same. "
+		+ "T says the time. M says the money, the orders and the next bill. C says where you are. "
+		+ "B says who is in the shop and what is around you. "
+		+ "Z lifts your ears up to the ceiling and back down. Page up and page down change the camera height. "
+		+ "Control comma and control period skip back and forward through the shop's music, and control with the square brackets change its volume. "
+		+ "Escape pauses the game and opens the menu, and the store saves itself when you do. "
+		+ "Enter at the back office terminal opens the manager screens, and the store clock keeps "
+		+ "running while you are in them, so the shop carries on trading behind you. "
+		+ "Once that machine is set up it speaks its own screens and its own answers in its own chip "
+		+ "voice, not in this one, so listen for the machine when you are reading a report off it. "
+		+ "The first time you use that terminal in a store it installs its own speech chip instead, "
+		+ "which counts left and right and wants space to confirm it, and H repeats what it is asking for. "
+		+ "Options in the main menu also lists the sound output devices, which picks the speakers or headphones "
+		+ "the game plays through and remembers the choice in config dot ini. "
+		+ "Each machine has a speech speed line and a pitch line on its own screen - on the manager terminal "
+		+ "itself and on the phone itself - for a player who cannot follow a chip at full speed or cannot "
+		+ "hear its note. Enter on either line opens a page of settings - the speed goes fastest, faster, "
+		+ "normal, slower, very slow, and the pitch goes higher, a little higher, normal, a little lower, "
+		+ "lower, and the machine talks at its normal speed of sixty five per cent until you change it. "
+		+ "Pick one and the machine says what it now sounds like, and each machine switches on and off "
+		+ "with a chime of its own. "
+		+ "F1 repeats this list. "
+		+ "The debug keys are F7 and F8 for the clock back and forward, shift F7 and shift F8 for six in the morning "
+		+ "and ten at night, F11 to send in a shoplifter, control shift R to turn diagnostic logging on or off, "
+		+ "and control F1 to write a diagnostic snapshot to the log.", true);
+}
+
+void speak_intro() {
+	say("Store Express. Main menu. Use up and down to move, Enter to choose, and Escape to go back a page. "
+		+ "New game, load game, options, or exit.", true);
+}
+
+/* ============================================================================
+   THE MAIN MENU
+   ========================================================================== */
+
+const int MM_NEW     = 0;
+const int MM_LOAD    = 1;
+const int MM_OPTIONS = 2;
+const int MM_EXIT    = 3;
+
+int g_mm_page  = 0;      /* 0 the top page, 1 a new game slot, 2 a load slot, 3 options */
+int g_mm_index = 0;
+int g_mm_confirm_slot = -1;
+bool g_intro_done = false;
+
+string mm_slot_label(int slot) {
+	string path = slot_path(slot);
+	if (!file_exists(path)) return "Slot " + slot + ", empty";
+	/* Read the name and the till straight out of the file without disturbing the
+	   slot we are playing. */
+	int keep = g_slot;
+	g_slot = slot;
+	string name = save_get("name", "a store");
+	int cash = save_get_int("cash", 0);
+	g_slot = keep;
+	return "Slot " + slot + ", " + name + ", " + money(cash) + " in the till";
+}
+
+int mm_item_count() {
+	if (g_mm_page == 1 or g_mm_page == 2) return 15;
+	if (g_mm_page == 3) return 5;
+	if (g_mm_page == 4) return audio_device_menu_items();
+	return 4;
+}
+
+string mm_item_label(int index) {
+	if (g_mm_page == 1) return mm_slot_label(index + 1);
+	if (g_mm_page == 2) return mm_slot_label(index + 1);
+	if (g_mm_page == 4) return audio_device_menu_label(index);
+	if (g_mm_page == 3) {
+		if (index == 0) return g_sr_preferred ? "Voice: the screen reader when one is available" : "Voice: the built in voice";
+		if (index == 1) return "Diagnostics are " + (g_diag_enabled ? "on" : "off");
+		if (index == 2) return "Sound output: " + audio_device_summary();
+		if (index == 3) return "Shop behind the menu: " + (g_demo_shop_enabled ? "on" : "off");
+		return "Back";
+	}
+	if (index == MM_NEW) return "New game";
+	if (index == MM_LOAD) return "Load game";
+	if (index == MM_OPTIONS) return "Options";
+	return "Exit";
+}
+
+string mm_title() {
+	if (g_mm_page == 1) return "New game. Pick a slot. Starting over a store cannot be undone";
+	if (g_mm_page == 2) return "Load game. Every slot that holds a store";
+	if (g_mm_page == 3) return "Options";
+	if (g_mm_page == 4) return "Sound output. Pick the device the game plays through";
+	return "Store Express main menu";
+}
+
+/* ---- the sound output device ---------------------------------------------
+   The machine's speakers and headphones, not the player's voice. The list
+   itself is built in audio.nvgt, because it is a fact about the machine rather
+   than about any menu; what belongs here is the page, the keys and the test.
+
+   Picking a device does not immediately commit the player to it. The engine
+   moves, a blip comes out of the left and then the right so they can hear where
+   the sound went, and the choice is only written down when they press space on
+   that same line again. Anything else — escape, or browsing to another line —
+   puts the sound back where it was. A player testing a headset they cannot hear
+   therefore cannot lose their game's audio to it. */
+
+uint g_mm_device_blip_at = 0;
+int  g_mm_device_blip_side = -1;    /* -1 nothing owed, 0 left, 1 right */
+
+void mm_device_sweep_start() {
+	g_mm_device_blip_side = 0;
+	g_mm_device_blip_at = ticks() + 320;
+}
+
+/* Two blips, one to a side. The chip is the only voice in the game that can be
+   panned, so it is what proves which speakers the sound has just moved to. */
+void mm_device_tick() {
+	if (g_mm_device_blip_side < 0 or ticks() < g_mm_device_blip_at) return;
+	chip_beep(CHIP_DEVICE_COMPUTER, (g_mm_device_blip_side == 0) ? -100 : 100, 150, -6.0);
+	if (g_mm_device_blip_side == 0) {
+		g_mm_device_blip_side = 1;
+		g_mm_device_blip_at = ticks() + 460;
+	} else {
+		g_mm_device_blip_side = -1;
+	}
+}
+
+void mm_device_open() {
+	/* Asked for again on the way in, so a headset that was plugged in after the
+	   game started is on the list. */
+	audio_devices_refresh();
+	g_mm_page = 4;
+	g_mm_index = (g_out_device < 0) ? 0 : (g_out_device + 1);
+	if (g_mm_index > audio_device_count()) g_mm_index = 0;
+	out_device_trial_begin();
+	mm_speak_current(true);
+}
+
+/* Leaving without confirming: the sound goes back and nothing is written. */
+void mm_device_leave() {
+	g_mm_device_blip_side = -1;
+	int back = out_device_trial_abandon();
+	if (back != OUT_DEVICE_NONE) say("Back on " + audio_device_label(back) + ". Nothing was changed.", true);
+}
+
+/* Enter on a line of the device page. The same line twice is a confirmation. */
+void mm_device_choose_line() {
+	int choice = audio_device_menu_choice(g_mm_index);
+	if (choice == OUT_DEVICE_BACK) {
+		mm_device_leave();
+		g_mm_page = 3;
+		g_mm_index = 2;
+		mm_speak_current(true);
+		return;
+	}
+	if (choice == out_device_trial_index()) {
+		g_mm_device_blip_side = -1;
+		audio_device_confirm();
+		chip_beep(CHIP_DEVICE_COMPUTER, 0, 90, -10.0);
+		string kept = "Kept. The game plays through " + audio_device_label(choice) + " now, and will again next time.";
+		if (choice < 0) kept += " That follows whatever the system is set to, so a headset plugged in later is picked up by itself.";
+		kept += " " + (g_mm_index + 1) + " of " + mm_item_count() + ".";
+		say(kept, true);
+		return;
+	}
+	if (!audio_device_try(choice)) {
+		say("The machine would not open " + audio_device_label(choice) + ", so nothing has changed. You are still on "
+			+ audio_device_label(g_out_device) + ".", true);
+		return;
+	}
+	chip_beep(CHIP_DEVICE_COMPUTER, 0, 90, -12.0);
+	mm_device_sweep_start();
+	string trying = "Trying " + audio_device_label(choice) + ". Listen: a blip on the left, then one on the right. ";
+	trying += "Press space again to keep it, or escape and the game goes back to ";
+	trying += (g_out_device_home < 0) ? "the system default" : audio_device_label(g_out_device_home);
+	trying += ". " + (g_mm_index + 1) + " of " + mm_item_count() + ".";
+	say(trying, true);
+}
+
+void mm_speak_current(bool with_title) {
+	int n = mm_item_count();
+	if (g_mm_index >= n) g_mm_index = n - 1;
+	if (g_mm_index < 0) g_mm_index = 0;
+	string prefix = with_title ? (mm_title() + ". ") : "";
+	say(prefix + mm_item_label(g_mm_index) + " " + (g_mm_index + 1) + " of " + n + ".", true);
+}
+
+void mm_choose() {
+	if (g_mm_page == 0) {
+		if (g_mm_index == MM_NEW) { g_mm_page = 1; g_mm_index = 0; mm_speak_current(true); return; }
+		if (g_mm_index == MM_LOAD) { g_mm_page = 2; g_mm_index = 0; mm_speak_current(true); return; }
+		if (g_mm_index == MM_OPTIONS) { g_mm_page = 3; g_mm_index = 0; mm_speak_current(true); return; }
+		request_quit = true;
+		return;
+	}
+	if (g_mm_page == 1) {
+		int slot = g_mm_index + 1;
+		if (file_exists(slot_path(slot))) {
+			say("Slot " + slot + " already holds a store. Press Enter again to start over the top of it, "
+				+ "or Escape to go back. Starting over cannot be undone.", true);
+			/* A second press on the same slot confirms it, so a slip of the finger
+			   is recoverable. */
+			if (g_mm_confirm_slot == slot) {
+				new_game_in(slot);
+				g_mm_page = 0;
+				return;
+			}
+			g_mm_confirm_slot = slot;
+			return;
+		}
+		new_game_in(slot);
+		g_mm_page = 0;
+		return;
+	}
+	if (g_mm_page == 2) {
+		int slot = g_mm_index + 1;
+		load_game_from(slot);
+		if (g_game_mode) g_mm_page = 0;
+		return;
+	}
+	if (g_mm_page == 3) {
+		if (g_mm_index == 0) { g_sr_preferred = !g_sr_preferred; mm_speak_current(false); return; }
+		if (g_mm_index == 1) { g_diag_enabled = !g_diag_enabled; mm_speak_current(false); return; }
+		if (g_mm_index == 2) { mm_device_open(); return; }
+		if (g_mm_index == 3) {
+			/* A shop that plays while the menu is up is a good demonstration and
+			   a bad neighbour for a player reading the menu with a screen
+			   reader, so it has a switch, and the switch is remembered. */
+			g_demo_shop_enabled = !g_demo_shop_enabled;
+			config_value_save("menu_demo_shop", g_demo_shop_enabled ? "1" : "0");
+			mm_speak_current(false);
+			return;
+		}
+		g_mm_page = 0;
+		g_mm_index = 0;
+		mm_speak_current(true);
+		return;
+	}
+	if (g_mm_page == 4) { mm_device_choose_line(); return; }
+}
+
+void handle_main_menu_keys() {
+	/* Browsing off a device that is on trial puts the sound back where it was:
+	   a device the player never confirmed is never the one they keep. */
+	if (g_mm_page == 4 and (key_pressed(KEY_UP) or key_pressed(KEY_DOWN) or key_pressed(KEY_PAGEUP)
+		or key_pressed(KEY_PAGEDOWN) or key_pressed(KEY_HOME) or key_pressed(KEY_END))) {
+		mm_device_leave();
+	}
+	if (key_pressed(KEY_UP))   { g_mm_index--; if (g_mm_index < 0) g_mm_index = mm_item_count() - 1; g_mm_confirm_slot = -1; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_DOWN)) { g_mm_index++; if (g_mm_index >= mm_item_count()) g_mm_index = 0; g_mm_confirm_slot = -1; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_PAGEUP))   { g_mm_index -= 10; if (g_mm_index < 0) g_mm_index = 0; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_PAGEDOWN)) { g_mm_index += 10; if (g_mm_index >= mm_item_count()) g_mm_index = mm_item_count() - 1; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_HOME)) { g_mm_index = 0; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_END))  { g_mm_index = mm_item_count() - 1; sfx_tick(); mm_speak_current(false); return; }
+	if (key_pressed(KEY_RETURN) or key_pressed(KEY_SPACE)) { mm_choose(); return; }
+	if (key_pressed(KEY_ESCAPE)) {
+		if (g_mm_page == 0) { g_mm_index = MM_EXIT; mm_speak_current(false); return; }
+		if (g_mm_page == 4) mm_device_leave();   /* a trial does not survive escape */
+		g_mm_page = 0;
+		g_mm_index = 0;
+		g_mm_confirm_slot = -1;
+		mm_speak_current(true);
+		return;
+	}
+}
+
+/* ============================================================================
+   DIAGNOSTIC AND DEBUG KEYS  (these work in every state)
+   ========================================================================== */
+
+void handle_universal_keys() {
+	/* Ctrl+Shift+R toggles diagnostic logging. */
+	if (key_down(KEY_LCTRL) and key_down(KEY_LSHIFT) and key_pressed(KEY_R)) {
+		g_diag_enabled = !g_diag_enabled;
+		sfx_ui(A("register.ogg"), -10.0, 700);
+		if (g_diag_enabled) {
+			log_line("diag", "diagnostic logging ON");
+			say("Diagnostic logging on. Everything spoken and every sound cue is now written to logs slash speech dot log.", true);
+		} else {
+			log_line("diag", "diagnostic logging OFF");
+			say("Diagnostic logging off.", true);
+		}
+		return;
+	}
+
+	/* Ctrl+F1 writes a one-shot snapshot to the log. */
+	if (key_down(KEY_LCTRL) and key_pressed(KEY_F1)) {
+		int customers = people_in_shop();
+		log_line("snapshot", "----- state snapshot -----");
+		log_line("snapshot", "store: " + g_store_name + " in slot " + g_slot);
+		log_line("snapshot", "room: " + room_name(g_player_room) + " at " + num1(g_px) + "," + num1(g_py)
+			+ " facing " + facing_word());
+		log_line("snapshot", "clock: " + clock_full_text() + " (paused=" + (clock_is_paused() ? "yes" : "no") + ")");
+		log_line("snapshot", "till: " + money(g_cash) + " arrears: " + money(g_arrears) + " stage " + g_bill_stage);
+		log_line("snapshot", "week: sales " + money(g_wk_sales) + " stock " + money(g_wk_stock)
+			+ " wages " + money(g_wk_wages) + " profit " + money(money_week_profit()));
+		log_line("snapshot", "catalogue: " + g_catalog.length() + " lines, empty "
+			+ shop_out_of_stock_lines() + ", draft " + money(shop_draft_total())
+			+ " in " + shop_order_count() + " placed orders");
+		log_line("snapshot", "staff: " + staff_count() + " employed, " + g_applicants.length()
+			+ " applicants, wages so far " + money(g_wk_wages));
+		log_line("snapshot", "customers: " + customers + " in the shop, queue " + people_queue_length()
+			+ ", reputation " + num1(g_reputation));
+		log_line("snapshot", "reviews: " + g_reviews.length() + " mess: " + g_mess.length()
+			+ " damaged displays: " + trouble_damaged_count());
+		log_line("snapshot", "licence: suspended=" + (g_licence_suspended ? "yes" : "no")
+			+ " bad inspections " + g_bad_inspections + " unscanned " + g_unscanned_sales
+			+ " id scans " + g_id_scans_logged);
+		log_line("snapshot", "police: calls " + g_police_calls + " false alarms " + g_false_alarms
+			+ " fines " + money(g_fines_owed) + " jail=" + (g_in_jail ? "yes" : "no"));
+		log_line("snapshot", "power: " + (g_power_on ? "on" : "off") + " beacons: " + g_beacons.length()
+			+ " voice remote: " + (g_voice_remote ? "yes" : "no")
+			+ " lines spoken: " + g_lines_to_player + " to the player, " + g_lines_to_people + " to the people");
+		log_line("snapshot", "----- end snapshot -----");
+		sfx_ui(A("register.ogg"), -10.0, 700);
+		say("Diagnostic snapshot written.", true);
+		return;
+	}
+
+	/* F1 repeats the control list. */
+	if (key_pressed(KEY_F1) and !key_down(KEY_LCTRL)) { sfx_ui(A("register.ogg"), -12.0, 700); speak_help(); return; }
+
+	if (!g_game_mode) return;
+
+	/* ---- debug keys --------------------------------------------------- */
+	if (key_pressed(KEY_F7)) {
+		if (key_down(KEY_LSHIFT)) { g_current_hour = 6; g_current_minute = 0; }
+		else { int h = int(g_current_hour) - 1; if (h < 0) h = 23; g_current_hour = uint(h); }
+		clock_announce();
+		return;
+	}
+	if (key_pressed(KEY_F8)) {
+		if (key_down(KEY_LSHIFT)) { g_current_hour = 22; g_current_minute = 0; }
+		else { int h = int(g_current_hour) + 1; if (h > 23) h = 0; g_current_hour = uint(h); }
+		clock_announce();
+		return;
+	}
+	if (key_pressed(KEY_F11) and !key_down(KEY_LSHIFT)) {
+		say("Sending in a shoplifter.", true);
+		people_spawn(ARCH_TEENAGER);
+		int last = int(g_customers.length()) - 1;
+		if (last >= 0) {
+			g_customers[last].shoplifter = true;
+			g_customers[last].rustled = true;
+		}
+		return;
+	}
+}
+
+/* ============================================================================
+   GO-TO  (the G key)
+   ========================================================================== */
+
+bool  g_goto_menu = false;
+int   g_goto_index = 0;
+
+void goto_speak_current() {
+	if (g_goto.length() == 0) { g_goto_menu = false; return; }
+	if (g_goto_index < 0) g_goto_index = 0;
+	if (uint(g_goto_index) >= g_goto.length()) g_goto_index = int(g_goto.length()) - 1;
+	goto_rec@ g = g_goto[g_goto_index];
+	int d = int(dist(g.x, g.y, g_px, g_py) + 0.5);
+	string extra = g.is_portal ? (", a doorway, press " + key_towards(g.x - g_px, g.y - g_py)) : "";
+	say(g.label + ", " + dir_word(g.x - g_px, g.y - g_py) + ", " + tiles_away(d) + extra
+		+ ". " + (g_goto_index + 1) + " of " + g_goto.length() + ".", true);
+}
+
+void goto_menu_open() {
+	goto_build();
+	if (g_goto.length() == 0) { say("There is nowhere to go in this room.", true); return; }
+	g_goto_menu = true;
+	g_goto_index = 0;
+	goto_speak_current();
+}
+
+void handle_goto_keys() {
+	if (key_pressed(KEY_UP)) { g_goto_index--; if (g_goto_index < 0) g_goto_index = int(g_goto.length()) - 1; goto_speak_current(); return; }
+	if (key_pressed(KEY_DOWN)) { g_goto_index++; if (uint(g_goto_index) >= g_goto.length()) g_goto_index = 0; goto_speak_current(); return; }
+	if (key_pressed(KEY_RETURN)) {
+		goto_rec@ g = g_goto[g_goto_index];
+		g_goto_menu = false;
+		goto_start(g.x, g.y, g.label);
+		return;
+	}
+	if (key_pressed(KEY_ESCAPE) or key_pressed(KEY_G)) { g_goto_menu = false; say("Cancelled.", true); return; }
+}
+
+/* ============================================================================
+   THE SHOP: WALKING AND THE WORLD KEYS
+   ========================================================================== */
+
+uint g_move_repeat_at = 0;
+
+/* The camera has the arrows while it is up. It flies on the horizontal plane,
+   and hugs the floor when it runs out of room. */
+bool cam_key(uint key, float dx, float dy) {
+	if (key_pressed(key)) {
+		rooms_camera_move(dx, dy);
+		g_move_repeat_at = ticks() + 220;
+		return true;
+	}
+	if (key_down(key) and ticks() >= g_move_repeat_at) {
+		rooms_camera_move(dx, dy);
+		g_move_repeat_at = ticks() + 110;
+		return true;
+	}
+	return false;
+}
+
+/* One tap steps once; holding the key keeps walking, and shift runs. */
+bool step_key(uint key, int which) {
+	if (key_pressed(key)) {
+		rooms_step(which);
+		g_move_repeat_at = ticks() + (key_down(KEY_LSHIFT) ? 110 : 280);
+		return true;
+	}
+	if (key_down(key) and ticks() >= g_move_repeat_at) {
+		rooms_step(which);
+		g_move_repeat_at = ticks() + (key_down(KEY_LSHIFT) ? 70 : 150);
+		return true;
+	}
+	return false;
+}
+
+void world_money_report() {
+	say(money_status_text() + " " + shop_orders_text(), true);
+}
+
+void world_who_report() {
+	people_scan_occupancy();
+	rooms_scan();
+}
+
+void handle_world_keys() {
+	/* Any deliberate key stops a go-to walk. Without this the very next frame
+	   would cancel the walk it had just started. */
+	if (g_walking) {
+		if (key_pressed(KEY_UP) or key_pressed(KEY_DOWN) or key_pressed(KEY_LEFT) or key_pressed(KEY_RIGHT)
+			or key_pressed(KEY_Q) or key_pressed(KEY_E) or key_pressed(KEY_SPACE) or key_pressed(KEY_RETURN)
+			or key_pressed(KEY_ESCAPE)) {
+			goto_stop("You stop.");
+			return;
+		}
+		return;
+	}
+
+	if (key_pressed(KEY_ESCAPE)) { open_pause(); return; }
+
+	/* The shop's speakers, anywhere in the shop: control with comma and period
+	   skip back and forward, control with the brackets change the volume. These
+	   come before everything else so they work while the go-to list is open, the
+	   way the reference game's music keys do, and they never touch the screen
+	   reader. */
+	if (key_down(KEY_LCTRL) and key_pressed(KEY_PERIOD)) { music_play_next(); say("Playing " + music_now_text() + ".", true); return; }
+	if (key_down(KEY_LCTRL) and key_pressed(KEY_COMMA))  { music_play_prev(); say("Playing " + music_now_text() + ".", true); return; }
+	if (key_down(KEY_LCTRL) and key_pressed(KEY_RIGHTBRACKET)) {
+		g_music_volume += 5; if (g_music_volume > 200) g_music_volume = 200;
+		music_apply(); say("Music at " + g_music_volume + " percent.", true); return;
+	}
+	if (key_down(KEY_LCTRL) and key_pressed(KEY_LEFTBRACKET)) {
+		g_music_volume -= 5; if (g_music_volume < 0) g_music_volume = 0;
+		music_apply(); say("Music at " + g_music_volume + " percent.", true); return;
+	}
+
+	if (g_game_over) {
+		if (key_pressed(KEY_RETURN)) {
+			say("The game is over. " + g_game_over_reason
+				+ " Escape opens the menu, where you can start a new store or load a save.", true);
+		}
+		return;
+	}
+
+	if (g_in_jail) {
+		if (key_pressed(KEY_RETURN)) {
+			say("Day " + g_jail_days_served + " of " + g_jail_days_total + ". "
+				+ staff_count() + " staff remain, the till holds " + money(g_cash) + ".", true);
+		}
+		return;
+	}
+
+	if (key_pressed(KEY_Q)) { face_turn(-1); say("You turn to face " + facing_word() + ".", true); return; }
+	if (key_pressed(KEY_E)) { face_turn(1);  say("You turn to face " + facing_word() + ".", true); return; }
+
+	if (key_pressed(KEY_G)) { goto_menu_open(); return; }
+
+	if (key_pressed(KEY_Z)) { rooms_camera_toggle(); return; }
+
+	if (g_cam_up) {
+		if (cam_key(KEY_UP, 0.0, 1.0)) return;
+		if (cam_key(KEY_DOWN, 0.0, -1.0)) return;
+		if (cam_key(KEY_LEFT, -1.0, 0.0)) return;
+		if (cam_key(KEY_RIGHT, 1.0, 0.0)) return;
+		if (key_pressed(KEY_PAGEUP))   { rooms_camera_height(key_down(KEY_LSHIFT) ? 0.1 : 1.0); return; }
+		if (key_pressed(KEY_PAGEDOWN)) { rooms_camera_height(key_down(KEY_LSHIFT) ? -0.1 : -1.0); return; }
+		if (key_pressed(KEY_HOME)) { rooms_camera_center(); return; }
+		if (key_pressed(KEY_COMMA) or key_pressed(KEY_PERIOD)) {
+			say("Following a person with the camera is not in this build. Use the arrows to fly it, "
+				+ "and page up and page down for the height.", true);
+			return;
+		}
+		return;
+	}
+
+	if (step_key(KEY_UP, 0)) return;
+	if (step_key(KEY_DOWN, 1)) return;
+	if (step_key(KEY_LEFT, 2)) return;
+	if (step_key(KEY_RIGHT, 3)) return;
+
+	if (key_pressed(KEY_SPACE)) { trouble_swat(); return; }
+	/* Shift+P is the phone, plain P is the panic button. The shift has to be
+	   asked first: key_pressed(P) is true with shift held as well. */
+	if (key_down(KEY_LSHIFT) and key_pressed(KEY_P)) { open_phone(); return; }
+	if (key_pressed(KEY_P)) { trouble_panic(); return; }
+	if (key_pressed(KEY_RETURN)) { mechanics_interact(); return; }
+	if (key_pressed(KEY_BACKSLASH)) { open_phone(); return; }
+	if (key_pressed(KEY_T)) { clock_announce(); return; }
+	if (key_pressed(KEY_M)) { world_money_report(); return; }
+	if (key_pressed(KEY_C)) { rooms_where(); return; }
+	if (key_pressed(KEY_B)) { world_who_report(); return; }
+}
+
+void handle_modal_keys() {
+	/* A device installing itself owns the screen and does not behave like a
+	   menu: it takes space, escape does nothing, and H repeats the instruction. */
+	if (g_modal == MODAL_HARDWARE) { hardware_keys(); return; }
+	if (key_pressed(KEY_UP))   { menu_move(-1); return; }
+	if (key_pressed(KEY_DOWN)) { menu_move(1); return; }
+	if (key_pressed(KEY_PAGEUP))   { menu_jump(-10); return; }
+	if (key_pressed(KEY_PAGEDOWN)) { menu_jump(10); return; }
+	if (key_pressed(KEY_HOME)) { menu_jump(-9999); return; }
+	if (key_pressed(KEY_END))  { menu_jump(9999); return; }
+	if (key_pressed(KEY_RETURN) or key_pressed(KEY_SPACE)) { menu_select(); return; }
+	if (key_pressed(KEY_ESCAPE)) {
+		if (g_modal == MODAL_PAUSE) { mechanics_close_modal(); say("Back to the shop.", true); return; }
+		if (g_modal == MODAL_SLEEP) { mechanics_close_modal(); say("Not yet, then.", true); return; }
+		menu_back();
+		return;
+	}
+}
+
+/* ============================================================================
+   MAIN
+   ========================================================================== */
+
+void main() {
+	/* Create the working folders before anything tries to write to them. */
+	ensure_all_dirs();
+	log_line("main", "Store Express process starting");
+
+	/* show_window returns a game_window handle rather than a bool, despite what
+	   the reference page says. Without a window there is no keyboard input, so
+	   there is no game. */
+	game_window@ win = show_window("Store Express");
+	if (@win is null) {
+		log_line("main", "FATAL: the window could not be created");
+		say_local("Store Express could not create its window, so it cannot run.", true);
+		return;
+	}
+
+	cfg_load(CONFIG_FILE);
+	g_diag_enabled = cfg_bool("diagnostics_default", false);
+	g_minutes_per_second = cfg_double("minutes_per_real_second", MINUTES_PER_REAL_SECOND);
+	log_line("main", "window created, config loaded");
+
+	/* Everything is built once, in strict dependency order, and it stays built.
+	   Starting or loading a game resets state rather than rebuilding, because
+	   rooms_init() registers the ambient beacons. */
+	audio_device_apply_configured();  /* the speakers the player picked last time */
+	audio_field_init();      /* the sound pool and room gain table */
+	mechanics_init();        /* menus, modals, the slot number */
+	shop_init();             /* the catalogue and the shelves */
+	staff_init();            /* nobody employed */
+	people_init();           /* nobody in the shop */
+	rooms_init();            /* the world, then the beacons */
+	trouble_init();          /* damages cleared, police record empty */
+	log_line("main", "world ready: " + room_name(g_player_room) + " with " + g_catalog.length()
+		+ " products across " + FACE_COUNT + " faces");
+	voice_init();            /* probes the voice server, speaks the fallback if needed */
+	log_line("main", "voice ready, remote=" + (g_voice_remote ? "yes" : "no"));
+	assets_bootstrap_start();/* the paced, non-blocking audio download */
+
+	log_line("main", "Store Express started on " + PLATFORM_DISPLAY_NAME);
+
+	uint last = ticks();
+	while (true) {
+		uint now = ticks();
+		double dt = double(int(now - last));
+		last = now;
+
+		handle_universal_keys();
+
+		/* Audio downloading runs alongside everything else and never takes the
+		   keyboard away. It used to own the whole loop while it ran, which meant a
+		   launch that had recordings to fetch ignored every key but Escape for up
+		   to two and a half minutes and looked like a hang. */
+		if (g_boot_state == BOOT_RUNNING) assets_bootstrap_step();
+
+		/* The shop behind the main menu plays while the menu is up, and this call is
+		   outside the menu branch on purpose: it is what stops it the moment a
+		   store is started or loaded. */
+		demo_shop_tick();
+
+		if (!g_intro_done) { g_intro_done = true; speak_intro(); }
+		if (!g_game_mode) {
+			if (g_boot_state == BOOT_IDLE) assets_bootstrap_step();
+			handle_main_menu_keys();
+			mm_device_tick();   /* the two blips that test a device on trial */
+		} else if (g_goto_menu) {
+			handle_goto_keys();
+		} else if (g_modal != MODAL_NONE) {
+			handle_modal_keys();
+		} else {
+			handle_world_keys();
+		}
+
+		/* A go-to walk takes one step per frame. */
+		if (g_game_mode and g_modal == MODAL_NONE and !g_goto_menu and !g_walking) { /* idle */ }
+		if (g_game_mode and g_modal == MODAL_NONE and !g_goto_menu) goto_tick();
+
+		mechanics_update(dt);
+		speech_update();      /* fetch and play the next spoken line, without blocking */
+		voice_local_update(); /* this computer's voices, when the worker lands */
+
+		/* The ears follow the body, unless the overhead camera has them. */
+		float lx = 0.0, ly = 0.0, lz = 0.0;
+		double lrot = 0.0;
+		int lroom = ROOM_SHOP;
+		rooms_listener(lx, ly, lz, lrot, lroom);
+		audio_update(lx, ly, lz, lrot, lroom);
+
+		if (request_quit) break;
+		process_frame();
+	}
+
+	/* ------------------------------------------------- clean shutdown ------ */
+	stop_all_speech();
+	save_game(true);
+	music_stop();
+	log_line("main", "Store Express closed");
+	audio_shutdown();
+	exit(0);
+}

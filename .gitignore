@@ -1,0 +1,20 @@
+# Runtime output - regenerated every session
+logs/
+cache/
+
+# Player saves and their backups. A store is never committed.
+saves/
+
+# Audio downloaded at runtime by the asset bootstrap.
+# assets/placeholder/ is generated and committed instead.
+assets/*.ogg
+assets/*.mp3
+assets/*.wav
+
+# Compiled NVGT products. These SHADOW the source script with the same
+# basename, so a stale one makes your edits look like they did nothing.
+*.zip
+/main.exe
+
+# Freebuff project metadata, not part of the game.
+.freebuff/

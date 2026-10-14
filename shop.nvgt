@@ -1,0 +1,877 @@
+/* ============================================================================
+   Store Express  -  shop.nvgt
+   ----------------------------------------------------------------------------
+   The shop itself: what is on the shelves, what it costs, what it sells for, and
+   how it gets there.
+
+     * The catalogue. Every product has a name, a tagline, a category, a
+       wholesale cost, a fair price that people round here expect to pay, a shelf
+       price that you choose, and a stock count.
+     * Twenty shelf faces across ten aisles, plus the restricted goods behind the
+       counter. Each face is a separate run of shelves with its own stock.
+     * Ordering: a draft order you build on the computer, paid for the moment you
+       place it, arriving on the Monday truck.
+     * The market. Wholesale costs move weekly, category by category, plus the
+       odd shock, and a story in the local news usually comes first.
+     * Pricing, one product at a time, a whole face, or everything at once, with
+       a warning whenever a price is at or below what it costs you.
+     * The reports the computer reads out: sales, stock levels, what is empty,
+       best and worst rows, and how prices compare against the market.
+
+   INCLUDE ORDER
+     Included after money.nvgt. It never calls into staff, people, trouble,
+     mechanics or main.
+
+   WHY PRODUCTS ARE INDEXED
+     Every product has one global index, and every table that needs to talk about
+     products (the draft order, a customer's basket, the till log) uses that index
+     rather than a name. That keeps basket math and save files small and exact.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS
+   ========================================================================= */
+
+const int FACE_COUNT = 20;           // ten aisles times two faces
+const int FACE_COUNTER = -1;         // the restricted goods behind the counter
+
+/* How much over the fair price people will put up with before they notice. */
+const int PRICE_TOLERANCE_PCT = 15;
+
+const int TRUCK_MINUTE = 6 * 60 + 30;    // Monday, half past six in the morning
+
+/* ==========================================================================
+   2.  THE PRODUCT
+   ========================================================================= */
+
+class product {
+	string name;
+	string tagline;
+	string category;
+	int    cost;         // what Ridgeline Wholesale charges you today, in cents
+	int    fair;         // what people round here expect to pay
+	int    price;        // your shelf price
+	int    opening_cost; // what it cost when the shop opened, the market baseline
+	int    stock;
+	int    capacity;
+	int    sold_since_delivery;
+	int    revenue_since_delivery;
+	int    face;         // index into the twenty faces, or FACE_COUNTER
+	bool   restricted;   // beer, wine, spirits, tobacco and vapes
+	product(const string&in n, const string&in t, const string&in c, int co, int fa, int fc, bool r) {
+		name = n; tagline = t; category = c;
+		cost = co; opening_cost = co; fair = fa; price = fa;
+		stock = 0; capacity = 0; sold_since_delivery = 0; revenue_since_delivery = 0;
+		face = fc; restricted = r;
+	}
+}
+
+array<product@> g_catalog;
+
+product@ product_at(int index) {
+	if (index < 0 or uint(index) >= g_catalog.length()) return null;
+	return g_catalog[index];
+}
+
+/* Round the fair price to the nearest five cents, which is how the reference
+   prices a shelf: no one charges $2.47 for crisps. */
+int fair_from_cost(int cost) {
+	int raw = (cost * 155) / 100;
+	return ((raw + 2) / 5) * 5;
+}
+
+/* How far above what people expect your price is, as a percentage. */
+int shop_price_over_fair(int index) {
+	product@ p = product_at(index);
+	if (@p is null or p.fair <= 0) return 0;
+	return ((p.price - p.fair) * 100) / p.fair;
+}
+
+/* True when the price is at or below what the stock cost you, which is a way to
+   go broke politely. */
+bool shop_below_cost(int index) {
+	product@ p = product_at(index);
+	if (@p is null) return false;
+	return p.price <= p.cost;
+}
+
+/* ==========================================================================
+   3.  BUILDING THE CATALOGUE
+   ========================================================================= */
+
+const int PRICE_RESTRICTED = -1;      // marker, not a price
+
+void shop_add(const string&in name, const string&in tagline, const string&in category,
+              int cost, int face, bool restricted) {
+	product@ p = product(name, tagline, category, cost, fair_from_cost(cost), face, restricted);
+	/* Shelf capacity varies a little per line so that the shelves do not all run
+	   out on the same afternoon. */
+	p.capacity = 12 + (int(g_catalog.length()) % 7) * 4;
+	p.stock = p.capacity;
+	g_catalog.insert_last(p);
+}
+
+/* The twenty faces, six products each, and the eight lines behind the counter.
+   Every brand is a joke and every product has a tagline. */
+void catalog_build() {
+	g_catalog.resize(0);
+
+	/* ---- aisle 1 west: crisps and corn snacks ---------------------------- */
+	int f = 0;
+	shop_add("Bag O Air Kettle Chips", "Nine crisps, sold in a cushion of premium nitrogen", "crisps", 92, f, false);
+	shop_add("Crisp Packet Mostly Air", "The full recommended daily allowance of disappointment", "crisps", 85, f, false);
+	shop_add("Big Triangle Nacho Chips", "Structurally sound until the exact moment you dip", "crisps", 118, f, false);
+	shop_add("Ready Salted Regret", "You will eat the whole bag. You always do", "crisps", 80, f, false);
+	shop_add("Flaming Meteor Crisps", "Bold enough to be legally a load bearing snack", "crisps", 132, f, false);
+	shop_add("Salt and Vinegar Weather", "One bag, three weather events", "crisps", 96, f, false);
+
+	/* ---- aisle 1 east: nuts, pretzels and jerky -------------------------- */
+	f = 1;
+	shop_add("Salted Peanuts, Family Size", "Goes in a bowl, never makes it to the bowl", "nuts", 165, f, false);
+	shop_add("Dry Roast Almonds", "Almost a health food, if you squint", "nuts", 245, f, false);
+	shop_add("Twisty Pretzel Knots", "The salty shape of your regret", "pretzels", 145, f, false);
+	shop_add("Beefy Trail Jerky", "A cow was consulted at some point in production", "jerky", 298, f, false);
+	shop_add("Teriyaki Road Jerky", "Tastes of the petrol station it was bought at", "jerky", 310, f, false);
+	shop_add("Wasabi Pea Crunch", "A dare in snack form", "snacks", 188, f, false);
+
+	/* ---- aisle 2 west: chocolate ---------------------------------------- */
+	f = 2;
+	shop_add("Chocolate Bar, Standard Issue", "The one you buy without thinking", "chocolate", 118, f, false);
+	shop_add("Biscuit Caramel Log", "Sticky at every temperature known to retail", "chocolate", 142, f, false);
+	shop_add("Extra Thick Dark Bar", "Seventy percent cocoa, one hundred percent price", "chocolate", 205, f, false);
+	shop_add("Hazelnut Whole Nut Block", "Contains nuts. Also contains the good bits", "chocolate", 188, f, false);
+	shop_add("Sharing Bag of Squares", "Nobody shares these", "chocolate", 265, f, false);
+	shop_add("Chocolate Coins in a Net", "Money you can eat. Almost", "chocolate", 165, f, false);
+
+	/* ---- aisle 2 east: sweets and gum ----------------------------------- */
+	f = 3;
+	shop_add("Fruity Chew Pack", "Flavours the fruit did not consent to", "sweets", 92, f, false);
+	shop_add("Mint Gum Five Strip", "For the drive home, and for the interview", "gum", 108, f, false);
+	shop_add("Sour Rainbow Pencils", "Sharp enough to be a health and safety matter", "sweets", 125, f, false);
+	shop_add("Liquorice Wheels", "Beloved by roughly nine percent of people", "sweets", 118, f, false);
+	shop_add("Toffee That Takes Your Fillings", "A dentist's fondest marketing", "sweets", 135, f, false);
+	shop_add("Mint Imperial Tin", "The smell of every glovebox in the county", "mints", 155, f, false);
+
+	/* ---- aisle 3 west: cookies and crackers ----------------------------- */
+	f = 4;
+	shop_add("Bourbon Creams", "Two biscuits, one incident", "cookies", 115, f, false);
+	shop_add("Digestive Value Pack", "At least the name is honest", "cookies", 145, f, false);
+	shop_add("Custard Cream Family Tin", "Opens once, empties once", "cookies", 198, f, false);
+	shop_add("Water Biscuits", "For people who own cheese", "crackers", 165, f, false);
+	shop_add("Cream Crackers, Plain", "The biscuit of a long car journey", "crackers", 120, f, false);
+	shop_add("Jammie Sandwich Packs", "Jam in the middle, filling on the outside", "cookies", 175, f, false);
+
+	/* ---- aisle 3 east: breakfast and shelf stable meals ----------------- */
+	f = 5;
+	shop_add("Flake Cereal, Big Box", "Gone the day after you buy it", "breakfast", 265, f, false);
+	shop_add("Honey Loop Cereal", "Approved by absolutely no dentists", "breakfast", 288, f, false);
+	shop_add("Instant Porridge Pot", "Just add boiling water and regret", "breakfast", 135, f, false);
+	shop_add("Tinned All Day Breakfast", "A meal, a mistake, a memory", "meals", 178, f, false);
+	shop_add("Instant Noodle Cup", "The official food of shift work", "meals", 92, f, false);
+	shop_add("Soup In A Mug Sachet", "Not soup. Adjacent to soup", "meals", 118, f, false);
+
+	/* ---- aisle 4 west: soda multipacks and mixers ----------------------- */
+	f = 6;
+	shop_add("Cola Six Pack", "The house standard", "soda", 355, f, false);
+	shop_add("Diet Cola Six Pack", "Same taste, different guilt", "soda", 355, f, false);
+	shop_add("Lemonade Two Litre", "Fizzy enough to take the roof off", "soda", 165, f, false);
+	shop_add("Ginger Ale Cans Four", "For stomachs and for cocktails", "soda", 245, f, false);
+	shop_add("Tonic Water Six", "Ninety percent of it goes in a glass with something else", "mixers", 310, f, false);
+	shop_add("Sparkling Water Multipack", "Water with ambition", "mixers", 265, f, false);
+
+	/* ---- aisle 4 east: mixers and drink concentrates -------------------- */
+	f = 7;
+	shop_add("Lime Cordial Bottle", "Half a bottle per glass, as everyone actually makes it", "mixers", 198, f, false);
+	shop_add("Orange Squash Two Litre", "The drink of every childhood kitchen", "mixers", 175, f, false);
+	shop_add("Bitter Lemon Cans", "Bittersweet, in the literal sense", "mixers", 255, f, false);
+	shop_add("Energy Drink Four Pack", "A heartbeat with a barcode", "energy", 425, f, false);
+	shop_add("Energy Drink Single, Warm", "Straight off the shelf, as nature intended", "energy", 165, f, false);
+	shop_add("Sports Drink One Litre", "Electrolytes for a very short run", "energy", 225, f, false);
+
+	/* ---- aisle 5 west: protein snacks ---------------------------------- */
+	f = 8;
+	shop_add("Protein Bar Chocolate", "Nine grams of it, anyway", "protein", 188, f, false);
+	shop_add("Protein Bar Peanut", "Chewy, in the engineering sense", "protein", 188, f, false);
+	shop_add("Protein Crisp Bag", "A crisp with a gym membership", "protein", 145, f, false);
+	shop_add("Beef Jerky Protein Pack", "Now with more protein than the last one", "protein", 335, f, false);
+	shop_add("Cheese Snack Squares", "Shelf stable. Enjoy that word", "protein", 165, f, false);
+	shop_add("Protein Cookie", "A cookie promoted above its ability", "protein", 205, f, false);
+
+	/* ---- aisle 5 east: sports nutrition and hydration ------------------ */
+	f = 9;
+	shop_add("Whey Protein Tub", "The big one. The committed one", "sports", 1550, f, false);
+	shop_add("Electrolyte Tablet Tube", "Drop one in water and taste the ocean", "sports", 425, f, false);
+	shop_add("Hydration Powder Sachets", "Sugar with a sports label", "sports", 335, f, false);
+	shop_add("Protein Shaker Bottle", "Forgets to be clean within one day", "sports", 355, f, false);
+	shop_add("Recovery Drink Powder", "For muscles that did nothing", "sports", 585, f, false);
+	shop_add("Gym Tote Bag", "Holds all of the above, badly", "sports", 425, f, false);
+
+	/* ---- aisle 6 west: bulk water and cooking staples ------------------- */
+	f = 10;
+	shop_add("Still Water Six Pack", "The heavyweight of the drinks aisle", "water", 245, f, false);
+	shop_add("Sparkling Water Six Pack", "Same, with bubbles and a markup", "water", 265, f, false);
+	shop_add("Large Water Two Litre", "For the car, the dog and the kettle", "water", 92, f, false);
+	shop_add("Sunflower Cooking Oil", "Fries everything, stains one shirt", "staples", 265, f, false);
+	shop_add("Long Grain Rice Bag", "The foundation of a hundred dinners", "staples", 285, f, false);
+	shop_add("Pasta Twists Value Bag", "Shapes chosen by committee", "staples", 145, f, false);
+
+	/* ---- aisle 6 east: juice and canned food ---------------------------- */
+	f = 11;
+	shop_add("Orange Juice One Litre", "Not from concentrate. Probably", "juice", 245, f, false);
+	shop_add("Apple Juice Carton", "The safe choice at any breakfast", "juice", 198, f, false);
+	shop_add("Mango Juice Carton", "A holiday in a carton", "juice", 225, f, false);
+	shop_add("Baked Beans Tin", "A national institution in a tin", "canned", 98, f, false);
+	shop_add("Chopped Tomatoes Tin", "The other national institution", "canned", 85, f, false);
+	shop_add("Tuna Chunks In Brine", "Brine is doing a lot of work there", "canned", 165, f, false);
+
+	/* ---- aisle 7 west: coffee, cocoa and baking ------------------------- */
+	f = 12;
+	shop_add("Instant Coffee Granules", "The house blend, as it were", "coffee", 425, f, false);
+	shop_add("Ground Coffee Bag", "For people with equipment", "coffee", 545, f, false);
+	shop_add("Coffee Filter Papers", "Sold in packs of a hundred, used in packs of one", "coffee", 245, f, false);
+	shop_add("Drinking Chocolate Tub", "Winter in a plastic tub", "cocoa", 465, f, false);
+	shop_add("Baking Powder Tin", "Bought once a decade", "baking", 155, f, false);
+	shop_add("Vanilla Essence Bottle", "Small bottle, large price", "baking", 225, f, false);
+
+	/* ---- aisle 7 east: tea, sweeteners and spreads ---------------------- */
+	f = 13;
+	shop_add("Tea Bags Eighty", "The actual national drink", "tea", 298, f, false);
+	shop_add("Herbal Tea Selection", "For guests you do not know well", "tea", 345, f, false);
+	shop_add("Sugar Granules One Kilo", "Heavier than it looks", "sweeteners", 175, f, false);
+	shop_add("Sweetener Tablet Dispenser", "A tiny click of denial", "sweeteners", 198, f, false);
+	shop_add("Strawberry Jam Jar", "Breakfast in a jar, and lunch if things are bad", "spreads", 225, f, false);
+	shop_add("Peanut Butter Smooth", "Either smooth or crunchy, pick a side", "spreads", 288, f, false);
+
+	/* ---- aisle 8 west: beer and party supplies, RESTRICTED -------------- */
+	f = 14;
+	shop_add("Lager Six Pack", "The default six pack of the nation", "beer", 700, f, true);
+	shop_add("Ale Six Pack", "Beer with opinions", "beer", 850, f, true);
+	shop_add("Stout Four Pack", "A meal and a drink", "beer", 895, f, true);
+	shop_add("Cider Four Pack", "Dangerously easy to drink", "beer", 780, f, true);
+	shop_add("Lager Twenty Four Cans", "Party logistics, solved", "beer", 2450, f, true);
+	shop_add("Plastic Party Cups", "Do not ask where the bottles went", "party", 210, f, false);
+
+	/* ---- aisle 8 east: wine and cocktail supplies, RESTRICTED ---------- */
+	f = 15;
+	shop_add("Red Wine Bottle", "The respectable bottle", "wine", 545, f, true);
+	shop_add("White Wine Bottle", "Chilled, or as close as the shelf gets", "wine", 545, f, true);
+	shop_add("Rose Wine Bottle", "Summer in a bottle, in February", "wine", 575, f, true);
+	shop_add("Sparkling Wine Bottle", "For occasions, and for Tuesdays", "wine", 895, f, true);
+	shop_add("Drinking Straws Pack", "Every party needs four hundred of them", "party", 145, f, false);
+	shop_add("Ice Bag", "Sold at the door to people who forgot", "party", 185, f, false);
+
+	/* ---- aisle 9 west: paper goods -------------------------------------- */
+	f = 16;
+	shop_add("Toilet Roll Four Pack", "The true currency of an emergency", "paper", 245, f, false);
+	shop_add("Kitchen Roll Two Pack", "Absorbs everything except the price", "paper", 225, f, false);
+	shop_add("Facial Tissues Box", "For colds and for endings", "paper", 165, f, false);
+	shop_add("Paper Plates Pack", "Washing up, avoided", "paper", 198, f, false);
+	shop_add("Disposable Cutlery Set", "A fork of unspeakable weakness", "paper", 165, f, false);
+	shop_add("Bin Bags Roll", "The most used and least loved item here", "paper", 285, f, false);
+
+	/* ---- aisle 9 east: cleaning and hardware --------------------------- */
+	f = 17;
+	shop_add("Washing Up Liquid", "Cuts grease and every excuse", "cleaning", 165, f, false);
+	shop_add("Surface Wipes Tub", "One wipe, one surface, allegedly", "cleaning", 245, f, false);
+	shop_add("Bleach Bottle", "Handle with the respect it earns", "cleaning", 145, f, false);
+	shop_add("AA Batteries Four Pack", "The correct size, for once", "hardware", 425, f, false);
+	shop_add("LED Bulb Single", "Promises eight years, usually gets two", "hardware", 355, f, false);
+	shop_add("Duct Tape Roll", "Fixes the shop, the car and the story", "hardware", 365, f, false);
+
+	/* ---- aisle 10 west: automotive -------------------------------------- */
+	f = 18;
+	shop_add("Screen Wash Five Litre", "The first thing to sell out in a cold snap", "automotive", 385, f, false);
+	shop_add("Engine Oil One Litre", "For cars older than their drivers", "automotive", 785, f, false);
+	shop_add("Ice Scraper", "Plastic dignity for winter mornings", "automotive", 245, f, false);
+	shop_add("De Icer Spray", "And the queue that comes with it", "automotive", 285, f, false);
+	shop_add("Microfibre Cloths Three", "Bought with good intentions, used on the windscreen", "automotive", 295, f, false);
+	shop_add("Emergency Triangle", "One day you will be glad it was here", "automotive", 655, f, false);
+
+	/* ---- aisle 10 east: travel and personal care ------------------------ */
+	f = 19;
+	shop_add("Travel Toothbrush Set", "Forgotten once, bought once", "travel", 245, f, false);
+	shop_add("Toothpaste Tube", "The one you always need at midnight", "personal", 265, f, false);
+	shop_add("Hand Sanitiser Bottle", "A permanent reminder of a bad year", "personal", 225, f, false);
+	shop_add("Lip Balm Stick", "Winter's small mercy", "personal", 195, f, false);
+	shop_add("Disposable Razors Three", "A shave and a small cut", "personal", 335, f, false);
+	shop_add("Book Of Sudoku", "For the lunch break you will not take", "travel", 425, f, false);
+
+	/* ---- behind the counter, RESTRICTED --------------------------------- */
+	shop_add("Cigarettes Twenty", "Behind the counter, and behind the law", "tobacco", 700, FACE_COUNTER, true);
+	shop_add("Cigarettes Twenty Menthol", "The one they keep asking for", "tobacco", 720, FACE_COUNTER, true);
+	shop_add("Rolling Tobacco Pouch", "For the patient and the practised", "tobacco", 1050, FACE_COUNTER, true);
+	shop_add("Small Cigars Five", "Sold rarely and always to the same person", "tobacco", 985, FACE_COUNTER, true);
+	shop_add("Vape Pen Starter Kit", "The modern answer to the old question", "vape", 1250, FACE_COUNTER, true);
+	shop_add("Vape Liquid Bottle", "Twelve flavours of fog", "vape", 425, FACE_COUNTER, true);
+	shop_add("Lighter, Refillable", "Sold to everyone, owned by nobody", "tobacco", 155, FACE_COUNTER, false);
+	shop_add("Nicotine Pouch Tin", "The quiet new one on the shelf", "vape", 585, FACE_COUNTER, true);
+
+	log_line("shop", "catalogue built: " + g_catalog.length() + " products");
+}
+
+/* ==========================================================================
+   4.  FACES AND AISLES
+   ========================================================================= */
+
+string shop_face_theme(int face) {
+	switch (face) {
+		case 0:  return "crisps and corn snacks";
+		case 1:  return "nuts, pretzels and jerky";
+		case 2:  return "chocolate";
+		case 3:  return "sweets and gum";
+		case 4:  return "cookies and crackers";
+		case 5:  return "breakfast and shelf stable meals";
+		case 6:  return "soda multipacks";
+		case 7:  return "mixers and drink concentrates";
+		case 8:  return "protein snacks";
+		case 9:  return "sports nutrition and hydration";
+		case 10: return "bulk water and cooking staples";
+		case 11: return "juice and canned food";
+		case 12: return "coffee, cocoa and baking";
+		case 13: return "tea, sweeteners and spreads";
+		case 14: return "beer and party supplies";
+		case 15: return "wine and cocktail supplies";
+		case 16: return "paper goods";
+		case 17: return "cleaning and hardware";
+		case 18: return "automotive";
+		case 19: return "travel and personal care";
+	}
+	return "the restricted goods behind the counter";
+}
+
+string shop_face_name(int face) {
+	if (face == FACE_COUNTER) return "behind the counter";
+	return "aisle " + (face / 2 + 1) + ((face % 2 == 0) ? " west face" : " east face");
+}
+
+int shop_face_of_aisle(int aisle, int which) { return aisle * 2 + which; }
+
+/* How full a face is, as a percentage of what it can hold. */
+int shop_face_stock_pct(int face) {
+	int held = 0, room = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.face != face) continue;
+		held += p.stock;
+		room += p.capacity;
+	}
+	if (room <= 0) return 0;
+	return (held * 100) / room;
+}
+
+int shop_out_of_stock_lines() {
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) if (g_catalog[i].stock <= 0) n++;
+	return n;
+}
+
+int shop_out_of_stock_on_face(int face) {
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		if (g_catalog[i].face == face and g_catalog[i].stock <= 0) n++;
+	}
+	return n;
+}
+
+/* Somewhere in the catalogue, or null. */
+product@ product_first_on_face(int face) {
+	for (uint i = 0; i < g_catalog.length(); i++) if (g_catalog[i].face == face) return g_catalog[i];
+	return null;
+}
+
+/* ==========================================================================
+   5.  SELLING
+   ========================================================================= */
+
+/* Take quantity off the shelf and return what it earns. Callers check stock
+   first; this is deliberately not forgiving. */
+int shop_sell(int index, int qty) {
+	product@ p = product_at(index);
+	if (@p is null or qty <= 0) return 0;
+	if (qty > p.stock) qty = p.stock;
+	p.stock -= qty;
+	int take = p.price * qty;
+	p.sold_since_delivery += qty;
+	p.revenue_since_delivery += take;
+	return take;
+}
+
+/* Put goods back on the shelf and take them off the figures again, which is what
+   a refused sale, a declined card or a customer who cannot cover the basket all
+   need. Doing it with p.stock += n alone leaves the sold counters claiming the
+   shop sold what it did not. */
+int shop_unsell(int index, int qty) {
+	product@ p = product_at(index);
+	if (@p is null or qty <= 0) return 0;
+	if (p.stock + qty > p.capacity) qty = p.capacity - p.stock;
+	if (qty <= 0) return 0;
+	int take = p.price * qty;
+	p.stock += qty;
+	p.sold_since_delivery -= qty;
+	p.revenue_since_delivery -= take;
+	if (p.sold_since_delivery < 0) p.sold_since_delivery = 0;
+	if (p.revenue_since_delivery < 0) p.revenue_since_delivery = 0;
+	return take;
+}
+
+/* A delivery resets every shelf's counters, so the reports always cover the same
+   week, exactly as the reference requires. */
+void shop_reset_sold_counters() {
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		g_catalog[i].sold_since_delivery = 0;
+		g_catalog[i].revenue_since_delivery = 0;
+	}
+}
+
+/* ==========================================================================
+   6.  PRICING
+   ========================================================================= */
+
+void shop_price_set(int index, int newprice) {
+	product@ p = product_at(index);
+	if (@p is null) return;
+	if (newprice < 1) newprice = 1;
+	p.price = newprice;
+	string warn = "";
+	if (shop_below_cost(index)) warn = " That is at or below what it costs you, so you lose money on every one.";
+	else if (shop_price_over_fair(index) > PRICE_TOLERANCE_PCT) {
+		warn = " That is " + shop_price_over_fair(index) + " percent over what people expect to pay, so they will buy fewer.";
+	}
+	say(p.name + " is now " + money(p.price) + "." + warn, true);
+}
+
+void shop_price_to_fair(int index) {
+	product@ p = product_at(index);
+	if (@p is null) return;
+	p.price = p.fair;
+	say(p.name + " is back to the fair price, " + money(p.price) + ".", true);
+}
+
+void shop_price_face(int face, int percent) {
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.face != face) continue;
+		p.price = (p.price * (100 + percent)) / 100;
+		if (p.price < 1) p.price = 1;
+		n++;
+	}
+	sfx_ui(A("keyboard.ogg"), -20.0);
+	say("Every price on " + shop_face_name(face) + " moved by " + signed_pct(percent) + ". "
+		+ plural(n, "line", "lines") + " changed.", true);
+}
+
+int shop_face_price_warnings(int face) {
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.face != face) continue;
+		if (p.price <= p.cost) n++;
+	}
+	return n;
+}
+
+void shop_price_face_to_fair(int face) {
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		if (g_catalog[i].face == face) g_catalog[i].price = g_catalog[i].fair;
+	}
+	say("Every price on " + shop_face_name(face) + " is back to the fair price.", true);
+}
+
+int shop_prices_drifted() {
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) if (g_catalog[i].price != g_catalog[i].fair) n++;
+	return n;
+}
+
+void shop_price_all_to_fair() {
+	int n = shop_prices_drifted();
+	for (uint i = 0; i < g_catalog.length(); i++) g_catalog[i].price = g_catalog[i].fair;
+	say("Everything in the shop is back to the fair price. " + plural(n, "line", "lines") + " changed.", true);
+}
+
+/* ==========================================================================
+   7.  ORDERING AND THE MONDAY TRUCK
+   ========================================================================= */
+
+/* The draft order: one quantity per catalogue index. It survives logging off, so
+   a half built order is still there when you come back. */
+array<int> g_draft_qty;
+
+int  shop_draft_total() {
+	int total = 0;
+	for (uint i = 0; i < g_draft_qty.length(); i++) {
+		if (g_draft_qty[i] <= 0) continue;
+		product@ p = product_at(int(i));
+		if (@p is null) continue;
+		total += p.cost * g_draft_qty[i];
+	}
+	return total;
+}
+
+class order_rec {
+	int arrive_day;
+	int arrive_minute;
+	int total;
+	array<int> qty;
+	int ordered_day;
+	int ordered_week;
+	order_rec(int ad, int am, int t, int od, int ow) {
+		arrive_day = ad; arrive_minute = am; total = t; ordered_day = od; ordered_week = ow;
+	}
+}
+
+array<order_rec@> g_orders;
+
+/* The truck comes Monday at half past six. Anything ordered Monday through
+   Saturday comes on the next Monday; order on Sunday and it waits a whole extra
+   week, which is the one rule everybody learns the hard way. */
+int shop_next_delivery_day() {
+	int w = int(g_current_day_of_week);
+	if (w == SUNDAY) return int(g_current_day) + 8;
+	int lead = (7 - w) % 7;
+	if (lead == 0) lead = 7;
+	return int(g_current_day) + lead;
+}
+
+void shop_order_add(int index, int qty) {
+	product@ p = product_at(index);
+	if (@p is null or qty <= 0) return;
+	if (g_draft_qty.length() != g_catalog.length()) g_draft_qty.resize(g_catalog.length());
+	g_draft_qty[index] += qty;
+}
+
+/* Add everything that is short to the draft order. */
+void shop_order_fill_all() {
+	g_draft_qty.resize(g_catalog.length());
+	int lines = 0, units = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		int want = p.capacity - p.stock;
+		if (want <= 0) continue;
+		g_draft_qty[i] = want;
+		lines++; units += want;
+	}
+	sfx_ui(A("keyboard.ogg"), -20.0);
+	say("The draft order now covers " + plural(lines, "line", "lines") + ", " + plural(units, "unit", "units")
+		+ ", for " + money(shop_draft_total()) + ". Nothing is ordered until you place it.", true);
+}
+
+void shop_order_fill_face(int face) {
+	if (g_draft_qty.length() != g_catalog.length()) g_draft_qty.resize(g_catalog.length());
+	int lines = 0, units = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.face != face) continue;
+		int want = p.capacity - p.stock;
+		if (want <= 0) continue;
+		g_draft_qty[i] = want;
+		lines++; units += want;
+	}
+	sfx_ui(A("keyboard.ogg"), -20.0);
+	if (lines == 0) { say(shop_face_name(face) + " is already full.", true); return; }
+	say(shop_face_name(face) + " added to the order: " + plural(lines, "line", "lines") + ", "
+		+ plural(units, "unit", "units") + ", " + money(shop_draft_total()) + " in total.", true);
+}
+
+void shop_order_clear() {
+	g_draft_qty.resize(0);
+	say("The draft order is empty.", true);
+}
+
+/* Place the draft order. It is paid for the moment you place it. */
+void shop_order_place() {
+	if (g_draft_qty.length() == 0) { say("There is nothing in the order to place.", true); return; }
+	int total = shop_draft_total();
+	if (total <= 0) { say("There is nothing in the order to place.", true); return; }
+	if (g_account_hold) {
+		sfx_ui(A("knock.wav"), -10.0);
+		say("Ridgeline Wholesale refuses the order. Your account is on hold because of the unpaid bill day. "
+			+ "The draft is kept, so nothing is lost.", true);
+		return;
+	}
+	if (!money_can_afford(total)) {
+		say("The order comes to " + money(total) + " and the till holds " + money(g_cash)
+			+ ". Ridgeline will not extend credit. The draft is kept.", true);
+		return;
+	}
+	money_spend(total, 1);      // bucket 1 is stock
+	order_rec@ o = order_rec(shop_next_delivery_day(), TRUCK_MINUTE, total, int(g_current_day), int(g_current_week));
+	o.qty.resize(g_catalog.length());
+	for (uint i = 0; i < g_catalog.length(); i++) o.qty[i] = (i < g_draft_qty.length()) ? g_draft_qty[i] : 0;
+	g_orders.insert_last(o);
+	g_draft_qty.resize(0);
+	sfx_ui(A("register.ogg"), -8.0);
+	say("Order placed and paid for, " + money(total) + ". It arrives on the truck on "
+		+ day_name(MONDAY) + ", day " + o.arrive_day + ", at half past six in the morning. "
+		+ "The till holds " + money(g_cash) + ".", true);
+	log_line("shop", "order placed: " + money(total) + " arriving day " + o.arrive_day);
+}
+
+int shop_order_count() { return int(g_orders.length()); }
+
+int shop_orders_total() {
+	int t = 0;
+	for (uint i = 0; i < g_orders.length(); i++) t += g_orders[i].total;
+	return t;
+}
+
+string shop_orders_text() {
+	if (g_orders.length() == 0) return "You have no orders on their way.";
+	string s = plural(int(g_orders.length()), "order is", "orders are") + " on the way. ";
+	for (uint i = 0; i < g_orders.length(); i++) {
+		order_rec@ o = g_orders[i];
+		s += "Order " + (i + 1) + ", " + money(o.total) + ", arriving on day " + o.arrive_day
+			+ ", which is " + plural(o.arrive_day - int(g_current_day), "day", "days") + " from now. ";
+	}
+	return s;
+}
+
+void shop_cancel_order(int index) {
+	if (index < 0 or uint(index) >= g_orders.length()) return;
+	int refund = g_orders[uint(index)].total;
+	g_cash += refund;
+	g_wk_stock -= refund;
+	if (g_wk_stock < 0) g_wk_stock = 0;
+	g_orders.remove_at(uint(index));
+	sfx_ui(A("coins.ogg"), -6.0);
+	say("Order cancelled and refunded in full, " + money(refund) + ".", true);
+}
+
+/* The driver puts everything straight onto the shelves. There is no stockroom:
+   anything that does not fit is paid for and lost. */
+void shop_delivery_arrive(order_rec@ o) {
+	int delivered = 0, wasted = 0, lines_short = 0;
+	for (uint i = 0; i < o.qty.length() and i < g_catalog.length(); i++) {
+		int qty = o.qty[i];
+		if (qty <= 0) continue;
+		product@ p = g_catalog[i];
+		int room = p.capacity - p.stock;
+		if (room <= 0) { wasted += qty; lines_short++; continue; }
+		int take = (qty > room) ? room : qty;
+		p.stock += take;
+		delivered += take;
+		if (qty > take) { wasted += qty - take; lines_short++; }
+	}
+	shop_reset_sold_counters();
+	sfx_ui(A("truck.mp3"), -6.0);
+	string s = "The truck is here. The driver puts " + plural(delivered, "unit", "units")
+		+ " straight onto the shelves. ";
+	if (wasted > 0) {
+		s += plural(wasted, "unit", "units") + " would not fit on " + plural(lines_short, "line", "lines")
+			+ ", so it has been paid for and lost. Order less next week, or sell more. ";
+	}
+	s += "Every shelf's sold since the last delivery counter has been reset, so this week's reports start now.";
+	say(s, true);
+	log_line("shop", "delivery: " + delivered + " units on, " + wasted + " wasted");
+}
+
+/* Called by mechanics.nvgt on every clock minute. Arrives at half past six. */
+void shop_check_deliveries() {
+	if (int(g_current_minute) != TRUCK_MINUTE % 60) return;
+	if (int(g_current_hour) * 60 + int(g_current_minute) != TRUCK_MINUTE) return;
+	for (int i = int(g_orders.length()) - 1; i >= 0; i--) {
+		order_rec@ o = g_orders[i];
+		if (int(g_current_day) != o.arrive_day) continue;
+		shop_delivery_arrive(o);
+		g_orders.remove_at(uint(i));
+	}
+}
+
+/* ==========================================================================
+   8.  THE MARKET
+   --------------------------------------------------------------------------
+   Wholesale costs follow real published consumer price figures, category by
+   category, plus the odd shock: a story in the local news, a warning email from
+   the wholesaler, and then costs move a few days later. Orders already placed
+   keep the price they were placed at, so a warning is your chance to stock up.
+   ========================================================================= */
+
+class market_rec {
+	string category;
+	int    change_pct;
+	market_rec(const string&in c, int p) { category = c; change_pct = p; }
+}
+
+array<market_rec@> g_market;
+bool g_market_warning_out = false;
+
+void shop_market_clear() { g_market.resize(0); }
+
+void shop_market_set(const string&in category, int pct) {
+	for (uint i = 0; i < g_market.length(); i++) {
+		if (g_market[i].category == category) { g_market[i].change_pct = pct; return; }
+	}
+	g_market.insert_last(market_rec(category, pct));
+}
+
+int shop_market_change(const string&in category) {
+	for (uint i = 0; i < g_market.length(); i++) {
+		if (g_market[i].category == category) return g_market[i].change_pct;
+	}
+	return 0;
+}
+
+/* Apply a percentage move to every product in a category. */
+void shop_market_apply(const string&in category, int pct) {
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.category != category) continue;
+		p.cost = (p.cost * (100 + pct)) / 100;
+		if (p.cost < 1) p.cost = 1;
+	}
+}
+
+/* The one call the week makes. A handful of categories move, occasionally one of
+   them violently, and the news says so first. */
+void shop_market_week() {
+	shop_market_clear();
+	int moves = random(2, 4);
+	string story = "";
+	for (int i = 0; i < moves; i++) {
+		int idx = random(0, int(g_catalog.length()) - 1);
+		product@ p = product_at(idx);
+		if (@p is null) continue;
+		int pct = random(-4, 5);
+		bool shock = (random(1, 100) <= 12);
+		if (shock) pct = (pct >= 0) ? random(18, 34) : random(-24, -14);
+		shop_market_set(p.category, pct);
+		shop_market_apply(p.category, pct);
+		if (shock) {
+			story += (story.length() > 0) ? " " : "";
+			story += "There is a story in the local news about " + p.category + ": costs there are "
+				+ signed_pct(pct) + " this week. ";
+		}
+	}
+	g_market_warning_out = true;
+	string s = "The wholesaler's price list has moved. ";
+	/* Read the biggest movers first; nobody wants forty numbers. */
+	for (uint i = 0; i < g_market.length(); i++) {
+		s += g_market[i].category + " " + signed_pct(g_market[i].change_pct) + ". ";
+	}
+	if (story.length() > 0) s += story;
+	s += "Orders you have already placed keep the price you placed them at, so a warning is your chance to stock up.";
+	say(s, true);
+	log_line("shop", "market week: " + g_market.length() + " categories moved");
+}
+
+/* ==========================================================================
+   9.  THE REPORTS THE COMPUTER READS OUT
+   ========================================================================= */
+
+string shop_report_sales() {
+	int units = 0, take = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		units += g_catalog[i].sold_since_delivery;
+		take += g_catalog[i].revenue_since_delivery;
+	}
+	if (units == 0) return "Nothing has sold off the shelves since the last delivery.";
+	return "Sales since the last delivery. " + plural(units, "unit", "units") + " sold for " + money(take) + ".";
+}
+
+string shop_report_levels() {
+	string s = "How well stocked the shelves are. ";
+	for (int f = 0; f < FACE_COUNT; f++) {
+		int pct = shop_face_stock_pct(f);
+		if (pct >= 90) continue;
+		s += shop_face_name(f) + ", " + shop_face_theme(f) + ", " + pct + " percent full. ";
+	}
+	int counter = shop_face_stock_pct(FACE_COUNTER);
+	s += "Behind the counter, " + counter + " percent full. ";
+	if (s.length() < 60) s += "Everything else is nearly full. ";
+	return s;
+}
+
+string shop_report_out_of_stock() {
+	string s = "";
+	int n = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.stock > 0) continue;
+		s += p.name + " is empty. ";
+		n++;
+		if (n >= 12) { s += "And more. "; break; }
+	}
+	if (n == 0) return "Nothing is out of stock. The shelves are holding up.";
+	return plural(shop_out_of_stock_lines(), "line is", "lines are") + " empty. " + s;
+}
+
+string shop_report_spend() {
+	return "You have spent " + money(g_wk_stock) + " on stock this week. "
+		+ shop_orders_text();
+}
+
+string shop_report_best_worst() {
+	if (g_catalog.length() == 0) return "The shelves are empty.";
+	int best = 0, worst = -1;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.revenue_since_delivery > g_catalog[best].revenue_since_delivery) best = int(i);
+		if (worst < 0 or p.revenue_since_delivery < g_catalog[worst].revenue_since_delivery) worst = int(i);
+	}
+	product@ b = g_catalog[best];
+	product@ w = g_catalog[worst];
+	string s = "Best row since the last delivery: " + b.name + ", on " + shop_face_name(b.face)
+		+ ", at " + money(b.revenue_since_delivery) + ", " + plural(b.sold_since_delivery, "unit", "units") + ". ";
+	if (@w !is null and b.revenue_since_delivery > 0) {
+		s += "Worst row: " + w.name + ", " + money(w.revenue_since_delivery) + ". ";
+		if (w.sold_since_delivery == 0) s += "It sold nothing at all. ";
+	}
+	return s;
+}
+
+string shop_report_face(int face) {
+	string s = shop_face_name(face) + ", " + shop_face_theme(face) + ". "
+		+ shop_face_stock_pct(face) + " percent full. ";
+	int units = 0, take = 0, empty = 0, lines = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.face != face) continue;
+		lines++;
+		units += p.sold_since_delivery;
+		take += p.revenue_since_delivery;
+		if (p.stock <= 0) empty++;
+	}
+	s += lines + " lines. ";
+	if (units > 0) s += "It has sold " + plural(units, "unit", "units") + " for " + money(take) + " since the last delivery. ";
+	else s += "Nothing has sold off it since the last delivery. ";
+	if (empty > 0) s += plural(empty, "line is", "lines are") + " out of stock. ";
+	return s;
+}
+
+string shop_product_text(int index) {
+	product@ p = product_at(index);
+	if (@p is null) return "There is no such product.";
+	string s = p.name + ". " + p.tagline + ". It sells for " + money(p.price)
+		+ " and costs you " + money(p.cost) + ". The fair price round here is " + money(p.fair) + ". ";
+	int over = shop_price_over_fair(index);
+	if (over > PRICE_TOLERANCE_PCT) s += "You are " + over + " percent over fair, so people buy fewer. ";
+	if (p.price <= p.cost) s += "You are at or below cost. ";
+	s += "You hold " + plural(p.stock, "unit", "units") + " out of " + p.capacity + ". ";
+	if (p.sold_since_delivery > 0) s += "It has sold " + plural(p.sold_since_delivery, "unit", "units") + " for " + money(p.revenue_since_delivery) + " since the last delivery. ";
+	if (p.restricted) s += "It is age restricted, so every sale needs a scan of the log. ";
+	return s;
+}
+
+string shop_market_text() {
+	string s = "The market. ";
+	if (g_market.length() == 0) s += "Nothing has moved yet this week. ";
+	for (uint i = 0; i < g_market.length(); i++) {
+		s += g_market[i].category + " " + signed_pct(g_market[i].change_pct) + ". ";
+	}
+	s += "Wholesale costs follow published consumer price figures, category by category, with the odd shock.";
+	return s;
+}
+
+/* ==========================================================================
+   10.  SETUP
+   ========================================================================= */
+
+void shop_init() {
+	catalog_build();
+	g_draft_qty.resize(0);
+	g_orders.resize(0);
+	shop_market_clear();
+	log_line("shop", "shelves stocked: " + g_catalog.length() + " lines across "
+		+ FACE_COUNT + " faces");
+}

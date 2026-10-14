@@ -1,0 +1,498 @@
+/* ============================================================================
+   Store Express  -  trouble.nvgt
+   ----------------------------------------------------------------------------
+   Everything that makes running a small town shop interesting.
+
+     * Mess. Spilled drinks, wet patches and the occasional worse thing. Your
+       customers find them with their feet and remember them.
+     * Shoplifters. A quiet rustle at the shelf, then, once they are outside, a
+       gloat and a run across the forecourt. The fly swatter is on Space and
+       reaches three tiles whichever way you are facing.
+     * The panic button, on P. A police car pulls onto the forecourt a few game
+       minutes later, siren and all.
+     * Drunks. They lurch, bump into displays, and can knock one over, along with
+       everything on it. It stays down and unusable until you book a repair.
+     * Fights. Put two drunks in the same aisle and sometimes it kicks off.
+     * The police record: false alarms, turned in shoplifters, and the fines that
+       follow.
+
+   INCLUDE ORDER
+     Included after people.nvgt. It never calls into mechanics or main.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS AND STATE
+   ========================================================================= */
+
+const int SWAT_REACH = 3;             // tiles, in the direction you are facing
+const int SWAT_GIVE_UP_SWATS = 3;     // some thieves give up after three to five
+const int SWAT_LAUGH_OFF_SWATS = 6;   // the ones who just laugh at you
+
+const int REPAIR_COST = 20000;        // $200, as the reference prices it
+const int FALSE_ALARM_FINE = 25000;   // $250
+const int TURN_IN_FINE_BASE = 35000;  // and it grows every time you do it
+const int FILING_FEE_PERCENT = 10;
+
+const int POLICE_NONE      = 0;
+const int POLICE_INCOMING  = 1;
+const int POLICE_ON_SITE   = 2;
+const int POLICE_DONE      = 3;
+
+/* Why the police were called. */
+const int CALL_THIEF  = 1;
+const int CALL_DRUNK  = 2;
+const int CALL_FIGHT  = 3;
+
+class fight {
+	customer@ a;
+	customer@ b;
+	float  x, y;
+	int    room;
+	int    blows;
+	int    state;        // 0 brawling, 1 finished
+	fight(customer@ pa, customer@ pb, float fx, float fy, int fr) {
+		@ a = pa; @ b = pb; x = fx; y = fy; room = fr; blows = 0; state = 0;
+	}
+}
+
+array<fight@> g_fights;
+
+int    g_police_state = POLICE_NONE;
+uint   g_police_call_at = 0;
+int    g_police_reason = 0;
+float  g_police_x = 0.0, g_police_y = 0.0;
+int    g_police_calls = 0;
+int    g_false_alarms = 0;
+int    g_fines_owed = 0;
+int    g_turn_ins = 0;
+int    g_offence_count = 0;
+bool   g_speakers_music_ducked = false;
+uint   g_next_drunk_noise = 0;
+
+/* ==========================================================================
+   2.  DAMAGED DISPLAYS
+   ========================================================================= */
+
+int trouble_damaged_count() {
+	int n = 0;
+	for (uint i = 0; i < g_things.length(); i++) if (g_things[i].damaged) n++;
+	return n;
+}
+
+int trouble_repair_bill() { return trouble_damaged_count() * REPAIR_COST; }
+
+string trouble_damaged_text() {
+	string s = "";
+	int n = 0;
+	for (uint i = 0; i < g_things.length(); i++) {
+		if (!g_things[i].damaged) continue;
+		s += g_things[i].label + ", in " + room_name(g_things[i].room) + ". ";
+		n++;
+	}
+	if (n == 0) return "Nothing is broken.";
+	return plural(n, "display is", "displays are") + " down. " + s;
+}
+
+/* A drunk has walked into something hard. The display goes over, along with
+   everything on it, and it stays down until somebody books a repair. */
+void trouble_knock_over(int room, float x, float y) {
+	thing@ worst = null;
+	float best = 9999.0;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != room or t.damaged) continue;
+		if (t.kind != IK_SHELF_FACE and t.kind != IK_FRIDGE_CASE and t.kind != IK_FROZEN_CASE
+			and t.kind != IK_COFFEE and t.kind != IK_FOUNTAIN) continue;
+		float d = dist2(t.x, t.y, x, y);
+		if (d < best) { best = d; @ worst = t; }
+	}
+	if (@worst is null or best > 2.5 * 2.5) return;
+	worst.damaged = true;
+	sfx_at(room, worst.x, worst.y, 0.0, A("crash.mp3"), -3.0);
+	/* Anything on a knocked over shelf face is lost. */
+	int lost = 0;
+	if (worst.kind == IK_SHELF_FACE) {
+		for (uint i = 0; i < g_catalog.length(); i++) {
+			if (g_catalog[i].face != worst.ref) continue;
+			lost += g_catalog[i].stock;
+			g_catalog[i].stock = 0;
+		}
+	}
+	say("Something goes over with a crash. " + worst.label + " has been knocked over in "
+		+ room_name(room) + ", and everything on it has gone with it. "
+		+ ((lost > 0) ? (plural(lost, "unit", "units") + " of stock is lost. ") : "")
+		+ "You will have to book a repair on the computer before it is any use again.", true);
+	log_line("trouble", "display knocked over: " + worst.label);
+}
+
+void trouble_repair_all() {
+	int n = trouble_damaged_count();
+	if (n == 0) { say("Nothing needs repairing.", true); return; }
+	int cost = n * REPAIR_COST;
+	if (!money_can_afford(cost)) {
+		say("The repair comes to " + money(cost) + " and the till holds " + money(g_cash) + ".", true);
+		return;
+	}
+	money_spend(cost, 3);
+	for (uint i = 0; i < g_things.length(); i++) g_things[i].damaged = false;
+	sfx_ui(A("knock.wav"), -8.0);
+	say("You booked the repair. " + plural(n, "display is", "displays are") + " back in use in the morning, "
+		+ "for " + money(cost) + ".", true);
+	/* Refill what was lost. */
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		if (p.stock < p.capacity / 2) p.stock = p.capacity;
+	}
+}
+
+/* ==========================================================================
+   3.  THE FLY SWATTER (Space)
+   ========================================================================= */
+
+bool trouble_in_swat_arc(customer@ c, float &out out_d) {
+	if (@c is null) return false;
+	float dx = c.x - g_px;
+	float dy = c.y - g_py;
+	float d = dist(g_px, g_py, c.x, c.y);
+	out_d = d;
+	if (d > float(SWAT_REACH) + 0.6) return false;
+	float rx, ry;
+	world_to_rel(dx, dy, rx, ry);
+	/* The swatter reaches three tiles whichever way you are facing, so anything
+	   in front, beside, or slightly behind you is fair game, but not something
+	   right behind your shoulder. */
+	if (ry < -0.6) return false;
+	return true;
+}
+
+void trouble_swat() {
+	sfx_ui(A("swatter.wav"), -6.0);
+	customer@ target = null;
+	float best = 9999.0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or !c.shoplifter) continue;
+		if (c.state == CUST_GONE or c.room != g_player_room) continue;
+		float d = 0.0;
+		if (!trouble_in_swat_arc(c, d)) continue;
+		if (d < best) { best = d; @ target = c; }
+	}
+	if (@target is null) {
+		say("You swing the fly swatter at nothing. It goes round your head once and stops.", true);
+		return;
+	}
+	target.swats++;
+	target.swatted = true;
+	sfx_at(target.room, target.x, target.y, 0.0, A("swatter.wav"), -2.0);
+	voice_use(target.voice);
+	if (target.swats >= SWAT_GIVE_UP_SWATS and target.arch != ARCH_TEENAGER) {
+		/* Most give up and put it back. */
+		target.shoplifter = false;
+		target.mood -= 4;
+		say("You catch " + target.name + " square on the shoulder. They yelp, and put what they took "
+			+ "back on the shelf, and leave at speed.", true);
+		log_line("trouble", "shoplifter swatted into giving it back: " + target.name);
+		return;
+	}
+	if (target.swats >= SWAT_LAUGH_OFF_SWATS) {
+		target.shoplifter = false;
+		say(target.name + " laughs at you, swings the last of it back on the shelf out of pure contempt, "
+			+ "and walks out. A swatter is not much of a weapon, to be fair.", true);
+		log_line("trouble", "shoplifter laughed it off: " + target.name);
+		return;
+	}
+	say("You get " + target.name + " with the swatter. They stagger, and keep going. "
+		+ "Swat them again before they reach the door.", true);
+	voice_clear();
+}
+
+string target_name_for(customer@ c) { return (@c is null) ? "Somebody" : c.name; }
+
+/* A shoplifter has reached the door with the goods. */
+void trouble_thief_escapes(customer@ c) {
+	if (@c is null) return;
+	int lost = 0;
+	for (uint i = 0; i < c.basket.length(); i++) {
+		product@ p = product_at(c.basket[i]);
+		if (@p is null) continue;
+		int qty = c.basket_qty[i];
+		if (qty > p.stock) qty = p.stock;
+		p.stock -= qty;
+		lost += p.price * qty;
+	}
+	c.basket.resize(0);
+	c.basket_qty.resize(0);
+	c.ran = true;
+	sfx_ui(A("register.ogg"), -10.0, 700);
+	say("Somebody laughs, outside, and then breaks into a run across the forecourt. "
+		+ target_name_for(c) + " has got away with " + money(lost) + " of your stock. "
+		+ "You can put in an insurance claim from the computer, if your policy covers stock.", true);
+	money_claim_stock(lost, "a shoplifter");
+	log_line("trouble", "shoplifter escaped with " + money(lost));
+}
+
+/* ==========================================================================
+   4.  THE PANIC BUTTON (P)
+   ========================================================================= */
+
+bool trouble_thief_on_the_floor() {
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or !c.shoplifter) continue;
+		if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+		return true;
+	}
+	return false;
+}
+
+bool trouble_drunk_on_the_floor() {
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.arch != ARCH_DRUNK) continue;
+		if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+		return true;
+	}
+	return false;
+}
+
+void trouble_police_arrive() {
+	g_police_state = POLICE_ON_SITE;
+	sfx_at(ROOM_FORECOURT, 8.5, 1.5, 0.0, A("siren.ogg"), -2.0);
+	string did = "";
+	if (g_police_reason == CALL_FIGHT) {
+		for (uint i = 0; i < g_fights.length(); i++) g_fights[i].state = 1;
+		g_fights.resize(0);
+		did = "The officers wade in and break it up. The knocked out ones are carried out, and the rest "
+			+ "are told to go home.";
+	} else if (g_police_reason == CALL_DRUNK) {
+		int walked = 0;
+		for (uint i = 0; i < g_customers.length(); i++) {
+			customer@ c = g_customers[i];
+			if (@c is null or c.arch != ARCH_DRUNK) continue;
+			if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+			people_customer_leave(c, true);
+			walked++;
+		}
+		did = "The officers walk " + plural(walked, "drunk", "drunks") + " out to the car and send them on their way.";
+	} else if (g_police_reason == CALL_THIEF) {
+		customer@ thief = null;
+		for (uint i = 0; i < g_customers.length(); i++) {
+			customer@ c = g_customers[i];
+			if (@c is null or !c.shoplifter) continue;
+			if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+			@ thief = c; break;
+		}
+		if (@thief !is null) {
+			if (thief.swatted) {
+				/* Turning in somebody you already hit is an offence, and the
+				   shoplifter says so. */
+				g_turn_ins++;
+				g_offence_count++;
+				int fine = (TURN_IN_FINE_BASE * g_turn_ins) + (TURN_IN_FINE_BASE * g_turn_ins * FILING_FEE_PERCENT) / 100;
+				g_fines_owed += fine;
+				thief.shoplifter = false;
+				people_customer_leave(thief, true);
+				did = "The shoplifter tells the officers you already hit them. That is an offence. "
+					+ "The fine is " + money(fine) + ", and it grows every time you do it.";
+				log_line("trouble", "turned in a swatted shoplifter, fine " + money(fine));
+			} else {
+				thief.shoplifter = false;
+				for (uint i = 0; i < thief.basket.length(); i++) {
+					product@ p = product_at(thief.basket[i]);
+					if (@p !is null) p.stock += thief.basket_qty[i];
+				}
+				thief.basket.resize(0);
+				thief.basket_qty.resize(0);
+				people_customer_leave(thief, true);
+				did = "The officers bring " + thief.name + " back to the door, and the goods come back "
+					+ "to the shelves. They get a talking to, and that is that.";
+			}
+		} else {
+			did = "The officers find nobody, because the thief has already gone.";
+		}
+	} else {
+		/* Nothing to answer. */
+		g_false_alarms++;
+		g_fines_owed += FALSE_ALARM_FINE;
+		did = "There is nothing here to answer. The officer tells you off at the door, out loud, "
+			+ "and it is a " + money(FALSE_ALARM_FINE) + " fine. The next call will be answered more slowly.";
+		log_line("trouble", "false alarm, fine " + money(FALSE_ALARM_FINE));
+	}
+	say("A police car pulls onto the forecourt. " + did, true);
+	g_police_reason = 0;
+}
+
+void trouble_panic() {
+	if (g_police_state == POLICE_INCOMING) {
+		say("They are already on their way.", true);
+		return;
+	}
+	if (g_police_state == POLICE_ON_SITE) {
+		say("The officers are already here.", true);
+		return;
+	}
+	/* Work out whether there is anything to answer. */
+	if (g_fights.length() > 0) g_police_reason = CALL_FIGHT;
+	else if (trouble_thief_on_the_floor()) g_police_reason = CALL_THIEF;
+	else if (trouble_drunk_on_the_floor()) g_police_reason = CALL_DRUNK;
+	else g_police_reason = 0;
+
+	g_police_calls++;
+	int delay = random(2, 5);       // game minutes
+	g_police_call_at = ticks() + uint(delay) * 6000;
+	g_police_state = POLICE_INCOMING;
+	sfx_ui(A("register.ogg"), -12.0, 700);
+	if (g_police_reason == 0) {
+		say("You press the panic button. Nobody is sure what you pressed it for.", true);
+	} else {
+		say("You press the panic button. A police car will be on the forecourt in about "
+			+ plural(delay, "minute", "minutes") + ".", true);
+	}
+	log_line("trouble", "panic button pressed, reason " + g_police_reason);
+}
+
+/* ==========================================================================
+   5.  DRUNKS AND FIGHTS
+   ========================================================================= */
+
+void trouble_fight_start(customer@ a, customer@ b) {
+	fight@ f = fight(a, b, (a.x + b.x) * 0.5, (a.y + b.y) * 0.5, a.room);
+	g_fights.insert_last(f);
+	sfx_at(a.room, f.x, f.y, 0.0, A("punch.mp3"), -4.0);
+	say("Two drunks have a go at each other near " + room_name(a.room) + ". "
+		+ "Somebody shouts, and then it is chaos.", true);
+	log_line("trouble", "fight started between " + a.name + " and " + b.name);
+}
+
+/* One round of a brawl. */
+void trouble_fight_tick(fight@ f, uint now) {
+	if (@f is null or f.state == 1) return;
+	f.blows++;
+	if (random(1, 100) <= 55) sfx_at(f.room, f.x, f.y, 0.0, A("punch.mp3"), -3.0);
+	if (random(1, 100) <= 25) sfx_at(f.room, f.x, f.y, 0.0, A("crash.mp3"), -8.0);
+	if (random(1, 100) <= 20) trouble_knock_over(f.room, f.x, f.y);
+	/* Sober customers nearby decide they would rather shop somewhere else. */
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.arch == ARCH_DRUNK) continue;
+		if (c.state == CUST_GONE or c.room != f.room) continue;
+		if (dist2(c.x, c.y, f.x, f.y) > 6.0 * 6.0) continue;
+		if (random(1, 100) > 25) continue;
+		voice_use(c.voice);
+		say(c.name + " decides they would rather shop somewhere else, and leaves.", true);
+		voice_clear();
+		people_customer_leave(c, true);
+	}
+	if (f.blows >= random(6, 12)) {
+		f.state = 1;
+		if (@f.a !is null) { people_customer_leave(f.a, true); f.a.mood -= 8; }
+		if (@f.b !is null) { people_customer_leave(f.b, true); f.b.mood -= 8; }
+		say("One of them goes down and stays down, with a cry that winds down like a tape machine "
+			+ "running out of power. Nobody is seriously hurt. It is that kind of town.", true);
+	}
+}
+
+void trouble_fights_tick(uint now) {
+	for (int i = int(g_fights.length()) - 1; i >= 0; i--) {
+		if (g_fights[i].state == 1) { g_fights.remove_at(uint(i)); continue; }
+		trouble_fight_tick(g_fights[i], now);
+	}
+}
+
+/* Drunks lurch, bump things and occasionally say something. */
+void trouble_drunk_tick(uint now) {
+	if (now < g_next_drunk_noise) return;
+	g_next_drunk_noise = now + uint(random(900, 2600));
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.arch != ARCH_DRUNK) continue;
+		if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+		int r = random(1, 100);
+		if (r <= 30) {
+			sfx_at(c.room, c.x, c.y, 0.0, A("knock.wav"), -14.0);
+			if (random(1, 100) <= 35) trouble_knock_over(c.room, c.x + random(-1, 1), c.y + random(-1, 1));
+		} else if (r <= 45) {
+			voice_use(c.voice);
+			say(c.name + " belches, at length, somewhere in the shop.", true);
+			voice_clear();
+		} else if (r <= 55) {
+			voice_use(c.voice);
+			say(c.name + " asks, slurring, whether you are still open. You are.", true);
+			voice_clear();
+		} else if (r <= 62) {
+			sfx_at(c.room, c.x, c.y, 0.0, A("squish.mp3"), -10.0);
+			mess_add(c.room, c.x, c.y, MESS_SICK);
+			say("Somebody is being sick in " + room_name(c.room) + ". "
+				+ "It never dries. Nobody knows why. Nobody wants to find out.", true);
+		}
+		/* Two drunks in one place is how fights start. */
+		if (c.arch == ARCH_DRUNK and random(1, 100) <= 10) {
+			for (uint j = i + 1; j < g_customers.length(); j++) {
+				customer@ o = g_customers[j];
+				if (@o is null or o.arch != ARCH_DRUNK) continue;
+				if (o.state == CUST_GONE or o.room != c.room) continue;
+				if (dist2(c.x, c.y, o.x, o.y) > 2.0 * 2.0) continue;
+				trouble_fight_start(c, o);
+				return;
+			}
+		}
+		return;
+	}
+}
+
+/* ==========================================================================
+   6.  THE FRAME AND MINUTE HOOKS
+   ========================================================================= */
+
+void trouble_tick(uint now) {
+	if (g_police_state == POLICE_INCOMING and now >= g_police_call_at) {
+		trouble_police_arrive();
+	}
+	/* Shoplifters who reach the door with goods in their basket are gone. */
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or !c.shoplifter) continue;
+		if (c.state == CUST_GONE) continue;
+		if (c.state != CUST_QUEUEING and c.state != CUST_TO_TILL) continue;
+		if (c.y <= 1.6) { trouble_thief_escapes(c); people_customer_finish(c); return; }
+	}
+	trouble_fights_tick(now);
+	trouble_drunk_tick(now);
+}
+
+void trouble_tick_minute() {
+	/* A waiting customer occasionally spills something, and a drunk makes more
+	   mess than most. */
+	if (random(1, 100) <= 4) {
+		customer@ head = people_queue_head();
+		if (@head !is null and dist2(head.x, head.y, g_px, g_py) > 0.5) {
+			sfx_at(head.room, head.x, head.y, 0.0, A("squish.mp3"), -12.0);
+			mess_add(head.room, head.x, head.y, MESS_WET);
+			say("Something is spilled near the counter. You hear it go over.", true);
+		}
+	}
+}
+
+string trouble_police_record_text() {
+	string s = "The police record. " + plural(g_police_calls, "call", "calls") + " to the panic button, "
+		+ plural(g_false_alarms, "of them", "of them") + " with nothing to answer. ";
+	if (g_turn_ins > 0) s += "You have turned in " + plural(g_turn_ins, "shoplifter you had already hit", "shoplifters you had already hit") + ". ";
+	if (g_fines_owed > 0) s += "You owe " + money(g_fines_owed) + " in fines, collected on bill day. ";
+	else s += "You owe nothing in fines. ";
+	s += "The week's short changed customers: " + people_short_change_count_this_week() + ". ";
+	return s;
+}
+
+void trouble_init() {
+	g_fights.resize(0);
+	g_police_state = POLICE_NONE;
+	g_police_reason = 0;
+	g_police_calls = 0;
+	g_false_alarms = 0;
+	g_fines_owed = 0;
+	g_turn_ins = 0;
+	g_offence_count = 0;
+	g_next_drunk_noise = 0;
+	for (uint i = 0; i < g_things.length(); i++) g_things[i].damaged = false;
+	log_line("trouble", "trouble module ready");
+}

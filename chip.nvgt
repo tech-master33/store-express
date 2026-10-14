@@ -1,0 +1,2274 @@
+/* ============================================================================
+   Store Express  -  chip.nvgt
+   ----------------------------------------------------------------------------
+   THE HARDWARE SPEECH CHIPS.
+
+   Everything else in this shop talks through the voice pool in audio.nvgt: a
+   voice server, this computer's own installed voices, or the player's screen
+   reader. The machines in the building do not. The back office terminal has a
+   Silicon Systems SSI-263 inside it, the phone has a cheap clone, and this file
+   is that chip.
+
+   THE CHIP IS AN EMULATION, NOT AN IMPRESSION. This is a port of the register
+   level SSI-263 model in Tamas Geczy's ssi263-speech project (MIT), which is
+   built from the phoneme ROM read off the die, the 1985/86 Silicon Systems and
+   Votrax data sheets, and the ISSCC 1984 chip family paper. What is here:
+
+     * THE PHONEME ROM, all 64 codes, decoded from src/data/rom_bits.csv of that
+       project with its candidate bit reading (significance-interleaved nibbles,
+       MSB first: FA = b05 b11 b17 b23, VA = b06 b12 b18 b24, and so on, with F1's
+       low bit on the PAR row and closure_clear, class1 and class2 as flags).
+       Nothing about it was guessed here, and a word in our own code is a code
+       number the chip itself knows.
+     * THE FILTER CAPACITANCE DECODE, so a 4 bit field becomes a formant: the
+       switched capacitor sections run at fc = XCK / (2 (256 - FF)) and their
+       pole is (2 sin(pi f / fc))^2 = K (C0 + sum of the binary weights).
+     * THE TRACT: five low pass sections F1 F2 F3 F4 F5, the noise injection at
+       F2 and F5 with the ROM's class2 bit choosing which of them gets it, a
+       band pass noise shaper, the 15 bit shift register noise source, the
+       glottal wave source (0.8 of an impulse plus 0.2 of MAME's SC-01 wave), the
+       pitch law F0 = XCK / (8 (4096 - I)), the articulation, amplitude and
+       inflection slews, the closure gate that makes a stop silent and then gives
+       it a burst, the output high pass, the 4 bit volume and the sample and hold.
+     * OUR OWN FRONT END. The project says it plainly: pronunciation is not the
+       chip's business, it knows phoneme codes, never words. So the sounds, the
+       spellings and the timing below are ours: our own sounding code (a
+       dictionary of this shop's words written in the chip's own codes, with a
+       frame length on each one) drives the emulated chip.
+
+   NOT PORTED, and why: the project's release lookahead, hold release, fricative
+   precharge and clock line carrier are about a real firmware's A/R handshake, or
+   are experiments it marks Python only; our front end knows the whole line in
+   advance, so the request is always answered at once. The 193 tap anti alias
+   filter of its output stage is a pair of one pole low passes here, because this
+   game renders the chip inside its own frame loop and not offline.
+
+   RENDERING NEVER BLOCKS. chip_say() queues a line and returns; chip_tick()
+   renders a slice of it per frame. A line costs a piece of a frame at a time, so
+   the clock, the customers and the room ambience keep running while the chip
+   works out what it is going to say. The lines a device says are cached, so a
+   sentence it has said once is played from memory ever after.
+
+   PAN, WHICH IS THE WHOLE POINT OF THE CALIBRATION STEP: the chip's samples are
+   ours, so they are an ordinary sound and set_pan can put them hard left or hard
+   right. A screen reader voice and a SAPI voice belong to the operating system
+   and cannot be moved.
+
+   INCLUDE ORDER
+     audio.nvgt <- core.nvgt <- chip.nvgt <- rooms.nvgt <- ... <- mechanics.nvgt
+   This file needs the config reader, the log and the mute flag, and nothing else.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  THE TWO CHIPS
+   --------------------------------------------------------------------------
+   Both devices run the same emulated chip. They differ in how the firmware
+   would have set it up, and in how badly the box is falling apart:
+
+     * THE TERMINAL runs its filter clock at 20 kHz, which is the clock the ROM's
+       capacitor ratios were checked against here: at that fc the decoded vowels
+       land where vowels live (E has F1 373 Hz and F2 2169, AE 652 and 1781, AW
+       652 and 1043, and R's F3 drops to 1408, which is why it sounds like an R).
+     * THE PHONE runs its clock at 17 kHz and sits an octave higher, so its tract
+       is smaller and brighter than the terminal's, its converter is 5 bits wide
+       and it loses a block now and then: a cheap handset. It used to be pushed
+       further than that - a 9 kHz clock and 3 bits - and the result was not a
+       cheap chip but an unintelligible one, which is no good for a device the
+       player has to understand. It is wired up when the phone is.
+   ========================================================================== */
+
+const int CHIP_DEVICE_COMPUTER = 0;   /* the back office terminal */
+const int CHIP_DEVICE_PHONE    = 1;   /* the handheld, wired up later */
+
+class chip_voice_profile {
+	string name;
+	int sample_rate;    /* Hz we take the chip's output at */
+	int ff;             /* R4: the filter clock; fc = XCK / (2 (256 - FF)) */
+	int rate_code;      /* R2[7:4]: the speech rate; a frame is 4096 (16-R)/XCK */
+	int articulation;   /* R3[6:4]: how fast the parameters transition */
+	int amplitude;      /* R3[3:0]: the chip's own 4 bit volume */
+	int pitch_hz;       /* our base F0; the chip is told I = 4096 - XCK / (8 F0) */
+	int pitch_pct;      /* the player's own pitch for this machine, as a per cent of
+	                       the profile's own pitch_hz: 100 is the chip as it came
+	                       out of the box. Set on the machine's own screen and
+	                       kept in the save, beside the speech speed. */
+	int glide_field;    /* R1[2:0]: the inflection glide rate */
+	int oversample;     /* output stage: fine samples per output sample */
+	int bits;           /* output converter width, 0 for the chip's own 4 bits */
+	int dropout_pct;    /* blocks of output simply lost */
+	int amp_pct;        /* how loud a finished line comes out */
+	int hiss_pct;       /* a little of the chip's own noise floor, always on */
+	int speed_pct;      /* the player's own speech speed: 100 is the chip as it
+	                       came out of the box, 40 is very slow. A host clock on
+	                       top of R2, so a player who cannot follow the voice can
+	                       slow the words down without changing its pitch and
+	                       without handing the machine to the screen reader. */
+	chip_voice_profile() {
+		name = "a chip"; sample_rate = 11025; ff = 231; rate_code = 6;
+		articulation = 4; amplitude = 15; pitch_hz = 104; pitch_pct = 100; glide_field = 0;
+		oversample = 2; bits = 0; dropout_pct = 0; amp_pct = 100; hiss_pct = 0;
+		speed_pct = 100;
+	}
+}
+
+chip_voice_profile@ g_chip_computer = null;
+chip_voice_profile@ g_chip_phone    = null;
+
+/* Straight out of config.ini in chip_init(). */
+int g_chip_volume_db = -5;         /* the chips sit under the narration */
+int g_chip_mirror    = 0;          /* also read a chip's line out in the UI voice; off
+                                      by default, because a machine that is read back
+                                      by the screen reader is not a machine with a
+                                      chip in it. The knob is here for a player who
+                                      cannot follow a chip voice at all. */
+
+void chip_profile_from_config(chip_voice_profile@ p, const string&in prefix) {
+	p.sample_rate  = cfg_int(prefix + "_sample_rate", p.sample_rate);
+	p.ff           = cfg_int(prefix + "_filter_clock", p.ff);
+	p.rate_code    = cfg_int(prefix + "_rate", p.rate_code);
+	p.articulation = cfg_int(prefix + "_articulation", p.articulation);
+	p.amplitude    = cfg_int(prefix + "_amplitude", p.amplitude);
+	p.pitch_hz     = cfg_int(prefix + "_pitch_hz", p.pitch_hz);
+	p.glide_field  = cfg_int(prefix + "_glide", p.glide_field);
+	p.oversample   = cfg_int(prefix + "_oversample", p.oversample);
+	p.bits         = cfg_int(prefix + "_bits", p.bits);
+	p.dropout_pct  = cfg_int(prefix + "_dropout_pct", p.dropout_pct);
+	p.amp_pct      = cfg_int(prefix + "_amp_pct", p.amp_pct);
+	p.hiss_pct     = cfg_int(prefix + "_hiss_pct", p.hiss_pct);
+	/* Anything silly in the file must not produce a chip that cannot be heard,
+	   cannot be rendered, or whose tract pole decoding runs off its own rails. */
+	if (p.sample_rate < 6000) p.sample_rate = 6000;
+	if (p.sample_rate > 44100) p.sample_rate = 44100;
+	if (p.ff < 1) p.ff = 1;
+	if (p.ff > 250) p.ff = 250;
+	if (p.rate_code < 0) p.rate_code = 0;
+	if (p.rate_code > 15) p.rate_code = 15;
+	if (p.articulation < 0) p.articulation = 0;
+	if (p.articulation > 7) p.articulation = 7;
+	if (p.amplitude < 1) p.amplitude = 1;
+	if (p.amplitude > 15) p.amplitude = 15;
+	if (p.pitch_hz < 60) p.pitch_hz = 60;
+	if (p.pitch_hz > 300) p.pitch_hz = 300;
+	if (p.glide_field < 0) p.glide_field = 0;
+	if (p.glide_field > 7) p.glide_field = 7;
+	if (p.oversample < 1) p.oversample = 1;
+	if (p.oversample > 4) p.oversample = 4;
+	if (p.bits < 0) p.bits = 0;
+	if (p.bits > 16) p.bits = 16;
+	if (p.dropout_pct < 0) p.dropout_pct = 0;
+	if (p.amp_pct < 5) p.amp_pct = 5;
+	if (p.hiss_pct < 0) p.hiss_pct = 0;
+	p.speed_pct = chip_speed_clamp(p.speed_pct);
+}
+
+chip_voice_profile@ chip_profile_of(int device) {
+	if (device == CHIP_DEVICE_PHONE) return g_chip_phone;
+	return g_chip_computer;
+}
+
+/* ---- the player's own speech speed and pitch ------------------------------
+   The chip's own speech rate register, R2, cannot reach far enough to help: at
+   rate 0 a frame lasts 65 ms against the terminal's 41, so the chip's slowest
+   possible setting is only one and a half times slower than its default, and a
+   player who cannot follow the voice needs more than that. So the speed is a
+   host clock on top of the chip instead of a register: the frame the tract
+   counts in is stretched, and because the pitch and the tract's own coefficients
+   are not counted in frames, the machine keeps its voice and only the words
+   come out slower.
+
+   Pitch is the other half of the same problem: a player who finds the chip too
+   shrill or too low needs the machine's own note moved, and rising and falling
+   formants mean nothing if the one under them cannot be followed. Both settings
+   are the player's, not the chip's, so both live on the machine's own screen
+   and both are kept in the save they were set in: a store's machines talk the
+   way that store's player left them, and loading another slot brings that
+   slot's settings with it.
+
+   The choices are the ones the menu walks, highest or fastest first, so one
+   press is always the next step down and the list wraps back to the top. */
+
+/* 65 per cent of the chip's own rate is this machine's NORMAL speech: a chip
+   left at its own 100 per cent is faster than it is meant to sound, and the
+   player who sets the speed is choosing around what the machine does out of the
+   box here, not around the die's own maximum. The words below say so. */
+const int CHIP_SPEED_DEFAULT = 65;   /* what a new store's machines start at */
+const int CHIP_SPEED_MAX     = 100;  /* the chip's own rate, the ceiling */
+const int CHIP_SPEED_MIN     = 40;   /* the slowest the menu will go */
+const string CHIP_SPEED_CHOICES = "100,80,65,50,40";
+
+const int CHIP_PITCH_NORMAL = 100;   /* the profile's own pitch_hz, untouched */
+const string CHIP_PITCH_CHOICES = "130,115,100,85,70";
+
+int chip_speed_clamp(int pct) {
+	if (pct > CHIP_SPEED_MAX) pct = CHIP_SPEED_MAX;
+	if (pct < CHIP_SPEED_MIN) pct = CHIP_SPEED_MIN;
+	return pct;
+}
+
+int chip_pitch_clamp(int pct) {
+	if (pct > 200) pct = 200;
+	if (pct < 30) pct = 30;
+	return pct;
+}
+
+/* The pitch the machine actually runs its F0 at: its profile's own pitch moved
+   by the player's per cent. Kept inside the range the tract can decode, which is
+   the same range a hand edited profile is held to. */
+double chip_effective_pitch(chip_voice_profile@ p) {
+	double hz = double(p.pitch_hz) * double(p.pitch_pct) / 100.0;
+	if (hz < 60.0) hz = 60.0;
+	if (hz > 300.0) hz = 300.0;
+	return hz;
+}
+
+string chip_device_prefix(int device) {
+	return (device == CHIP_DEVICE_PHONE) ? "chip_phone" : "chip_computer";
+}
+
+/* The save keys these settings live in. They belong to a store, not to the
+   computer: the save carries them, and loading a slot puts them back on the
+   machines. */
+string chip_speed_save_key(int device) { return chip_device_prefix(device) + "_speed_pct"; }
+string chip_pitch_save_key(int device) { return chip_device_prefix(device) + "_pitch_pct"; }
+
+int chip_pct_choice_count(const string&in choices) {
+	string[]@ parts = choices.split(",");
+	int n = 0;
+	for (uint i = 0; i < parts.length(); i++) if (parts[i].trim_whitespace().length() > 0) n++;
+	return n;
+}
+
+int chip_pct_choice(const string&in choices, int step) {
+	if (step < 0) step = 0;
+	string[]@ parts = choices.split(",");
+	int seen = 0;
+	for (uint i = 0; i < parts.length(); i++) {
+		string t = parts[i].trim_whitespace();
+		if (t.length() == 0) continue;
+		if (seen == step) return parse_int(t);
+		seen++;
+	}
+	return 100;
+}
+
+/* 65 is what this machine calls normal, so the words are relative to it. */
+string chip_speed_word(int pct) {
+	if (pct == 100) return "fastest";
+	if (pct == 80) return "faster";
+	if (pct == 65) return "normal";
+	if (pct == 50) return "slower";
+	if (pct == 40) return "very slow";
+	return "";
+}
+
+string chip_pitch_word(int pct) {
+	if (pct == 100) return "normal";
+	if (pct == 115) return "a little higher";
+	if (pct == 130) return "higher";
+	if (pct == 85) return "a little lower";
+	if (pct == 70) return "lower";
+	return "";
+}
+
+/* How the setting reads on the machine's own screen. It is the machine's own
+   line, so it does not name the machine: the screen it is on already does, and
+   the chip reading it out is the machine it is about. */
+string chip_speed_line(int device) {
+	int pct = chip_profile_of(device).speed_pct;
+	string word = chip_speed_word(pct);
+	string text = (word.length() > 0) ? (word + ", ") : "";
+	return "Speech speed: " + text + pct + " per cent of the chip's own rate";
+}
+
+/* The pitch line reads the same way, and says per cent of the machine's own
+   pitch rather than a number of hertz, because the terminal and the phone are
+   two different voices and "lower" means the same thing on both. */
+string chip_pitch_line(int device) {
+	int pct = chip_profile_of(device).pitch_pct;
+	string word = chip_pitch_word(pct);
+	string text = (word.length() > 0) ? (word + ", ") : "";
+	return "Pitch: " + text + pct + " per cent of normal";
+}
+
+/* The line the machine itself says when the setting changes, so the player
+   hears the speed they just picked rather than having to walk away and find
+   out. It is the machine's own voice on purpose: the setting that changed
+   belongs to the machine, and nothing here repeats a chip in the player's. */
+string chip_speed_preview_line(int device, int pct) {
+	string who = (device == CHIP_DEVICE_PHONE) ? "THE PHONE" : "THE TERMINAL";
+	string word = chip_speed_word(pct);
+	string at = (word.length() > 0) ? word : ("" + pct + " PER CENT");
+	string line = who + " WILL SPEAK LIKE THIS, AT " + at + ".";
+	line = chip_upper(line);
+	return line;
+}
+
+/* The pitch preview says the same thing about the machine's note. */
+string chip_pitch_preview_line(int device, int pct) {
+	string who = (device == CHIP_DEVICE_PHONE) ? "THE PHONE" : "THE TERMINAL";
+	string word = chip_pitch_word(pct);
+	string at = (word.length() > 0) ? word : ("" + pct + " PER CENT");
+	string line = who + " WILL SOUND LIKE THIS, " + at + ".";
+	line = chip_upper(line);
+	return line;
+}
+
+/* Put a setting on one machine without saying anything. This is how a save's
+   settings are put back when a store is loaded, and how a new store is set to
+   the defaults. Nothing is silenced and no cache is thrown away: a line already
+   being made keeps the speed and the pitch it started with - it is not the
+   player's line being read, and cutting a machine off in the middle of a word
+   is exactly what pressing the setting used to do. The line cache is keyed by
+   the speed and the pitch as well as by the words, so a stale entry can never
+   be played back. */
+void chip_speed_apply(int device, int pct) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	if (@p is null) return;
+	p.speed_pct = chip_speed_clamp(pct);		log_line("chip", "speech speed for device " + device + " is now " + p.speed_pct
+			+ " per cent of the chip's own rate");
+}
+
+void chip_pitch_apply(int device, int pct) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	if (@p is null) return;
+	p.pitch_pct = chip_pitch_clamp(pct);
+	log_line("chip", "speech pitch for device " + device + " is now " + p.pitch_pct + " per cent");
+}
+
+
+/* The clock the whole tract runs on. Everything the chip does is timed in these
+   ticks, and the formant a 4 bit field decodes to is a fraction of it. */
+double chip_xck() { return 1000000.0; }
+double chip_fc(chip_voice_profile@ p) { return chip_xck() / (2.0 * double(256 - p.ff)); }
+
+/* A frame: the unit the speech rate and the phoneme duration are counted in.
+   The player's speed divides it. That one division is the whole of the speech
+   speed setting: every phoneme's hold, every transition between them and the
+   pauses between words are counted in frames, so stretching the frame slows
+   the words and leaves everything else where it was. The pitch is not counted
+   in frames at all, so the voice does not drop as it slows. */
+double chip_frame_seconds_at(chip_voice_profile@ p, int speed_pct) {
+	double speed = double(speed_pct) / 100.0;
+	if (speed < 0.01) speed = 0.01;
+	return 4096.0 * double(16 - p.rate_code) / chip_xck() / speed;
+}
+
+double chip_frame_seconds(chip_voice_profile@ p) {
+	return chip_frame_seconds_at(p, p.speed_pct);
+}
+
+/* The pitch the chip is told, as the 12 bit I of the data sheet. */
+int chip_pitch_code(double hz) {
+	if (hz < 20.0) hz = 20.0;
+	double period = chip_xck() / (8.0 * hz);
+	int i = int(4096.0 - period);
+	if (i < 0) i = 0;
+	if (i > 4095) i = 4095;
+	return i;
+}
+
+/* ==========================================================================
+   2.  THE PHONEME ROM
+   --------------------------------------------------------------------------
+   code, name, then the six 4 bit fields the analog sections see: F1 F2 F3
+   NAS VA FA, then the flags: class1, class2, closure_clear.
+
+   NAS drives the second formant's bandwidth (a nasal has a broader one).
+   VA is the voice level and FA the noise level, both out of 15.
+   class1 marks the stops that reopen before the end of their own duration;
+   class2 picks which injection point that code's noise goes into (0 takes the
+   F5 path: S Z TH THV T, 1 takes F2: everything else), which is the ROM's own
+   stand in for a balance control.
+   closure_clear marks the codes that do NOT shut the tract: a vowel, a liquid,
+   a nasal, KV, and PA. Everything else closes it and bursts.
+   ========================================================================== */
+
+const string CHIP_ROM_TABLE =
+	"0x00,PA,7,9,12,0,0,0,0,1,1;"
+	"0x01,E,2,14,14,0,12,0,1,1,1;"
+	"0x02,E1,5,14,13,0,10,0,1,1,1;"
+	"0x03,Y,1,13,14,0,11,0,1,1,1;"
+	"0x04,YI,2,12,11,0,6,0,1,1,1;"
+	"0x05,AY,3,14,14,0,12,0,1,1,1;"
+	"0x06,IE,1,15,15,0,9,0,1,1,1;"
+	"0x07,I,5,10,12,0,8,0,1,1,1;"
+	"0x08,A,6,11,11,0,8,0,1,1,1;"
+	"0x09,AI,6,9,10,0,8,0,1,1,1;"
+	"0x0A,EH,9,8,11,0,8,0,1,1,1;"
+	"0x0B,EH1,10,9,11,0,8,0,1,1,1;"
+	"0x0C,AE,13,9,11,0,6,0,1,1,1;"
+	"0x0D,AE1,15,7,11,0,6,0,1,1,1;"
+	"0x0E,AH,15,3,11,0,6,0,1,1,1;"
+	"0x0F,AH1,15,4,11,0,7,0,1,1,1;"
+	"0x10,AW,13,2,10,0,6,0,1,1,1;"
+	"0x11,O,7,1,11,0,8,0,1,1,1;"
+	"0x12,OU,5,1,11,0,9,0,1,1,1;"
+	"0x13,OO,8,2,10,0,8,0,1,1,1;"
+	"0x14,IU,3,6,10,0,10,0,1,1,1;"
+	"0x15,IU1,4,4,10,0,9,0,1,1,1;"
+	"0x16,U,3,1,8,0,10,0,1,1,1;"
+	"0x17,U1,1,0,7,0,10,0,1,1,1;"
+	"0x18,UH,8,4,11,0,10,0,1,1,1;"
+	"0x19,UH1,10,3,11,0,8,0,1,1,1;"
+	"0x1A,UH2,12,3,11,0,6,0,1,1,1;"
+	"0x1B,UH3,12,5,11,0,7,0,1,1,1;"
+	"0x1C,ER,6,4,3,0,8,0,1,1,1;"
+	"0x1D,R,3,1,1,0,8,0,1,1,1;"
+	"0x1E,R1,2,3,4,0,8,0,1,1,1;"
+	"0x1F,R2,7,6,9,0,6,0,1,1,1;"
+	"0x20,L,3,3,14,0,7,0,1,1,1;"
+	"0x21,L1,1,5,15,0,8,0,1,1,1;"
+	"0x22,LF,5,1,14,0,9,0,1,1,1;"
+	"0x23,W,3,0,9,0,8,0,1,1,1;"
+	"0x24,B,1,3,12,0,8,0,1,1,0;"
+	"0x25,D,1,9,14,0,8,0,1,1,0;"
+	"0x26,KV,3,10,8,0,10,0,1,1,1;"
+	"0x27,P,4,2,8,0,0,15,1,1,0;"
+	"0x28,T,4,9,14,0,0,15,1,0,0;"
+	"0x29,K,3,10,8,0,0,4,1,1,0;"
+	"0x2A,HV,7,9,12,0,6,0,0,1,1;"
+	"0x2B,HVC,7,9,12,0,15,0,0,1,0;"
+	"0x2C,HF,7,9,12,0,0,8,0,1,1;"
+	"0x2D,HFC,7,9,12,0,0,8,0,1,0;"
+	"0x2E,HN,7,9,12,3,4,0,0,1,1;"
+	"0x2F,Z,3,2,13,0,1,10,1,0,1;"
+	"0x30,S,0,7,12,0,0,15,1,0,1;"
+	"0x31,J,2,11,14,0,1,10,1,1,1;"
+	"0x32,SCH,2,11,14,0,0,6,1,1,1;"
+	"0x33,V,2,3,9,0,3,4,1,1,1;"
+	"0x34,F,2,3,9,0,0,4,1,1,1;"
+	"0x35,THV,3,7,14,0,1,2,1,0,1;"
+	"0x36,TH,5,8,10,0,0,2,1,0,1;"
+	"0x37,M,0,3,9,3,10,0,1,1,1;"
+	"0x38,N,0,8,13,3,8,0,1,1,1;"
+	"0x39,NG,2,12,14,3,4,0,1,1,1;"
+	"0x3A,:A,7,9,10,0,8,0,1,1,1;"
+	"0x3B,:OH,2,8,9,0,6,0,1,1,1;"
+	"0x3C,:U,1,7,9,0,10,0,1,1,1;"
+	"0x3D,:UH,0,9,10,0,10,0,1,1,1;"
+	"0x3E,E2,6,7,10,0,7,0,1,1,1;"
+	"0x3F,LB,1,1,14,0,8,0,1,1,1;";
+
+const int CHIP_ROM_COUNT = 64;
+const int CHIP_PA = 0;                 /* the pause, the first code on the die */
+
+array<string> g_rom_name;
+array<int> g_rom_f1, g_rom_f2, g_rom_f3, g_rom_nas, g_rom_va, g_rom_fa;
+array<int> g_rom_cls1, g_rom_cls2, g_rom_cc;
+
+/* The order of the six parameters everywhere in this file, so the counters, the
+   latches and the targets cannot drift apart: F1, F2, F3, NAS, VA, FA. */
+const int CHIP_F = 6;
+
+int chip_rom_code(const string&in name) {
+	for (uint i = 0; i < g_rom_name.length(); i++) if (g_rom_name[i] == name) return int(i);
+	return -1;
+}
+
+/* The switched capacitor decode: a 4 bit field, the binary weights of the
+   capacitor rows, and the section's K and fixed capacitance, give the pole. */
+double chip_theta(double k, double c0, int field) {
+	double cap = c0;
+	if ((field & 1) != 0) cap += 1.0;
+	if ((field & 2) != 0) cap += 2.0;
+	if ((field & 4) != 0) cap += 4.0;
+	if ((field & 8) != 0) cap += 8.0;
+	double s = sqrt(k * cap) / 2.0;
+	if (s > 0.999) s = 0.999;
+	return 2.0 * asin(s);
+}
+
+/* The capacitor constants of the three controlled sections, from the project's
+   fit to its own recorded unit. */
+const double CHIP_F1_K = 0.00255;
+const double CHIP_F1_C0 = 3.38;
+const double CHIP_F2_K = 0.02837;
+const double CHIP_F2_C0 = 1.75;
+const double CHIP_F3_K = 0.03795;
+const double CHIP_F3_C0 = 4.07;
+
+/* The two fixed sections, and the bandwidths of all five, as fractions of fc. */
+const double CHIP_F4_RATIO = 0.163;
+const double CHIP_F5_RATIO = 0.24;
+const double CHIP_BW1 = 0.0025;
+const double CHIP_BW2 = 0.0040;
+const double CHIP_BW3 = 0.0060;
+const double CHIP_BW4 = 0.0300;
+const double CHIP_BW5 = 0.0600;
+const double CHIP_NAS_F2_BW_GAIN = 0.5;
+
+/* The formant a code's field really lands on, in Hz, for anybody reading this
+   and wondering what the ROM says. */
+double chip_formant_hz(int which, int code, chip_voice_profile@ p) {
+	int field = 0;
+	double k = CHIP_F1_K, c0 = CHIP_F1_C0;
+	if (which == 0) { field = g_rom_f1[uint(code)]; k = CHIP_F1_K; c0 = CHIP_F1_C0; }
+	else if (which == 1) { field = g_rom_f2[uint(code)]; k = CHIP_F2_K; c0 = CHIP_F2_C0; }
+	else { field = g_rom_f3[uint(code)]; k = CHIP_F3_K; c0 = CHIP_F3_C0; }
+	return chip_theta(k, c0, field) / (2.0 * 3.14159265358979) * chip_fc(p);
+}
+
+/* ==========================================================================
+   3.  OUR OWN SOUNDING CODE
+   --------------------------------------------------------------------------
+   A word is written as the chip's own codes, each with a frame length after it:
+   the number is how many frames the phoneme is held for, 1 to 4, and a frame is
+   4096 (16 - rate) cycles of the chip's clock. So LEFT is "L1 EH2 F1 T1", and
+   the chip is told exactly that.
+
+   The vowels are chosen by the formant the ROM gives them rather than by the
+   letter on the front, which is why the dictionary reads the way it does:
+   E is the closed front vowel (F1 373, F2 2169), I next (466, 1864), EH (566,
+   1694), AE (652, 1781), AH the open central (690, 1175), AW the open back
+   (652, 1043), O (518, 892), U the closed back (406, 892), ER is the r coloured
+   one (F3 down at 1668) and R is lower still (F3 1408).
+
+   A hard G is K then HVC: K shuts the tract and HVC is the chip's own voiced
+   hold that opens it again. That is not our invention either, it is what the
+   Braille Lite's firmware did for every G it said.
+
+   Text in double square brackets is taken as our code verbatim, so a line can be
+   written in the chip's own language when a word needs spelling out:
+       chip_say("[[S1 EH1 T1 UH1 P1]]")
+   ========================================================================== */
+
+const string CHIP_WORDS =
+	"A=UH1;AND=AE1 N1 D1;BACK=B1 AE2 K1;BOTH=B1 OU2 TH1;"
+	"CALIBRATION=K1 AE1 L1 I1 B1 R1 EH1 E1 SCH1 UH1 N1;"
+	"CHANNEL=T1 SCH1 AE1 N1 UH1 L1;CHECK=T1 SCH1 EH2 K1;CHIP=T1 SCH1 I2 P1;"
+	"COMPLETE=K1 UH1 M1 P1 L1 E2 T1;COMPUTER=K1 UH1 M1 P1 IU1 T1 ER1;"
+	"CONFIGURATION=K1 UH1 N1 F1 I1 K1 HVC1 IU1 ER1 EH1 E1 SCH1 UH1 N1;"
+	"DIAGNOSTIC=D1 AI2 UH1 K1 HVC1 N1 O1 S1 T1 I1 K1;DONE=D1 UH2 N1;DOT=D1 O1 T1;"
+	"EIGHT=EH1 E1 T1;ERROR=EH2 R1 ER1;FAILED=F1 EH1 E1 L1 D1;FIVE=F1 AI2 V1;"
+	"FOUR=F1 O2 R1;FROM=F1 R1 UH1 M1;HARDWARE=HF1 O1 R1 D1 W1 EH1 R1;"
+	"HEAR=HF1 E1 R1;HEARD=HF1 ER2 D1;HELLO=HF1 EH1 L1 OU1;HERE=HF1 E1 R1;"
+	"IF=I1 F1;IS=I1 Z1;IT=I1 T1;LEFT=L1 EH2 F1 T1;LINE=L1 AI2 N1;"
+	"MEMORY=M1 EH1 M1 ER1 E1;MODULE=M1 O1 D1 IU1 L1;NINE=N1 AI2 N1;"
+	"NOMINAL=N1 O1 M1 I1 N1 UH1 L1;NOT=N1 O1 T1;OF=UH1 V1;OFFICE=O1 F1 I1 S1;"
+	"OK=OU1 K1 EH1 E1;ON=O1 N1;ONE=W1 UH2 N1;ONLINE=O1 N1 L1 AI2 N1;"
+	"PASSED=P1 AE1 S1 T1;PHONE=F1 OU2 N1;PRESS=P1 R1 EH2 S1;READY=R1 EH1 D1 E1;"
+	"REQUIRED=R1 E1 K1 W1 AI1 ER1 D1;RIGHT=R1 AI2 T1;ROM=R1 O1 M1;"
+	"SAVED=S1 EH1 E1 V1 D1;SEVEN=S1 EH1 V1 UH1 N1;SET=S1 EH1 T1;SETUP=S1 EH1 T1 UH1 P1;"
+	"SIDES=S1 AI2 D1 Z1;SIX=S1 I1 K1 S1;SPACE=S1 P1 EH1 E1 S1;SPEAK=S1 P1 E2 K1;"
+	"SPEECH=S1 P1 E2 T1 SCH1;START=S1 T1 O1 R1 T1;SUBSYSTEM=S1 UH1 B1 S1 I1 S1 T1 EH1 M1;"
+	"SYSTEM=S1 I1 S1 T1 EH1 M1;TEN=T1 EH2 N1;TERMINAL=T1 ER1 M1 I1 N1 UH1 L1;"
+	"TEST=T1 EH1 S1 T1;TEXT=T1 EH1 K1 S1 T1;THAT=THV1 AE1 T1;THE=THV1 UH1;"
+	"THIS=THV1 I1 S1;THREE=TH1 R1 E2;TO=T1 U2;TWO=T1 U2;UP=UH1 P1;"
+	"VERSION=V1 ER1 SCH1 UH1 N1;VOICE=V1 O1 E1 S1;WELL=W1 EH2 L1;"
+	"WITH=W1 I1 THV1;WORK=W1 ER1 K1;WORKING=W1 ER1 K1 I1 NG1;YOU=IU2;ZERO=Z1 E1 R1 OU1;"
+	"@0=Z1 E1 R1 OU1;@1=W1 UH2 N1;@2=T1 U2;@3=TH1 R1 E2;@4=F1 O2 R1;@5=F1 AI2 V1;"
+	"@6=S1 I1 K1 S1;@7=S1 EH1 V1 UH1 N1;@8=EH1 E1 T1;@9=N1 AI2 N1;"
+	"@A=EH1 E1;@B=B1 E2;@C=S1 E2;@D=D1 E2;@E=E2;@F=EH1 F1;@G=D1 J1 E2;"
+	"@H=EH1 E1 T1 SCH1;@I=AI2;@J=D1 J1 EH1 E1;@K=K1 EH1 E1;@L=EH1 L1;"
+	"@M=EH1 M1;@N=EH1 N1;@O=OU2;@P=P1 E2;@Q=K1 IU2;@R=O2 R1;@S=EH1 S1;"
+	"@T=T1 E2;@U=IU2;@V=V1 E2;@W=D1 UH1 B1 UH1 L1 IU1;@X=EH1 K1 S1;"
+	"@Y=W1 AI2;@Z=Z1 E2;@-=PA1;"
+	/* Acronyms the shop itself talks about. A word with no vowel in it is spelled
+	   by the rules below, but SSI, TTS and NVDA all have one, and a machine that
+	   read SSI as a word would not be saying the name of its own chip. */
+	"SSI=EH1 S1 EH1 S1 AI2;TTS=T1 E2 T1 E2 EH1 S1;NVDA=EH1 N1 V1 E2 D1 E2 EH1 E1;"
+	"PC=P1 E2 S1 E2;TV=T1 E2 V1 E2;CD=S1 E2 D1 E2;";
+
+array<string> g_word_key;
+array<string> g_word_code;
+
+bool chip_word(const string&in key, string &out codes) {
+	for (uint i = 0; i < g_word_key.length(); i++) {
+		if (g_word_key[i] != key) continue;
+		codes = g_word_code[i];
+		return true;
+	}
+	return false;
+}
+
+const string CHIP_ALPHA  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const string CHIP_LOWER  = "abcdefghijklmnopqrstuvwxyz";
+const string CHIP_UPPER  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const string CHIP_DIGITS = "0123456789";
+
+string chip_upper(const string&in text) {
+	string result = "";
+	for (uint i = 0; i < text.length(); i++) {
+		string ch = text.substr(i, 1);
+		int at = CHIP_LOWER.find_first(ch);
+		if (at >= 0) result += CHIP_UPPER.substr(uint(at), 1);
+		else result += ch;
+	}
+	return result;
+}
+
+/* ==========================================================================
+   3b.  THE REST OF ENGLISH
+   --------------------------------------------------------------------------
+   The dictionary above is the shop's own handful of words. It used to be the
+   whole vocabulary: anything else - PAIRING, COMPRESSED, FOUND, HANDSET - was
+   spelled out letter by letter, which is honest about the vocabulary and
+   unlistenable in a shop (a machine that says PEE AY EYE ARR EYE EN JEE for
+   PAIRING is not speaking). So a word that is not in the dictionary now goes
+   through the spellings below: English written in the chip's own codes, asked
+   longest first, which is what every text to speech machine of this generation
+   did with a word it did not know. Only a word with no vowel in it at all (SSI,
+   TTS) is still spelled, because that is the one case where the letters really
+   are the word.
+
+   A rule is PATTERN PREV NEXT = CODES. The pattern is matched at the current
+   letter; PREV is the letter before it and NEXT the letters after, in this
+   little language: * any, # the start of the word, _ the end of the word, v a
+   vowel, c a consonant, and anything else the letters that must be there. CODES
+   are our own codes, each with its frame length, and the table is in order: it
+   is read from the top, so a longer pattern is always asked before a shorter
+   one and C before E (a soft S) before C before anything at all (a K).
+   ========================================================================== */
+
+/* The words a number, a price or a clock reading is made of. They are looked up
+   by key, so a key here can never collide with a word in the text: every one of
+   them starts with #. */
+const string CHIP_NUM_WORDS =
+	"#0=Z1 E1 R1 OU1;#1=W1 UH2 N1;#2=T1 U2;#3=TH1 R1 E2;#4=F1 O2 R1;"
+	"#5=F1 AI2 V1;#6=S1 I1 K1 S1;#7=S1 EH1 V1 UH1 N1;#8=EH1 E1 T1;#9=N1 AI2 N1;"
+	"#10=T1 EH2 N1;#11=I1 L1 EH2 V1 UH1 N1;#12=T1 W1 EH2 L1 V1;#13=TH1 ER1 T1 E2 N1;"
+	"#14=F1 O2 R1 T1 E2 N1;#15=F1 I1 F1 T1 E2 N1;#16=S1 I1 K1 S1 T1 E2 N1;"
+	"#17=S1 EH1 V1 UH1 N1 T1 E2 N1;#18=EH1 E1 T1 E2 N1;#19=N1 AI2 N1 T1 E2 N1;"
+	"#20=T1 W1 EH1 N1 T1 E2;#30=TH1 ER1 T1 E2;#40=F1 O2 R1 T1 E2;#50=F1 I1 F1 T1 E2;"
+	"#60=S1 I1 K1 S1 T1 E2;#70=S1 EH1 V1 UH1 N1 T1 E2;#80=EH1 E1 T1 E2;#90=N1 AI2 N1 T1 E2;"
+	"#100=HF1 UH1 N1 D1 R1 EH1 D1;#1000=TH1 AW1 Z1 UH1 N1 D1;#1000000=M1 I1 L1 Y1 UH1 N1;"
+	"#AND=AE1 N1 D1;#MINUS=M1 AI2 N1 UH1 S1;#OH=OU2;#OCLOCK=UH1 K1 L1 O1 K1;"
+	"#POINT=P1 O1 N1 T1;#DOLLAR=D1 O1 L1 ER1;#DOLLARS=D1 O1 L1 ER1 Z1;"
+	"#CENT=S1 EH1 N1 T1;#CENTS=S1 EH1 N1 T1 S1;#PERCENT=P1 ER1 S1 EH1 N1 T1;"
+	"#AT=AE1 T1;#AM=EH1 E1 EH1 M1;#PM=P1 E2 EH1 M1;#HOUR=AW1 ER1;#HOURS=AW1 ER1 Z1;"
+	"#MINUTE=M1 I1 N1 I1 T1;#MINUTES=M1 I1 N1 I1 T1 S1";
+
+const string CHIP_RULES =
+	/* The /sh/ of TION and SION, and the /t sh/ of CH, are the ROM's own SCH code.
+	   There is no SH on the die at all, and a token that is not a ROM name is
+	   dropped where it stands, so a rule written with SH would say nothing. */
+	"TION * * = SCH1 UH1 N1;"
+	"SION * * = SCH1 UH1 N1;"
+	"TURE * _ = T1 SCH1 ER1;"
+	"IGHT * * = AI2 T1;"
+	"EIGH * * = EH1 E1;"
+	"OUGH * * = O2;"
+	"TCH * * = T1 SCH1;"
+	"IED * _ = E2 D1;"
+	"IES * _ = E2 Z1;"
+	"ING * _ = I1 NG1;"
+	"AL * _ = UH1 L1;"
+	"LE * _ = UH1 L1;"
+	"LY * _ = L1 E2;"
+	"ED * _ = D1;"
+	"ES v _ = Z1;"
+	"ES * _ = EH1 Z1;"
+	"CH * * = T1 SCH1;"
+	"SH * * = SCH1;"
+	"PH * * = F1;"
+	"TH * * = TH1;"
+	"WH * * = W1;"
+	"CK * * = K1;"
+	"NG * * = NG1;"
+	"NK * * = NG1 K1;"
+	"GH * * = ;"
+	"QU * * = K1 W1;"
+	"KN # * = N1;"
+	"GN # * = N1;"
+	"WR # * = R1;"
+	"MB * _ = M1;"
+	"EE * * = E2;"
+	"EA * * = E2;"
+	"EI * * = E2;"
+	"IE * * = E2;"
+	"EY * * = E2;"
+	"EW * * = U2;"
+	"OO * * = U2;"
+	"OU * * = OU2;"
+	"OW * * = OU2;"
+	"OA * * = OU2;"
+	"OI * * = O1 E1;"
+	"OY * * = O1 E1;"
+	"AU * * = O2;"
+	"AW * * = O2;"
+	"AI * * = EH1 E1;"
+	"AY * _ = EH1 E1;"
+	"UR * * = ER1;"
+	"IR * * = ER1;"
+	"ER * * = ER1;"
+	"AR * _ = ER1;"
+	"AR * * = O1 R1;"
+	"OR * _ = O2 R1;"
+	"OR * * = O1 R1;"
+	"C * I = S1;"
+	"C * E = S1;"
+	"C * Y = S1;"
+	"C * * = K1;"
+	"G * E = D1 J1;"
+	"G * I = D1 J1;"
+	"G * Y = D1 J1;"
+	"G * * = K1 HVC1;"
+	"Y # * = Y1;"
+	"Y * _ = E2;"
+	"Y * * = Y1;"
+	"S v _ = Z1;"
+	"S * * = S1;"
+	"E c _ = E2;"
+	"E # * = E2;"
+	"E * * = EH1;"
+	"A * * = AE1;"
+	"I * * = I1;"
+	"O * * = O1;"
+	"U * * = AH1;"
+	"B * * = B1;"
+	"D * * = D1;"
+	"F * * = F1;"
+	"H * * = HF1;"
+	"J * * = D1 J1;"
+	"K * * = K1;"
+	"L * * = L1;"
+	"M * * = M1;"
+	"N * * = N1;"
+	"P * * = P1;"
+	"Q * * = K1;"
+	"R * * = R1;"
+	"T * * = T1;"
+	"V * * = V1;"
+	"W * * = W1;"
+	"X * * = K1 S1;"
+	"Z * * = Z1;";
+
+array<string> g_rule_pat;
+array<string> g_rule_prev;
+array<string> g_rule_next;
+array<string> g_rule_codes;
+
+/* ---- the letters a rule is matched against -------------------------------- */
+
+string chip_char_at(const string&in s, int at) {
+	if (at < 0 or at >= int(s.length())) return "";
+	return s.substr(uint(at), 1);
+}
+
+string chip_slice(const string&in s, int from) {
+	if (from < 0 or from >= int(s.length())) return "";
+	return s.substr(uint(from));
+}
+
+bool chip_is_vowel_letter(const string&in c) {
+	if (c.length() != 1) return false;
+	return "AEIOUY".find_first(c) >= 0;
+}
+
+bool chip_is_consonant_letter(const string&in c) {
+	if (c.length() != 1) return false;
+	return CHIP_ALPHA.find_first(c) >= 0 and "AEIOUY".find_first(c) < 0;
+}
+
+bool chip_has_vowel_letter(const string&in word) {
+	for (uint i = 0; i < word.length(); i++) {
+		if (chip_is_vowel_letter(word.substr(i, 1))) return true;
+	}
+	return false;
+}
+
+/* One token of our code, split into the chip's code number and its frames. A
+   token we do not know is dropped rather than guessed at. */
+bool chip_token_split(const string&in token, int &out code, int &out frames) {
+	string s = token.trim_whitespace();
+	if (s.length() < 2) return false;
+	int digit = CHIP_DIGITS.find_first(s.substr(s.length() - 1, 1));
+	if (digit < 0) return false;
+	frames = digit;
+	if (frames < 1) frames = 1;
+	if (frames > 4) frames = 4;
+	code = chip_rom_code(s.substr(0, s.length() - 1));
+	return code >= 0;
+}
+
+/* ---- one word of codes, built from the rules ------------------------------ */
+
+/* A line of codes with another word's codes stuck on the end of it. It returns
+   the result rather than filling a reference, deliberately: an out parameter in
+   this engine does not arrive with its value, and an accumulator that is emptied
+   on every call silently keeps only the last word of the word. */
+string chip_append(const string&in line, const string&in codes) {
+	if (codes.length() == 0) return line;
+	if (line.length() == 0) return codes;
+	return line + " " + codes;
+}
+
+/* The codes a #key stands for, or nothing at all. */
+string chip_say_word(const string&in key) {
+	string codes = "";
+	if (chip_word(key, codes)) return codes;
+	return "";
+}
+
+/* A word with no vowel in it is not spoken, it is spelled: that is what the
+   letters of SSI or TTS are. */
+string chip_spell_word(const string&in word) {
+	string spelled = "";
+	for (uint c = 0; c < word.length(); c++) {
+		string one = "";
+		if (!chip_word("@" + word.substr(c, 1), one)) continue;
+		spelled = chip_append(spelled, one);
+	}
+	return spelled;
+}
+
+string chip_strip_commas(const string&in s) {
+	string built = "";
+	for (uint i = 0; i < s.length(); i++) {
+		string c = s.substr(i, 1);
+		if (c == ",") continue;
+		built += c;
+	}
+	return built;
+}
+
+string chip_trim_zeros(const string&in digits) {
+	uint i = 0;
+	while (i + 1 < digits.length() and digits.substr(i, 1) == "0") i++;
+	return digits.substr(i);
+}
+
+/* A number as a word: 2500 is TWO THOUSAND FIVE HUNDRED, and so on down. */
+string chip_number_codes(int n) {
+	if (n == 0) return chip_say_word("#0");
+	if (n < 0) return chip_say_word("#MINUS") + " " + chip_number_codes(-n);
+	if (n < 20) return chip_say_word("#" + n);
+	string built = "";
+	string part = "";
+	if (n >= 1000000) {
+		part = chip_number_codes(n / 1000000) + " " + chip_say_word("#1000000");
+		built = chip_append(built, part);
+		n = n % 1000000;
+	}
+	if (n >= 1000) {
+		part = chip_number_codes(n / 1000) + " " + chip_say_word("#1000");
+		built = chip_append(built, part);
+		n = n % 1000;
+	}
+	if (n >= 100) {
+		part = chip_number_codes(n / 100) + " " + chip_say_word("#100");
+		built = chip_append(built, part);
+		n = n % 100;
+	}
+	if (n >= 20) {
+		built = chip_append(built, chip_say_word("#" + ((n / 10) * 10)));
+		n = n % 10;
+	}
+	if (n > 0) built = chip_append(built, chip_say_word("#" + n));
+	return built;
+}
+
+string chip_digit_codes(const string&in digits) {
+	string built = "";
+	for (uint i = 0; i < digits.length(); i++) built = chip_append(built, chip_say_word("#" + digits.substr(i, 1)));
+	return built;
+}
+
+/* A run of digits: a number when it is short enough to say as one, and one digit
+   at a time when it is long enough to be a barcode or a serial. */
+string chip_digits_codes(const string&in digits) {
+	string d = chip_trim_zeros(digits);
+	if (d.length() == 0) return chip_say_word("#0");
+	if (d.length() > 9) return chip_digit_codes(d);
+	return chip_number_codes(parse_int(d));
+}
+
+string chip_money_codes(const string&in dollars, const string&in cents) {
+	string built = chip_digits_codes(dollars);
+	int value = (dollars.length() > 0 and dollars.length() <= 9) ? parse_int(chip_trim_zeros(dollars)) : -1;
+	built = chip_append(built, chip_say_word(value == 1 ? "#DOLLAR" : "#DOLLARS"));
+	int c = (cents.length() > 0) ? parse_int(cents) : 0;
+	if (c > 0) {
+		built = chip_append(built, chip_say_word("#AND"));
+		built = chip_append(built, chip_number_codes(c));
+		built = chip_append(built, chip_say_word(c == 1 ? "#CENT" : "#CENTS"));
+	}
+	return built;
+}
+
+string chip_time_codes(const string&in hours, const string&in minutes) {
+	string built = chip_number_codes(parse_int(hours));
+	int m = (minutes.length() > 0) ? parse_int(minutes) : 0;
+	if (minutes.length() == 0) return built;
+	if (m == 0) { built = chip_append(built, chip_say_word("#OCLOCK")); return built; }
+	if (m < 10) built = chip_append(built, chip_say_word("#OH"));
+	built = chip_append(built, chip_number_codes(m));
+	return built;
+}
+
+/* The vowel a silent E makes long: LIKE, STORE, CUTE, STYLE. */
+string chip_long_vowel(const string&in v) {
+	if (v == "A") return "EH1 E1";
+	if (v == "E") return "E2";
+	if (v == "I") return "AI2";
+	if (v == "O") return "OU2";
+	if (v == "U") return "IU1";
+	if (v == "Y") return "AI2";
+	return chip_spell_word(v);
+}
+
+/* Is this code a vowel? The ROM's own voice level will not say on its own: M, N
+   and NG are voiced as well (they are nasals), and so are L, R, W and the chip's
+   voiced hold. A vowel here is a voiced code that is none of those, so the
+   stress lands on a vowel rather than on the first letter of the word. */
+bool chip_code_is_vowel(int code) {
+	if (code < 0 or uint(code) >= g_rom_va.length()) return false;
+	if (g_rom_va[uint(code)] == 0 or g_rom_fa[uint(code)] != 0) return false;
+	string name = g_rom_name[uint(code)];
+	if (name == "M" or name == "N" or name == "NG" or name == "L" or name == "L1"
+		or name == "R" or name == "R1" or name == "R2" or name == "W"
+		or name == "HV" or name == "HVC" or name == "HN" or name == "HFC") return false;
+	return true;
+}
+
+/* A word whose last letter is a silent E: MAKE, STORE, TABLE. A word whose only
+   vowel is that E still says it: BE, SHE. */
+int chip_final_e_index(const string&in word) {
+	int n = int(word.length());
+	if (n < 3) return -1;
+	if (chip_char_at(word, n - 1) != "E") return -1;
+	for (int i = 0; i < n - 2; i++) {
+		if (chip_is_vowel_letter(chip_char_at(word, i))) return n - 1;
+	}
+	return -1;
+}
+
+/* The vowel a magic E lengthens: the letter two places before the final E, when
+   a single consonant sits between them. A vowel digraph is left to its own rule,
+   so HOUSE is an OU and not a lengthened U. */
+int chip_magic_e_index(const string&in word) {
+	int n = int(word.length());
+	if (n < 3) return -1;
+	if (chip_char_at(word, n - 1) != "E") return -1;
+	if (!chip_is_consonant_letter(chip_char_at(word, n - 2))) return -1;
+	if (!chip_is_vowel_letter(chip_char_at(word, n - 3))) return -1;
+	if (n >= 4 and chip_is_vowel_letter(chip_char_at(word, n - 4))) return -1;
+	return n - 3;
+}
+
+bool chip_rule_ok(const string&in word, int at, int len, const string&in prev, const string&in next) {
+	if (prev == "v") { if (!chip_is_vowel_letter(chip_char_at(word, at - 1))) return false; }
+	else if (prev == "c") { if (!chip_is_consonant_letter(chip_char_at(word, at - 1))) return false; }
+	else if (prev == "#") { if (at != 0) return false; }
+	if (next == "_") { if (at + len < int(word.length())) return false; }
+	else if (next == "v") { if (!chip_is_vowel_letter(chip_char_at(word, at + len))) return false; }
+	else if (next == "c") { if (!chip_is_consonant_letter(chip_char_at(word, at + len))) return false; }
+	else if (next != "*") {
+		string after = chip_slice(word, at + len);
+		if (after.length() < next.length() or after.substr(0, next.length()) != next) return false;
+	}
+	return true;
+}
+
+/* One stress per word: the first vowel is held two frames and the rest one, so a
+   line has a beat instead of a level drone. The table is still asked first, and
+   a word it knows keeps the frames it was written with. */
+string chip_stress_word(const string&in codes) {
+	if (g_rom_name.length() == 0) return codes;
+	string[]@ tokens = codes.split(" ");
+	string built = "";
+	bool stressed = false;
+	for (uint i = 0; i < tokens.length(); i++) {
+		int code = 0, frames = 0;
+		if (!chip_token_split(tokens[i], code, frames)) continue;
+		if (chip_code_is_vowel(code)) {
+			frames = stressed ? 1 : 2;
+			stressed = true;
+		}
+		built = chip_append(built, g_rom_name[uint(code)] + frames);
+	}
+	if (built.length() == 0) return codes;
+	return built;
+}
+
+/* One word, in the chip's codes: the shop's own dictionary first, then the rules
+   above, and only a word with nothing to sound in it is spelled. */
+string chip_word_codes(const string&in word) {
+	string codes = "";
+	if (chip_word(word, codes)) return codes;
+	if (!chip_has_vowel_letter(word)) return chip_spell_word(word);
+	int silent = chip_final_e_index(word);
+	int magic = chip_magic_e_index(word);
+	string built = "";
+	int i = 0;
+	int n = int(word.length());
+	while (i < n) {
+		if (silent == i) { i++; continue; }
+		string emit = "";
+		int step = 1;
+		if (magic == i) {
+			emit = chip_long_vowel(chip_char_at(word, i));
+		} else {
+			for (uint r = 0; r < g_rule_pat.length(); r++) {
+				string pat = g_rule_pat[r];
+				int len = int(pat.length());
+				if (len == 0) continue;
+				if (i + len > n) continue;
+				if (word.substr(uint(i), uint(len)) != pat) continue;
+				if (!chip_rule_ok(word, i, len, g_rule_prev[r], g_rule_next[r])) continue;
+				emit = g_rule_codes[r];
+				step = len;
+				break;
+			}
+		}
+		i += step;
+		built = chip_append(built, emit);
+	}
+	if (built.length() == 0) return chip_spell_word(word);
+	return chip_stress_word(built);
+}
+
+/* The two tables above, into the arrays the words and the rules live in. The
+   number words go into the same word table the dictionary uses, under keys that
+   begin with #, so a key can never be a word the player's text contains. */
+void chip_build_front_end() {
+	string[]@ numbers = CHIP_NUM_WORDS.split(";");
+	for (uint i = 0; i < numbers.length(); i++) {
+		string rec = numbers[i].trim_whitespace();
+		int eq = rec.find_first("=");
+		if (eq <= 0) continue;
+		g_word_key.insert_last(rec.substr(0, uint(eq)));
+		g_word_code.insert_last(chip_slice(rec, eq + 1).trim_whitespace());
+	}
+	g_rule_pat.resize(0); g_rule_prev.resize(0);
+	g_rule_next.resize(0); g_rule_codes.resize(0);
+	string[]@ rules = CHIP_RULES.split(";");
+	for (uint i = 0; i < rules.length(); i++) {
+		string rec = rules[i].trim_whitespace();
+		int eq = rec.find_first("=");
+		if (eq <= 0) continue;
+		string left = rec.substr(0, uint(eq)).trim_whitespace();
+		string[]@ parts = left.split(" ");
+		if (parts.length() < 3) continue;
+		string pat = parts[0].trim_whitespace();
+		if (pat.length() == 0) continue;
+		g_rule_pat.insert_last(pat);
+		g_rule_prev.insert_last(parts[1].trim_whitespace());
+		g_rule_next.insert_last(parts[2].trim_whitespace());
+		g_rule_codes.insert_last(chip_slice(rec, eq + 1).trim_whitespace());
+	}
+	log_line("chip", "front end: " + g_rule_pat.length() + " spelling rules over "
+		+ g_word_key.length() + " words");
+}
+
+bool chip_is_digit_char(const string&in c) {
+	return c.length() == 1 and CHIP_DIGITS.find_first(c) >= 0;
+}
+
+/* Where a run of digits starting at at ends. A comma is part of the run only
+   when a digit follows it, so "2,500" is one number and "1. of" is not. */
+int chip_digits_end(const string&in t, int at) {
+	int n = int(t.length());
+	while (at < n) {
+		string c = chip_char_at(t, at);
+		if (chip_is_digit_char(c)) { at++; continue; }
+		if (c == "," and chip_is_digit_char(chip_char_at(t, at + 1))) { at++; continue; }
+		break;
+	}
+	return at;
+}
+
+/* Those digits, with the commas taken out. */
+string chip_digits_text(const string&in t, int from, int to) {
+	string run = "";
+	for (int i = from; i < to; i++) {
+		string c = chip_char_at(t, i);
+		if (chip_is_digit_char(c)) run += c;
+	}
+	return run;
+}
+
+/* Text in, our code out: space separated CODE<frames> tokens. A word goes through
+   the dictionary and then through the rules above; a price, a number, a clock
+   reading and a percent get words of their own; punctuation becomes a pause. */
+string chip_code_for_text(const string&in text) {
+	string t = chip_upper(text);
+	string result = "";
+	int n = int(t.length());
+	int i = 0;
+	while (i < n) {
+		string ch = chip_char_at(t, i);
+		/* Our own language, handed over untouched. */
+		if (ch == "[" and chip_char_at(t, i + 1) == "[") {
+			int close = t.find_first("]]", uint(i));
+			if (close > 0) {
+				result = chip_append(result, t.substr(uint(i + 2), uint(close - i - 2)).trim_whitespace());
+				i = close + 2;
+				continue;
+			}
+		}
+		if (CHIP_ALPHA.find_first(ch) >= 0) {
+			int start = i;
+			while (i < n and CHIP_ALPHA.find_first(chip_char_at(t, i)) >= 0) i++;
+			result = chip_append(result, chip_word_codes(t.substr(uint(start), uint(i - start))));
+			continue;
+		}
+		if (ch == "$") {
+			int at = chip_digits_end(t, i + 1);
+			string dollars = chip_digits_text(t, i + 1, at);
+			string cents = "";
+			if (chip_char_at(t, at) == "." and chip_is_digit_char(chip_char_at(t, at + 1))
+				and chip_is_digit_char(chip_char_at(t, at + 2))) {
+				cents = t.substr(uint(at + 1), 2);
+				at += 3;
+			}
+			if (dollars.length() == 0) dollars = "0";
+			result = chip_append(result, chip_money_codes(dollars, cents));
+			i = at;
+			continue;
+		}
+		if (chip_is_digit_char(ch)) {
+			int at = chip_digits_end(t, i);
+			string run = chip_digits_text(t, i, at);
+			if (chip_char_at(t, at) == ":" and chip_is_digit_char(chip_char_at(t, at + 1))) {
+				int m = at + 1;
+				int m_end = chip_digits_end(t, m);
+				result = result = chip_append(result, chip_time_codes(run, chip_digits_text(t, m, m_end)));
+				i = m_end;
+				continue;
+			}
+			if (chip_char_at(t, at) == "." and chip_is_digit_char(chip_char_at(t, at + 1))) {
+				int f = at + 1;
+				int f_end = chip_digits_end(t, f);
+				result = result = chip_append(result, chip_digits_codes(run) + " " + chip_say_word("#POINT") + " "
+					+ chip_digit_codes(chip_digits_text(t, f, f_end)));
+				i = f_end;
+				continue;
+			}
+			result = result = chip_append(result, chip_digits_codes(run));
+			i = at;
+			continue;
+		}
+		if (ch == "%") { result = chip_append(result, chip_say_word("#PERCENT")); i++; continue; }
+		if (ch == "&") { result = chip_append(result, chip_say_word("#AND")); i++; continue; }
+		/* The apostrophe is nothing at all: DON'T is one word and not two. */
+		if (ch == "'" or ch == "`") { i++; continue; }
+		/* Everything else is punctuation, and in this code punctuation is a pause. */
+		if (ch == "." or ch == "!" or ch == "?") {
+			if (result.length() > 0) result += " PA2 PA2";
+		} else if (ch == "," or ch == ":" or ch == ";" or ch == "-" or ch == "/" or ch == "("
+			or ch == ")" or ch == "\\" or ch == "\"" or ch == "*" or ch == "+" or ch == "=") {
+			if (result.length() > 0) result += " PA1";
+		} else if (ch == " ") {
+			if (result.length() > 0) result += " PA1";
+		}
+		i++;
+	}
+	return result;
+}
+
+/* How long a line will take to come out of a chip, in milliseconds. A frame is
+   4096 (16 - rate) cycles of the chip's clock, and the chip takes one frame per
+   phoneme step, so this is a plain sum plus the tail the tract rings for. The
+   hardware routine uses it to know when the chip has finished speaking, and it
+   needs no audio rendered first. */
+const int CHIP_LINE_TAIL_MS = 90;
+
+int chip_line_ms(const string&in text, int device = CHIP_DEVICE_COMPUTER) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	double frame_ms = chip_frame_seconds(p) * 1000.0;
+	string[]@ tokens = chip_code_for_text(text).split(" ");
+	double total = 0.0;
+	for (uint i = 0; i < tokens.length(); i++) {
+		int code = 0, frames = 0;
+		if (!chip_token_split(tokens[i], code, frames)) continue;
+		total += frame_ms * double(frames);
+	}
+	return int(total) + CHIP_LINE_TAIL_MS;
+}
+
+/* ==========================================================================
+   4.  THE CHIP
+   --------------------------------------------------------------------------
+   One object is one chip. The host writes registers, pulls audio; pronunciation
+   is not the chip's business. This copies the structure of the project's
+   reference model: the six parameter counters slew toward their targets and are
+   latched into 4 bit codes, the five tract sections are rebuilt whenever a latch
+   changes, the sources are the glottal wave and the shift register noise, and the
+   output is high passed, scaled by the volume, held and area sampled.
+
+   Register map, so the port can be read next to the data sheet:
+     R0 [7:6] duration (4 - the field, in frames)  [5:0] the phoneme code
+     R1 [7:3] pitch I10..I6                        [2:0] the glide field
+     R2 [7:4] speech rate                          [3] I11  [2:0] I2..I0
+     R3 [7] CTL (1 is powered down)                [6:4] articulation  [3:0] volume
+     R4 [7:0] FF, the filter clock divider
+   ========================================================================== */
+
+/* The glottal wave: 0.8 of an impulse plus 0.2 of MAME's SC-01 wave, the whole
+   thing normalised to unit area, as the project chose against its own recordings
+   (its 'glottal_wave' parameter, v0.13). 36 taps: nine levels, four ticks each. */
+const int CHIP_GLOTTAL_TAPS = 36;
+array<double> g_chip_glottal;
+
+/* The articulation codes and the glide field multipliers, both straight out of
+   the project's parameter set, kept here so the render loop does not build them
+   every slice. */
+array<double> g_chip_art_codes;
+array<double> g_chip_glide_mults;
+
+void chip_build_tables() {
+	/* the project's glottal wave: nine levels, four filter clock ticks each */
+	array<double> levels;
+	levels.insert_last(0.0);
+	levels.insert_last(-4.0 / 7.0);
+	levels.insert_last(1.0);
+	levels.insert_last(6.0 / 7.0);
+	levels.insert_last(5.0 / 7.0);
+	levels.insert_last(4.0 / 7.0);
+	levels.insert_last(3.0 / 7.0);
+	levels.insert_last(2.0 / 7.0);
+	levels.insert_last(1.0 / 7.0);
+	double area = 0.0;
+	for (uint i = 0; i < levels.length(); i++) area += levels[i] * 4.0;
+	g_chip_glottal.resize(0);
+	for (uint i = 0; i < levels.length(); i++) {
+		for (int k = 0; k < 4; k++) {
+			double v = 0.2 * levels[i] / area;
+			if (g_chip_glottal.length() == 0) v += 0.8;   /* the impulse leads it */
+			g_chip_glottal.insert_last(v);
+		}
+	}
+	g_chip_art_codes.resize(0);
+	g_chip_art_codes.insert_last(1.4); g_chip_art_codes.insert_last(1.8);
+	g_chip_art_codes.insert_last(2.3); g_chip_art_codes.insert_last(2.9);
+	g_chip_art_codes.insert_last(3.4); g_chip_art_codes.insert_last(4.0);
+	g_chip_art_codes.insert_last(4.6); g_chip_art_codes.insert_last(5.1);
+	g_chip_glide_mults.resize(0);
+	g_chip_glide_mults.insert_last(1.000); g_chip_glide_mults.insert_last(0.962);
+	g_chip_glide_mults.insert_last(1.226); g_chip_glide_mults.insert_last(2.462);
+	g_chip_glide_mults.insert_last(2.092); g_chip_glide_mults.insert_last(2.462);
+	g_chip_glide_mults.insert_last(2.462); g_chip_glide_mults.insert_last(2.462);
+}
+
+/* The noise shaper: a two pole band pass at 0.28 fc with a bandwidth of 0.15 fc,
+   fitted by the project against fricative spectra. Its gain is normalised to
+   unity at the peak, which is computed here rather than looked up. */
+class chip_shaper {
+	double g, a1, a2, y1, y2, x1, x2;
+	chip_shaper() { g = 1.0; a1 = 0.0; a2 = 0.0; y1 = 0.0; y2 = 0.0; x1 = 0.0; x2 = 0.0; }
+	void set(double ratio, double bw_ratio) {
+		double r = exp(-3.14159265358979 * bw_ratio);
+		double th = 2.0 * 3.14159265358979 * ratio;
+		a1 = 2.0 * r * cos(th);
+		a2 = r * r;
+		double re = 1.0 - a1 * cos(th) + a2 * cos(2.0 * th);
+		double im = a1 * sin(th) - a2 * sin(2.0 * th);
+		double den = sqrt(re * re + im * im);
+		double num = 2.0 * abs(sin(th));
+		g = (num > 1e-9) ? (den / num) : 1.0;
+	}
+	void clear() { y1 = 0.0; y2 = 0.0; x1 = 0.0; x2 = 0.0; }
+}
+
+class ssi263 {
+	/* the host's registers */
+	int r0, r1, r2, r3, r4;
+	int mode;
+	int phoneme;
+	double elapsed, duration;
+	/* the six counters, the latch the analog sections see, and the volume */
+	double cur1, cur2, cur3, curnas, curva, curfa;
+	double tgt1, tgt2, tgt3, tgtnas, tgtva, tgtfa;
+	int lat1, lat2, lat3, latnas, latva, latfa;
+	double amp_cur;
+	int amp_target;
+	/* the closure gate */
+	double clo;
+	bool closing, releases, released, onto_silence;
+	/* the pitch */
+	int imm, trans_target;
+	double trans;
+	/* the five tract sections */
+	double s1g, s1a1, s1a2, s1y1, s1y2, s1x1, s1x2;
+	double s2g, s2a1, s2a2, s2y1, s2y2, s2x1, s2x2;
+	double s3g, s3a1, s3a2, s3y1, s3y2, s3x1, s3x2;
+	double s4g, s4a1, s4a2, s4y1, s4y2, s4x1, s4x2;
+	double s5g, s5a1, s5a2, s5y1, s5y2, s5x1, s5x2;
+	chip_shaper shaper;
+	/* the sources */
+	double phase, pending_pulse;
+	int pulse_tick, prev_pulse_tick;
+	double pulse_weight, prev_pulse_weight;
+	int lfsr;
+	double noise_phase, noise_val;
+	double g2, g5, w2, w5;
+	/* the output stage */
+	double hp_x1, hp_y1;
+	double lp1, lp2;                 /* two one pole low passes, our anti alias */
+	double out_pos, out_acc, pend_v, pend_rem;
+	int fine_left;
+	int tick;
+	int made;
+	/* what the front end wants to know afterwards */
+	int phonemes_spoken;
+	bool done;
+	ssi263() {
+		r0 = 0; r1 = 0; r2 = 0; r3 = 0x80; r4 = 0;
+		mode = 3; phoneme = 0; elapsed = 0.0; duration = 0.0;
+		cur1 = 0.0; cur2 = 0.0; cur3 = 0.0; curnas = 0.0; curva = 0.0; curfa = 0.0;
+		tgt1 = 0.0; tgt2 = 0.0; tgt3 = 0.0; tgtnas = 0.0; tgtva = 0.0; tgtfa = 0.0;
+		lat1 = -1; lat2 = -1; lat3 = -1; latnas = -1; latva = -1; latfa = -1;
+		amp_cur = 0.0; amp_target = 0;
+		clo = 1.0;
+		closing = false; releases = false; released = false; onto_silence = false;
+		imm = 0; trans_target = 0; trans = 0.0;
+		s1g = 1.0; s1a1 = 0.0; s1a2 = 0.0; s1y1 = 0.0; s1y2 = 0.0; s1x1 = 0.0; s1x2 = 0.0;
+		s2g = 1.0; s2a1 = 0.0; s2a2 = 0.0; s2y1 = 0.0; s2y2 = 0.0; s2x1 = 0.0; s2x2 = 0.0;
+		s3g = 1.0; s3a1 = 0.0; s3a2 = 0.0; s3y1 = 0.0; s3y2 = 0.0; s3x1 = 0.0; s3x2 = 0.0;
+		s4g = 1.0; s4a1 = 0.0; s4a2 = 0.0; s4y1 = 0.0; s4y2 = 0.0; s4x1 = 0.0; s4x2 = 0.0;
+		s5g = 1.0; s5a1 = 0.0; s5a2 = 0.0; s5y1 = 0.0; s5y2 = 0.0; s5x1 = 0.0; s5x2 = 0.0;
+		phase = 0.0; pending_pulse = 0.0;
+		pulse_tick = -1000; prev_pulse_tick = -1000; pulse_weight = 0.0; prev_pulse_weight = 0.0;
+		lfsr = 1; noise_phase = 0.0; noise_val = 1.0;
+		g2 = 0.0; g5 = 0.0; w2 = 0.5; w5 = 0.5;
+		hp_x1 = 0.0; hp_y1 = 0.0; lp1 = 0.0; lp2 = 0.0;
+		out_pos = 0.0; out_acc = 0.0; pend_v = 0.0; pend_rem = 0.0; fine_left = 1;
+		tick = 0; made = 0; phonemes_spoken = 0; done = false;
+	}
+}
+
+/* Set one section's pole from a frequency and a bandwidth, both as fractions of
+   the clock, with the bilinear numerator that puts a null at fc/2. */
+void chip_section(double &out g, double &out a1, double &out a2, double f_ratio, double bw_ratio) {
+	double r = exp(-3.14159265358979 * bw_ratio);
+	double th = 2.0 * 3.14159265358979 * f_ratio;
+	a1 = 2.0 * r * cos(th);
+	a2 = r * r;
+	g = (1.0 - a1 + a2) / 4.0;
+}
+
+/* Rebuild every filter a latch has changed. Called at most once per frame in
+   practice, because the counters only cross a whole number now and then. */
+void chip_latch_filters(ssi263@ c, chip_voice_profile@ p) {
+	/* chip_theta() is the pole already expressed the way a section wants it:
+	   an angle per tick, which is 2 pi times the frequency as a fraction of the
+	   clock. Dividing it by the clock again (as this did at first) puts every
+	   formant at zero hertz and leaves a tract that only passes direct current. */
+	double two_pi = 2.0 * 3.14159265358979;
+	double bw2 = CHIP_BW2 * (1.0 + CHIP_NAS_F2_BW_GAIN * double(c.latnas));
+	chip_section(c.s1g, c.s1a1, c.s1a2, chip_theta(CHIP_F1_K, CHIP_F1_C0, c.lat1) / two_pi, CHIP_BW1);
+	chip_section(c.s2g, c.s2a1, c.s2a2, chip_theta(CHIP_F2_K, CHIP_F2_C0, c.lat2) / two_pi, bw2);
+	chip_section(c.s3g, c.s3a1, c.s3a2, chip_theta(CHIP_F3_K, CHIP_F3_C0, c.lat3) / two_pi, CHIP_BW3);
+	chip_section(c.s4g, c.s4a1, c.s4a2, CHIP_F4_RATIO, CHIP_BW4);
+	chip_section(c.s5g, c.s5a1, c.s5a2, CHIP_F5_RATIO, CHIP_BW5);
+}
+
+int chip_quantise(double v) {
+	int i = int(floor(v + 0.5));
+	if (i < 0) i = 0;
+	if (i > 15) i = 15;
+	return i;
+}
+
+void chip_latch_all(ssi263@ c, chip_voice_profile@ p, bool force) {
+	int q1 = chip_quantise(c.cur1), q2 = chip_quantise(c.cur2), q3 = chip_quantise(c.cur3);
+	int qn = chip_quantise(c.curnas), qv = chip_quantise(c.curva), qf = chip_quantise(c.curfa);
+	if (!force and q1 == c.lat1 and q2 == c.lat2 and q3 == c.lat3 and qn == c.latnas
+		and qv == c.latva and qf == c.latfa) return;
+	c.lat1 = q1; c.lat2 = q2; c.lat3 = q3; c.latnas = qn; c.latva = qv; c.latfa = qf;
+	chip_latch_filters(c, p);
+}
+
+/* Load a phoneme the way the host would by writing R0, plus the one piece of
+   knowledge our host has that a real firmware's request does not carry: whether
+   the phoneme coming next is one the tract stays open for. The chip's own
+   release decision needs that, and the project models it with an early request. */
+void chip_load(ssi263@ c, chip_voice_profile@ p, int code, int frames, int next_code, int speed_pct = 0) {
+	int prev_fa = int(c.tgtfa);
+	bool prev_releases = c.releases;
+	bool prev_released = c.released;
+	double prev_clo = c.clo;
+	bool held = prev_releases and not prev_released and prev_clo <= 0.5;
+
+	c.onto_silence = (c.amp_cur < 0.5 or (c.latva == 0 and c.latfa == 0 and c.g2 + c.g5 < 0.5));
+	c.phoneme = code;
+	c.tgt1 = double(g_rom_f1[uint(code)]); c.tgt2 = double(g_rom_f2[uint(code)]);
+	c.tgt3 = double(g_rom_f3[uint(code)]); c.tgtnas = double(g_rom_nas[uint(code)]);
+	c.tgtva = double(g_rom_va[uint(code)]); c.tgtfa = double(g_rom_fa[uint(code)]);
+	c.closing = not (g_rom_cc[uint(code)] != 0);
+	c.releases = c.closing and (g_rom_cls1[uint(code)] == 1);
+	/* The ROM's class2 picks the noise injection point for this code. */
+	if (g_rom_cls2[uint(code)] == 0) { c.w2 = 0.0; c.w5 = 1.0; }
+	else { c.w2 = 1.0; c.w5 = 0.25; }
+	if (held and not c.closing) {
+		/* the stop was held to its end, and its own noise is the burst */
+		c.g2 = (prev_fa * c.w2 > c.g2) ? (prev_fa * c.w2) : c.g2;
+		c.g5 = (prev_fa * c.w5 > c.g5) ? (prev_fa * c.w5) : c.g5;
+	}
+	c.released = false;
+	/* Whether the tract will be allowed to open again before this stop's end. */
+	if (c.releases and next_code >= 0) {
+		c.released = (g_rom_cc[uint(next_code)] != 0) and (g_rom_va[uint(next_code)] > 0)
+			and (g_rom_fa[uint(next_code)] == 0);
+	}
+	c.elapsed = 0.0;
+	c.phonemes_spoken++;
+	double frame = chip_frame_seconds_at(p, (speed_pct > 0) ? speed_pct : p.speed_pct);
+	c.duration = frame * double(frames);
+	/* the register image, for anything that reads the chip back */
+	c.r0 = ((4 - frames) << 6) | (code & 0x3F);
+}
+
+/* Power the chip up the way a firmware would: the volume register set and the
+   tract's coefficients built from the first phoneme. Until the volume is up the
+   chip is silent, which is exactly what a chip with R3 at zero does. */
+void chip_power_up(ssi263@ c, chip_voice_profile@ p) {
+	c.amp_target = p.amplitude;
+	c.r3 = (p.articulation << 4) | p.amplitude;
+	c.r4 = p.ff;
+	c.r2 = (p.rate_code << 4) | (c.r2 & 0x0F);
+	chip_latch_filters(c, p);
+	chip_latch_all(c, p, true);
+}
+
+/* The host writes the pitch it wants for the next phoneme. Its own front end
+   hangs a small declination on the end of a line, which is what stops the chip
+   sounding like a list of words. The first write of a line lands at once; after
+   that the chip's own inflection glide carries it, which is slow, and that
+   slowness is most of why this voice sounds like a machine. */
+void chip_set_pitch(ssi263@ c, int i_code) {
+	if (i_code < 0) i_code = 0;
+	if (i_code > 4095) i_code = 4095;
+	c.imm = ((i_code >> 11) & 1) * 2048 + (i_code & 7);
+	c.trans_target = ((i_code >> 3) & 0xFF) << 3;
+	if (c.phonemes_spoken <= 1) c.trans = double(c.trans_target);
+	c.r1 = ((i_code >> 6) & 0x1F) << 3;
+	c.r2 = (c.r2 & 0xF0) | (((i_code >> 11) & 1) << 3) | (i_code & 7);
+}
+
+/* ==========================================================================
+   5.  RENDERING A LINE
+   --------------------------------------------------------------------------
+   The chip is driven from a program: a list of code numbers and frame lengths,
+   and a pitch for each one. This is the function the frame loop calls, a slice
+   of output samples at a time, so the shop keeps trading while a line is made.
+   ========================================================================== */
+
+class chip_render_state {
+	string text;             /* what this utterance says, for the log */
+	int device;
+	int pan;
+	array<int> pcode;        /* the program: the chip's own code numbers */
+	array<int> pframes;      /* and how many frames each one is held for */
+	array<double> ppitch;    /* the pitch asked for, in Hz, per phoneme */
+	uint at;                 /* how far through the program the host is */
+	int tail_ms;             /* how long to keep rendering after the last phoneme */
+	int speed_pct;           /* the speech speed this line was started at. A line
+	                            already being made keeps the speed and the pitch
+	                            it began with, so changing the setting never
+	                            stretches or cuts a word in half. */
+	ssi263@ chip;
+	array<int16>@ pcm;
+	int written;
+	bool finished;
+	chip_render_state() {
+		device = CHIP_DEVICE_COMPUTER; pan = 0; at = 0; tail_ms = CHIP_LINE_TAIL_MS;
+		speed_pct = CHIP_SPEED_DEFAULT;
+		written = 0; finished = false; text = "";
+	}
+}
+
+/* Text in, a program out: our code, then the chip's, with a pitch on each
+   phoneme. A line leans down as it goes, which is our own intonation and not
+   the chip's: the chip only knows what I it is handed. */
+bool chip_program_for_text(const string&in text, int device, chip_render_state@ st) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	string[]@ tokens = chip_code_for_text(text).split(" ");
+	int n = 0;
+	for (uint i = 0; i < tokens.length(); i++) {
+		int code = 0, frames = 0;
+		if (!chip_token_split(tokens[i], code, frames)) continue;
+		st.pcode.insert_last(code);
+		st.pframes.insert_last(frames);
+		st.ppitch.insert_last(0.0);
+		n++;
+	}
+	if (n == 0) return false;
+	/* A word's first vowel carries the stress, and the line falls away to its
+	   end: 4 per cent up on the stress, 14 per cent down at the end. */
+	bool new_word = true;
+	for (int i = 0; i < n; i++) {
+		double f0 = chip_effective_pitch(p);
+		double down = 1.03 - 0.14 * (double(i) / double(n > 1 ? n - 1 : 1));
+		bool vowel = chip_code_is_vowel(st.pcode[uint(i)]);
+		if (vowel and new_word) { f0 *= 1.04; new_word = false; }
+		if (st.pcode[uint(i)] == CHIP_PA) new_word = true;
+		if (i == n - 1) down *= 0.90;
+		st.ppitch[uint(i)] = f0 * down;
+	}
+	return true;
+}
+
+/* One slice of a line. Returns true when the program is spent and the tract has
+   rung out. This is the function that makes the routine non blocking: it is
+   called with a slice's worth of work, once a frame, and never loops until it is
+   done. */
+bool chip_render_step(chip_render_state@ st, int budget) {
+	chip_voice_profile@ p = chip_profile_of(st.device);
+	if (@st.chip is null) {
+		@st.chip = ssi263();
+		chip_power_up(st.chip, p);
+		if (st.pcode.length() > 0) {
+			int next_code = (st.pcode.length() > 1) ? st.pcode[1] : -1;
+			chip_load(st.chip, p, st.pcode[0], st.pframes[0], next_code, st.speed_pct);
+			chip_set_pitch(st.chip, chip_pitch_code(st.ppitch[0]));
+			st.at = 1;
+		}
+	}
+	if (st.finished) return true;
+
+	ssi263@ c = st.chip;
+	double fc = chip_fc(p);
+	double dt = 1.0 / fc;
+	double rate = double(p.sample_rate);
+	int os = p.oversample;
+	double out_dt = 1.0 / (rate * double(os));
+	double art = g_chip_art_codes[uint(p.articulation)];
+	double amp_mult = 6.0;
+	double speed1 = 2.25;             /* the first formant moves faster; the unit said so */
+	double glide_mult = g_chip_glide_mults[uint(p.glide_field)];
+	double frame = chip_frame_seconds_at(p, st.speed_pct);
+	double step = art * dt / frame;
+	double astp = step * amp_mult;
+	double gstep = glide_mult * chip_xck() / (128.0 * double(16 - p.rate_code)) * dt;
+	double cstep = dt * 1000.0 / 4.0;              /* closure_ramp_ms */
+	double rel_frames = 1.25;                      /* closure_release_frames */
+	double hol_frames = 0.3;                       /* burst_hold_frames */
+	double cdel_frames = 1.0;                      /* closure_delay_frames */
+	double scale = c.duration / (4.0 * frame);
+	double rel = c.releases ? rel_frames * frame * scale : 0.0;
+	double cdel = c.onto_silence ? 0.0 : (c.releases ? cdel_frames : 0.0);
+	bool pre_hp = false;                           /* closure_point 'after_hp' */
+	bool clo_va = false;                           /* closure_target 'vol' */
+	double hpr = 1.0 - 2.0 * 3.14159265358979 * 0.004;
+	double gain = 3.0;
+	double noise_gain = 0.012;
+	double swell = 1.0;
+	double swell_norm = sqrt(1.0 + swell * swell / 2.0);
+	double hiss = double(p.hiss_pct) / 100.0;
+	double q_step = 0.0;
+	double inv_q = 0.0;
+	if (p.bits >= 2) { q_step = 2.0 / pow(2.0, double(p.bits)); inv_q = 1.0 / q_step; }
+	double lp_a = 1.0 - exp(-2.0 * 3.14159265358979 * (0.45 * rate) / (rate * double(os)));
+
+	/* everything that runs state, in locals for the whole slice */
+	double s1y1 = c.s1y1, s1y2 = c.s1y2, s1x1 = c.s1x1, s1x2 = c.s1x2;
+	double s2y1 = c.s2y1, s2y2 = c.s2y2, s2x1 = c.s2x1, s2x2 = c.s2x2;
+	double s3y1 = c.s3y1, s3y2 = c.s3y2, s3x1 = c.s3x1, s3x2 = c.s3x2;
+	double s4y1 = c.s4y1, s4y2 = c.s4y2, s4x1 = c.s4x1, s4x2 = c.s4x2;
+	double s5y1 = c.s5y1, s5y2 = c.s5y2, s5x1 = c.s5x1, s5x2 = c.s5x2;
+	double shg = c.shaper.g, sha1 = c.shaper.a1, sha2 = c.shaper.a2;
+	double shy1 = c.shaper.y1, shy2 = c.shaper.y2, shx1 = c.shaper.x1, shx2 = c.shaper.x2;
+	double hp_x1 = c.hp_x1, hp_y1 = c.hp_y1;
+	double lp1 = c.lp1, lp2 = c.lp2;
+	double phase = c.phase, pending_pulse = c.pending_pulse;
+	int pulse_tick = c.pulse_tick, prev_pulse_tick = c.prev_pulse_tick;
+	double pulse_weight = c.pulse_weight, prev_pulse_weight = c.prev_pulse_weight;
+	int lfsr = c.lfsr;
+	double noise_phase = c.noise_phase, noise_val = c.noise_val;
+	double g2 = c.g2, g5 = c.g5;
+	double out_pos = c.out_pos, out_acc = c.out_acc;
+	double pend_v = c.pend_v, pend_rem = c.pend_rem;
+	int fine_left = c.fine_left;
+	int tick = c.tick;
+	int made = 0;
+	int os_left = fine_left;
+
+	array<int16>@ pcm = st.pcm;
+	while (made < budget) {
+		/* ---- the controller ---------------------------------------- */
+		c.elapsed += dt;
+		double d = 0.0, stp = 0.0;
+		d = c.tgt1 - c.cur1; stp = step * speed1;
+		if (d != 0.0) c.cur1 = (d > 0.0) ? ((d <= stp) ? c.tgt1 : c.cur1 + stp) : ((d >= -stp) ? c.tgt1 : c.cur1 - stp);
+		d = c.tgt2 - c.cur2; stp = step;
+		if (d != 0.0) c.cur2 = (d > 0.0) ? ((d <= stp) ? c.tgt2 : c.cur2 + stp) : ((d >= -stp) ? c.tgt2 : c.cur2 - stp);
+		d = c.tgt3 - c.cur3; stp = step;
+		if (d != 0.0) c.cur3 = (d > 0.0) ? ((d <= stp) ? c.tgt3 : c.cur3 + stp) : ((d >= -stp) ? c.tgt3 : c.cur3 - stp);
+		d = c.tgtnas - c.curnas; stp = step;
+		if (d != 0.0) c.curnas = (d > 0.0) ? ((d <= stp) ? c.tgtnas : c.curnas + stp) : ((d >= -stp) ? c.tgtnas : c.curnas - stp);
+		d = c.tgtva - c.curva; stp = astp;
+		if (d != 0.0) c.curva = (d > 0.0) ? ((d <= stp) ? c.tgtva : c.curva + stp) : ((d >= -stp) ? c.tgtva : c.curva - stp);
+		d = c.tgtfa - c.curfa; stp = astp;
+		if (d != 0.0) c.curfa = (d > 0.0) ? ((d <= stp) ? c.tgtfa : c.curfa + stp) : ((d >= -stp) ? c.tgtfa : c.curfa - stp);
+		if (c.duration > 0.0) {
+			double astp2 = 15.0 * dt / c.duration;
+			d = double(c.amp_target) - c.amp_cur;
+			if (d != 0.0) c.amp_cur = (d > 0.0) ? ((d <= astp2) ? double(c.amp_target) : c.amp_cur + astp2)
+				: ((d >= -astp2) ? double(c.amp_target) : c.amp_cur - astp2);
+		}
+		d = double(c.trans_target) - c.trans;
+		if (d != 0.0) c.trans = (d > 0.0) ? ((d <= gstep) ? double(c.trans_target) : c.trans + gstep)
+			: ((d >= -gstep) ? double(c.trans_target) : c.trans - gstep);
+
+		/* ---- the closure gate -------------------------------------- */
+		bool rel_now = false;
+		if (c.closing) {
+			rel_now = (rel > 0.0) and (c.elapsed >= c.duration - rel);
+			if (rel_now) rel_now = c.released;
+			double cdel_now = cdel * frame * scale;
+			if (c.elapsed >= cdel_now and not rel_now) c.clo = (c.clo > cstep) ? (c.clo - cstep) : 0.0;
+			else if (c.clo < 1.0) c.clo = (c.clo + cstep < 1.0) ? (c.clo + cstep) : 1.0;
+		} else if (c.clo < 1.0) {
+			c.clo = (c.clo + cstep < 1.0) ? (c.clo + cstep) : 1.0;
+		}
+
+		/* ---- latch the six codes, and rebuild the tract if they moved */
+		chip_latch_all(c, p, false);
+
+		/* ---- the two noise paths, slewing at the amplitude rate ----- */
+		double t2 = (rel_now or not c.closing) ? c.tgtfa * c.w2 : 0.0;
+		double t5 = (rel_now or not c.closing) ? c.tgtfa * c.w5 : 0.0;
+		if (rel_now and c.releases and hol_frames > 0.0
+			and c.elapsed >= c.duration - (rel_frames - hol_frames) * frame * scale) {
+			t2 *= 0.3; t5 *= 0.3;                     /* the burst tail */
+		}
+		if (hiss > 0.0 and not c.closing) { t2 += hiss * 2.0; t5 += hiss * 2.0; }
+		d = t2 - g2;
+		if (d != 0.0) g2 = (d > 0.0) ? ((d <= astp) ? t2 : g2 + astp) : ((d >= -astp) ? t2 : g2 - astp);
+		d = t5 - g5;
+		if (d != 0.0) g5 = (d > 0.0) ? ((d <= astp) ? t5 : g5 + astp) : ((d >= -astp) ? t5 : g5 - astp);
+
+		/* ---- the sources ------------------------------------------- */
+		double period = 8.0 * (4096.0 - (double(c.imm) + c.trans)) / chip_xck();
+		if (period < 1.0e-6) period = 1.0e-6;
+		double inc = dt / period;
+		double pulse = pending_pulse;
+		pending_pulse = 0.0;
+		phase += inc;
+		int n = int(phase);
+		if (n > 0) {
+			double a = double(n) - phase;
+			pulse += 1.0 - a;
+			pending_pulse = a;
+			phase -= double(n);
+			if (phase < 0.0) phase = 0.0;
+		}
+		if (pulse > 0.0) {
+			prev_pulse_tick = pulse_tick; prev_pulse_weight = pulse_weight;
+			pulse_tick = tick; pulse_weight = pulse;
+		}
+		double src = 0.0;
+		int age = tick - pulse_tick;
+		if (age >= 0 and age < CHIP_GLOTTAL_TAPS) src += g_chip_glottal[uint(age)] * pulse_weight;
+		int age2 = tick - prev_pulse_tick;
+		if (age2 >= 0 and age2 < CHIP_GLOTTAL_TAPS) src += g_chip_glottal[uint(age2)] * prev_pulse_weight;
+		/* the latched volume, so the voice level steps in the chip's own 16 steps */
+		src *= double(c.latva) / 15.0;
+		{
+			double sa = (src < 0.0) ? -src : src;
+			if (sa > g_chip_peak_source) g_chip_peak_source = sa;
+		}
+		noise_phase += 1.0;
+		while (noise_phase >= 1.0) {
+			noise_phase -= 1.0;
+			int bit = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+			lfsr = ((lfsr << 1) | bit) & 0x7FFF;
+			noise_val = (bit != 0) ? 1.0 : -1.0;
+		}
+		double nz = noise_val * noise_gain / 15.0;
+		if (swell > 0.0 and c.latva > 0) nz = nz * (1.0 + swell * cos(2.0 * 3.14159265358979 * phase)) / swell_norm;
+		/* the shaper */
+		double shy = shg * (nz - shx2) + sha1 * shy1 - sha2 * shy2;
+		shx2 = shx1; shx1 = nz;
+		shy2 = shy1; shy1 = shy;
+		nz = shy;
+
+		/* ---- the tract: F1, noise into F2, F2, F3, F4, noise, F5 ----- */
+		/* The coefficients are read fresh every tick: a latch that moved
+		   mid-slice has just rebuilt the tract. */
+		double x = src;
+		double y = c.s1g * (x + 2.0 * s1x1 + s1x2) + c.s1a1 * s1y1 - c.s1a2 * s1y2;
+		s1x2 = s1x1; s1x1 = x; s1y2 = s1y1; s1y1 = y; x = y;
+		x += g2 * nz;
+		y = c.s2g * (x + 2.0 * s2x1 + s2x2) + c.s2a1 * s2y1 - c.s2a2 * s2y2;
+		s2x2 = s2x1; s2x1 = x; s2y2 = s2y1; s2y1 = y; x = y;
+		y = c.s3g * (x + 2.0 * s3x1 + s3x2) + c.s3a1 * s3y1 - c.s3a2 * s3y2;
+		s3x2 = s3x1; s3x1 = x; s3y2 = s3y1; s3y1 = y; x = y;
+		y = c.s4g * (x + 2.0 * s4x1 + s4x2) + c.s4a1 * s4y1 - c.s4a2 * s4y2;
+		s4x2 = s4x1; s4x1 = x; s4y2 = s4y1; s4y1 = y; x = y;
+		x += g5 * nz;
+		y = c.s5g * (x + 2.0 * s5x1 + s5x2) + c.s5a1 * s5y1 - c.s5a2 * s5y2;
+		s5x2 = s5x1; s5x1 = x; s5y2 = s5y1; s5y1 = y; x = y;
+
+		/* ---- the output: high pass, volume, sample and hold --------- */
+		if (pre_hp and not clo_va) x *= c.clo;
+		{
+			double xa = (x < 0.0) ? -x : x;
+			if (xa > g_chip_peak_tract) g_chip_peak_tract = xa;
+		}
+		double hp = x - hp_x1 + hpr * hp_y1;
+		hp_x1 = x; hp_y1 = hp;
+		double amp = double(int(c.amp_cur + 0.5)) / 15.0;
+		double v = gain * hp * amp;
+		if (!clo_va and !pre_hp) v *= c.clo;
+		tick++;
+
+		/* area sample the held value to the output rate, low pass it, and
+		   keep one sample in every oversample: the project's own stage, with
+		   a pair of one poles where it uses a long FIR */
+		double rem = dt;
+		while (rem > 0.0) {
+			double take = rem;
+			if (take > out_dt - out_pos) take = out_dt - out_pos;
+			out_acc += v * take;
+			out_pos += take; rem -= take;
+			if (out_pos >= out_dt - 1e-15) {
+				double fine = out_acc / out_dt;
+				lp1 += lp_a * (fine - lp1);
+				lp2 += lp_a * (lp1 - lp2);
+				out_acc = 0.0; out_pos = 0.0;
+				os_left--;
+				if (os_left <= 0) {
+					os_left = os;
+					double s = lp2;
+					if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
+					if (inv_q > 0.0) s = q_step * floor(s * inv_q + 0.5);
+					int iv = int(s * 32000.0);
+					if (iv > 32767) iv = 32767; else if (iv < -32768) iv = -32768;
+					if (pcm.length() <= uint(st.written)) pcm.resize(uint(st.written) + 2048);
+					pcm[uint(st.written)] = int16(iv);
+					st.written++;
+					made++;
+					if (made >= budget) { rem = 0.0; break; }
+				}
+			}
+		}
+
+		/* ---- the host answers the request --------------------------- */
+		if (c.elapsed >= c.duration) {
+			if (st.at < st.pcode.length()) {
+				uint i = st.at;
+				int next_code = (i + 1 < st.pcode.length()) ? st.pcode[i + 1] : -1;
+				chip_load(c, p, st.pcode[i], st.pframes[i], next_code, st.speed_pct);
+				chip_set_pitch(c, chip_pitch_code(st.ppitch[i]));
+				st.at++;
+				scale = c.duration / (4.0 * frame);
+				rel = c.releases ? rel_frames * frame * scale : 0.0;
+				cdel = c.onto_silence ? 0.0 : (c.releases ? cdel_frames : 0.0);
+			} else if (st.tail_ms <= 0) {
+				c.done = true;
+				break;
+			} else {
+				/* the last phoneme is over: a PA to shut the gate, then a
+				   short tail so the tract's ring is not cut off */
+				c.duration = double(st.tail_ms) / 1000.0;
+				c.elapsed = 0.0;
+				c.tgtva = 0.0; c.tgtfa = 0.0;
+				c.closing = true; c.releases = false; c.released = false;
+				st.tail_ms = 0;
+			}
+		}
+	}
+
+	/* write the running state back, so the next slice carries on here */
+	c.s1y1 = s1y1; c.s1y2 = s1y2; c.s1x1 = s1x1; c.s1x2 = s1x2;
+	c.s2y1 = s2y1; c.s2y2 = s2y2; c.s2x1 = s2x1; c.s2x2 = s2x2;
+	c.s3y1 = s3y1; c.s3y2 = s3y2; c.s3x1 = s3x1; c.s3x2 = s3x2;
+	c.s4y1 = s4y1; c.s4y2 = s4y2; c.s4x1 = s4x1; c.s4x2 = s4x2;
+	c.s5y1 = s5y1; c.s5y2 = s5y2; c.s5x1 = s5x1; c.s5x2 = s5x2;
+	c.shaper.g = shg; c.shaper.a1 = sha1; c.shaper.a2 = sha2;
+	c.shaper.y1 = shy1; c.shaper.y2 = shy2; c.shaper.x1 = shx1; c.shaper.x2 = shx2;
+	c.hp_x1 = hp_x1; c.hp_y1 = hp_y1; c.lp1 = lp1; c.lp2 = lp2;
+	c.phase = phase; c.pending_pulse = pending_pulse;
+	c.pulse_tick = pulse_tick; c.prev_pulse_tick = prev_pulse_tick;
+	c.pulse_weight = pulse_weight; c.prev_pulse_weight = prev_pulse_weight;
+	c.lfsr = lfsr; c.noise_phase = noise_phase; c.noise_val = noise_val;
+	c.g2 = g2; c.g5 = g5;
+	c.out_pos = out_pos; c.out_acc = out_acc; c.pend_v = pend_v; c.pend_rem = pend_rem;
+	c.fine_left = os_left; c.tick = tick;
+	c.made += made;
+
+	st.finished = c.done;
+	return st.finished;
+}
+
+/* Two peaks kept while a line is made: the strongest the voice source got, and
+   the strongest the tract handed to the output stage. Together they say the
+   voice path is alive, which a level measurement alone cannot: a line can be
+   loud and still be all noise. */
+double g_chip_peak_source = 0.0;
+double g_chip_peak_tract = 0.0;
+
+/* Bring a finished line to the level its profile asks for. The tract runs quiet
+   on purpose so nothing clips on the way through; this is what makes the result
+   audible, and the cap on the gain is what stops a line of consonants from being
+   inflated into a shout of hiss. */
+int chip_last_pcm_samples = 0;
+int chip_last_pcm_peak    = 0;
+
+void chip_normalise(array<int16>@ pcm, int amp_pct) {
+	int peak = 0;
+	for (uint i = 0; i < pcm.length(); i++) {
+		int v = int(pcm[i]);
+		if (v < 0) v = -v;
+		if (v > peak) peak = v;
+	}
+	chip_last_pcm_samples = int(pcm.length());
+	chip_last_pcm_peak = peak;
+	if (peak < 32) return;
+	double want = 32000.0 * double(amp_pct) / 100.0 * 0.80;
+	double scale = want / double(peak);
+	if (scale > 12.0) scale = 12.0;
+	if (scale < 0.05) scale = 0.05;
+	if (scale > 0.97 and scale < 1.03) return;
+	int new_peak = 0;
+	for (uint i = 0; i < pcm.length(); i++) {
+		double v = double(pcm[i]) * scale;
+		if (v > 32000.0) v = 32000.0;
+		if (v < -32000.0) v = -32000.0;
+		int iv = int(v);
+		pcm[i] = int16(iv);
+		if (iv < 0) iv = -iv;
+		if (iv > new_peak) new_peak = iv;
+	}
+	chip_last_pcm_peak = new_peak;
+}
+
+/* ==========================================================================
+   6.  PLAYING IT
+   --------------------------------------------------------------------------
+   A chip line is an ordinary sound, which is the whole reason this file exists:
+   set_pan puts it hard left or hard right. Six players is more than the game
+   ever needs at once, and each one carries the time it will be free again, so
+   two chip lines can never cut each other off. The engine's own "active"
+   property is not used for that: it stays true after a sound has finished.
+   ========================================================================== */
+
+const int CHIP_PLAYERS = 6;
+array<sound@> g_chip_players;
+array<uint>   g_chip_player_until;     /* when each player is free again */
+array<int>    g_chip_player_device;    /* which machine each one is speaking for */
+int  g_chip_player_next = 0;
+int  g_chip_played = 0;                /* how many lines have actually been heard */
+int  g_chip_last_pan = 0;
+int  g_chip_last_samples = 0;
+bool g_chip_load_failed = false;
+
+bool chip_play_pcm(array<int16>@ pcm, int device, int pan, float gain_db = 0.0) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	if (@pcm is null or pcm.length() == 0) return false;
+	g_chip_last_samples = int(pcm.length());
+	g_chip_last_pan = pan;
+	if (g_chip_players.length() == 0) return false;
+
+	uint now = ticks();
+	int chosen = -1;
+	for (int tries = 0; tries < CHIP_PLAYERS; tries++) {
+		int at = (g_chip_player_next + tries) % CHIP_PLAYERS;
+		if (@g_chip_players[uint(at)] is null) continue;
+		if (g_chip_player_until[uint(at)] <= now) { chosen = at; break; }
+	}
+	if (chosen < 0) chosen = g_chip_player_next % CHIP_PLAYERS;
+	g_chip_player_next = chosen + 1;
+
+	sound@ player = g_chip_players[uint(chosen)];
+	if (player.active) player.stop();
+	if (uint(chosen) < g_chip_player_device.length()) g_chip_player_device[uint(chosen)] = device;
+	if (!player.load_pcm(pcm, p.sample_rate, 1)) {
+		if (!g_chip_load_failed) {
+			g_chip_load_failed = true;
+			log_line("chip", "the engine refused the chip's samples; the chips will be silent");
+		}
+		return false;
+	}
+	player.pan = float(pan);
+	player.volume = float(pow(10.0, double(g_chip_volume_db + gain_db) / 20.0));
+	player.play();
+	double ms = double(pcm.length()) * 1000.0 / double(p.sample_rate);
+	g_chip_player_until[uint(chosen)] = now + uint(ms) + 60;
+	g_chip_played++;
+	diag("chip", p.name + " at pan " + pan + ": " + g_last_chip_text);
+	return true;
+}
+
+/* ==========================================================================
+   7.  THE RENDER QUEUE
+   --------------------------------------------------------------------------
+   chip_say() is the only thing the rest of the game calls, and it returns at
+   once. What the player hears a moment later is a sound that was written a
+   slice of a frame at a time while the shop carried on trading.
+   ========================================================================== */
+
+/* How much audio is written in one go, and how long a frame is allowed to spend
+   writing it. The chip's tract runs at its own clock, which is far above the
+   rate we take its output at, so the cost is per tick and not per output sample.
+   At the clock the terminal uses, the chip costs about 300 ms of work per second
+   of speech, so a frame that spends a few milliseconds on it stays comfortably
+   ahead of playback. */
+int CHIP_SAMPLES_PER_FRAME = 1400;
+uint CHIP_RENDER_BUDGET_MS = 3;
+
+array<chip_render_state@> g_chip_queue;
+chip_render_state@ g_chip_rendering = null;
+string g_last_chip_text = "";
+float  g_chip_pending_gain = 0.0;
+int    g_chip_spoken = 0;
+int    g_chip_last_frames = 0;             /* frames the last line took to render */
+int    g_chip_cache_hits = 0;
+
+/* ---- the line cache -------------------------------------------------------
+   A device says the same sentences for its entire life, so the arithmetic is
+   done once. The key is the device and the words; the pan is not part of it,
+   because panning happens when the samples are played, not when they are made. */
+const int CHIP_CACHE_MAX = 32;
+array<string> g_chip_cache_key;
+array<array<int16>@> g_chip_cache_pcm;
+
+int chip_cache_find(const string&in key) {
+	for (uint i = 0; i < g_chip_cache_key.length(); i++) {
+		if (g_chip_cache_key[i] == key) return int(i);
+	}
+	return -1;
+}
+
+void chip_cache_add(const string&in key, array<int16>@ pcm) {
+	if (@pcm is null or pcm.length() == 0) return;
+	if (chip_cache_find(key) >= 0) return;
+	if (g_chip_cache_key.length() >= uint(CHIP_CACHE_MAX)) {
+		g_chip_cache_key.remove_at(0);
+		g_chip_cache_pcm.remove_at(0);
+	}
+	g_chip_cache_key.insert_last(key);
+	g_chip_cache_pcm.insert_last(pcm);
+}
+
+/* The key holds the speed and the pitch as well as the device and the words.
+   Without them a line made at one setting would be played back at another,
+   which is the whole failure this feature could have: the player slows a
+   machine down and hears the same fast line come back out of the cache. The
+   cache never has to be emptied when a setting changes, which is what lets the
+   line in flight finish at the speed it started at. */
+string chip_cache_key_for(int device, const string&in text) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	int speed = (@p is null) ? CHIP_SPEED_DEFAULT : p.speed_pct;
+	int pitch = (@p is null) ? CHIP_PITCH_NORMAL : p.pitch_pct;
+	return "" + device + ":" + speed + ":" + pitch + ":" + text;
+}
+
+/* How much of the line in flight has been written, so the work can be watched
+   being spread across frames rather than taken on trust. */
+int chip_render_progress() {
+	if (@g_chip_rendering is null) return -1;
+	return g_chip_rendering.written;
+}
+
+void chip_say(const string&in text, int device = CHIP_DEVICE_COMPUTER, int pan = 0, float gain_db = 0.0) {
+	g_last_chip_text = text;
+	int cached = chip_cache_find(chip_cache_key_for(device, text));
+	if (cached >= 0) {
+		g_chip_cache_hits++;
+		chip_play_pcm(g_chip_cache_pcm[uint(cached)], device, pan, gain_db);
+		return;
+	}
+	chip_render_state@ st = chip_render_state();
+	st.device = device;
+	st.pan = pan;
+	st.text = text;
+	chip_voice_profile@ sp = chip_profile_of(device);
+	st.speed_pct = (@sp is null) ? CHIP_SPEED_DEFAULT : sp.speed_pct;
+	@st.pcm = array<int16>();
+	if (!chip_program_for_text(text, device, st)) {
+		log_line("chip", "the chip had nothing to say for: " + text);
+		return;
+	}
+	g_chip_pending_gain = gain_db;
+	g_chip_queue.insert_last(st);
+	g_chip_spoken++;
+}
+
+/* One frame's worth of chip work, called from hardware_tick(), which runs
+   whether or not a screen is open, so a chip line is never held up by the player
+   reading a menu. It stops on a sample count and on a stopwatch, so a slower
+   machine spends the same slice of a frame rather than a long one. */
+void chip_tick() {
+	if (@g_chip_rendering is null) {
+		if (g_chip_queue.length() == 0) return;
+		@g_chip_rendering = g_chip_queue[0];
+		g_chip_queue.remove_at(0);
+		g_chip_last_frames = 0;
+	}
+	g_chip_last_frames++;
+	uint started = ticks();
+	bool done = false;
+	while (!done) {
+		done = chip_render_step(g_chip_rendering, CHIP_SAMPLES_PER_FRAME);
+		if (done) break;
+		if (ticks() - started >= CHIP_RENDER_BUDGET_MS) break;
+	}
+	if (done) {
+		array<int16>@ finished_pcm = g_chip_rendering.pcm;
+		finished_pcm.resize(uint(g_chip_rendering.written));
+		chip_normalise(finished_pcm, chip_profile_of(g_chip_rendering.device).amp_pct);
+		chip_cache_add(chip_cache_key_for(g_chip_rendering.device, g_chip_rendering.text), finished_pcm);
+		chip_play_pcm(finished_pcm, g_chip_rendering.device, g_chip_rendering.pan, g_chip_pending_gain);
+		@g_chip_rendering = null;
+	}
+}
+
+/* How much chip audio is waiting, for the tests and for anybody wondering why
+   the chip is quiet. */
+int chip_pending_lines() {
+	int n = int(g_chip_queue.length());
+	if (@g_chip_rendering !is null) n++;
+	return n;
+}
+
+/* Every chip line queued and not yet heard, thrown away. The cache is
+   deliberately left alone: those lines are already rendered. */
+void chip_silence() {
+	g_chip_queue.resize(0);
+	@g_chip_rendering = null;
+	for (uint i = 0; i < g_chip_players.length(); i++) {
+		if (@g_chip_players[i] != null and g_chip_players[i].active) g_chip_players[i].stop();
+		if (i < g_chip_player_device.length()) g_chip_player_device[i] = -1;
+	}
+}
+
+/* Throw away what ONE machine is saying: the lines it has queued, the line being
+   rendered for it, and the line it is in the middle of. A machine's screen asks
+   for this as the cursor moves, exactly the way the player's own voice is
+   interrupted on every move, so the line the cursor has left is not still being
+   read out over the line it has landed on. The other machine is left alone: a
+   phone in the player's pocket is not the terminal they are reading. */
+void chip_stop_device(int device) {
+	for (int i = int(g_chip_queue.length()) - 1; i >= 0; i--) {
+		if (g_chip_queue[uint(i)].device == device) g_chip_queue.remove_at(uint(i));
+	}
+	if (@g_chip_rendering !is null and g_chip_rendering.device == device) @g_chip_rendering = null;
+	for (uint i = 0; i < g_chip_players.length(); i++) {
+		if (i >= g_chip_player_device.length()) break;
+		if (g_chip_player_device[i] != device) continue;
+		if (@g_chip_players[i] != null and g_chip_players[i].active) g_chip_players[i].stop();
+		g_chip_player_until[i] = 0;
+	}
+}
+
+/* One utterance, start to finish, in a single call. The game never uses this:
+   it is here for tools that want finished samples without waiting for frames. */
+array<int16>@ chip_render_all(const string&in text, int device = CHIP_DEVICE_COMPUTER) {
+	chip_render_state@ st = chip_render_state();
+	st.device = device;
+	st.text = text;
+	chip_voice_profile@ sp = chip_profile_of(device);
+	st.speed_pct = (@sp is null) ? CHIP_SPEED_DEFAULT : sp.speed_pct;
+	@st.pcm = array<int16>();
+	g_chip_peak_source = 0.0;
+	g_chip_peak_tract = 0.0;
+	if (!chip_program_for_text(text, device, st)) return array<int16>();
+	while (!chip_render_step(st, 100000000)) { }
+	st.pcm.resize(uint(st.written));
+	chip_normalise(st.pcm, chip_profile_of(device).amp_pct);
+	return st.pcm;
+}
+
+/* Wait for the queue to drain. Bounded, so a broken renderer fails instead of
+   hanging. Nothing in the game needs it. */
+bool chip_wait_for_render(int max_frames = 20000) {
+	int frames = 0;
+	while ((@g_chip_rendering !is null or g_chip_queue.length() > 0) and frames < max_frames) {
+		chip_tick();
+		frames++;
+	}
+	return (@g_chip_rendering is null and g_chip_queue.length() == 0);
+}
+
+/* Write interleaved samples to a wav file, header and all. Nothing in the game
+   calls this: it is how a chip line becomes a wav in logs/ for a human to listen
+   to, so you can hear what a chip sounds like, and which side of the head each
+   count came out of, without walking to the terminal in the game to find out.
+
+   The header is spelled out here rather than written by the engine's wav
+   encoder, and that is a measurement rather than a preference. audio_wav_encoder
+   drains into the audio engine in real time and truncates on close(): asked to
+   write 54623 frames it reported all 54623 written and left a file holding
+   12539, and it lost the same four fifths of every other size tried. A file a
+   human is asked to judge by ear is worse than no file at all when a fifth of
+   it is there, so the 44 bytes of header below are written by hand and the
+   samples go straight to the disk, which is byte exact and needs no waiting. */
+bool chip_write_wav(const string&in path, array<int16>@ pcm, int rate, int channels, int &out written) {
+	written = 0;
+	if (@pcm is null or pcm.length() == 0 or channels < 1 or rate < 1) return false;
+	uint per_frame = uint(channels);
+	if (pcm.length() % per_frame != 0) return false;
+	uint frames = pcm.length() / per_frame;
+	uint data_bytes = uint(pcm.length()) * 2;
+
+	file f;
+	if (!f.open(path, "wb")) {
+		log_line("chip", "could not open " + path + " to write the chip's samples");
+		return false;
+	}
+	f.write_uint(0x46464952);                 /* "RIFF" */
+	f.write_uint(36 + data_bytes);
+	f.write_uint(0x45564157);                 /* "WAVE" */
+	f.write_uint(0x20746d66);                 /* "fmt " */
+	f.write_uint(16);
+	f.write_uint16(uint16(1));                /* PCM, uncompressed */
+	f.write_uint16(uint16(channels));
+	f.write_uint(uint(rate));
+	f.write_uint(uint(rate) * per_frame * 2);
+	f.write_uint16(uint16(per_frame * 2));    /* block align */
+	f.write_uint16(uint16(16));               /* bits per sample */
+	f.write_uint(0x61746164);                 /* "data" */
+	f.write_uint(data_bytes);
+	for (uint i = 0; i < pcm.length(); i++) f.write_int16(pcm[i]);
+	f.close();
+	written = int(frames);
+	if (!file_exists(path)) {
+		log_line("chip", "wrote " + path + " but it is not there");
+		return false;
+	}
+	return true;
+}
+
+/* ==========================================================================
+   8.  A SHORT TONE FROM THE SAME CHIP
+   --------------------------------------------------------------------------
+   The calibration wants something that cannot be mistaken for speech: a square
+   blip through the chip's own 4 bit volume, so it belongs to the same machine.
+   ========================================================================== */
+
+array<int16>@ chip_beep_pcm(int device = CHIP_DEVICE_COMPUTER, int ms = 130, double hz = 620.0) {
+	chip_voice_profile@ p = chip_profile_of(device);
+	array<int16>@ pcm = array<int16>();
+	double rate = double(p.sample_rate);
+	int total = int(rate * double(ms) / 1000.0);
+	double phase = 0.0;
+	for (int i = 0; i < total; i++) {
+		phase += hz / rate;
+		if (phase >= 1.0) phase -= 1.0;
+		double v = (phase < 0.5) ? 0.55 : -0.55;
+		/* A short fade at each end keeps it a blip rather than a click. */
+		if (i < 40) v *= double(i) / 40.0;
+		if (i > total - 60) v *= double(total - i) / 60.0;
+		/* the chip's own 4 bit volume, quantised, then a converter if the box
+		   has a narrow one */
+		v = floor(v * 15.0 + 0.5) / 15.0;
+		if (p.bits >= 2) {
+			double q = 2.0 / pow(2.0, double(p.bits));
+			v = q * floor(v / q + 0.5);
+		}
+		if (v > 1.0) v = 1.0;
+		if (v < -1.0) v = -1.0;
+		pcm.insert_last(int16(int(v * 32000.0)));
+	}
+	return pcm;
+}
+
+void chip_beep(int device = CHIP_DEVICE_COMPUTER, int pan = 0, int ms = 130, float gain_db = -2.0) {
+	array<int16>@ pcm = chip_beep_pcm(device, ms, 620.0);
+	chip_normalise(pcm, chip_profile_of(device).amp_pct);
+	chip_play_pcm(pcm, device, pan, gain_db);
+}
+
+/* ==========================================================================
+   9.  SETUP
+   ========================================================================== */
+
+void chip_init() {
+	@ g_chip_computer = chip_voice_profile();
+	@ g_chip_phone    = chip_voice_profile();
+
+	/* The terminal: the chip at the clock its ROM was checked against. */
+	g_chip_computer.name = "the back office chip";
+	g_chip_computer.sample_rate = 11025;
+	g_chip_computer.ff = 231;              /* fc = 20 kHz */
+	g_chip_computer.rate_code = 6;         /* a frame is 41 ms */
+	g_chip_computer.articulation = 4;
+	g_chip_computer.amplitude = 15;
+	g_chip_computer.pitch_hz = 104;
+	g_chip_computer.glide_field = 0;
+	g_chip_computer.oversample = 2;
+	g_chip_computer.bits = 0;              /* the chip's own 4 bit volume is enough */
+	g_chip_computer.dropout_pct = 0;
+	g_chip_computer.amp_pct = 100;
+	g_chip_computer.hiss_pct = 3;
+	g_chip_computer.speed_pct = CHIP_SPEED_DEFAULT;
+	g_chip_computer.pitch_pct = CHIP_PITCH_NORMAL;
+	chip_profile_from_config(g_chip_computer, "chip_computer");
+
+	/* The phone: a handset chip, so still smaller and higher than the terminal,
+	   with a narrow converter and the odd lost block. It used to run its filter
+	   clock at 8.9 kHz, which put every formant below half where it belongs and
+	   made whole words unrecognisable, and it lost a block in eight: a cheap
+	   handset is meant to sound cheap, not to be unlistenable. The order the
+	   player types into it is what has to be understood down a phone line. */
+	g_chip_phone.name = "the phone chip";
+	g_chip_phone.sample_rate = 8000;
+	g_chip_phone.ff = 227;                 /* fc = 17.2 kHz: a small tract, but
+	                                          every vowel still lands in speech */
+	g_chip_phone.rate_code = 6;
+	g_chip_phone.articulation = 4;
+	g_chip_phone.amplitude = 14;
+	g_chip_phone.pitch_hz = 132;
+	g_chip_phone.glide_field = 1;
+	g_chip_phone.oversample = 2;
+	g_chip_phone.bits = 5;                 /* 32 levels: gritty, not gargled */
+	g_chip_phone.dropout_pct = 3;
+	g_chip_phone.amp_pct = 100;
+	g_chip_phone.hiss_pct = 6;
+	g_chip_phone.speed_pct = CHIP_SPEED_DEFAULT;
+	g_chip_phone.pitch_pct = CHIP_PITCH_NORMAL;
+	chip_profile_from_config(g_chip_phone, "chip_phone");
+
+	g_chip_volume_db = cfg_int("chip_volume_db", g_chip_volume_db);
+	g_chip_mirror = cfg_int("chip_mirror_lines", g_chip_mirror);
+	CHIP_SAMPLES_PER_FRAME = cfg_int("chip_samples_per_frame", CHIP_SAMPLES_PER_FRAME);
+	CHIP_RENDER_BUDGET_MS = uint(cfg_int("chip_render_budget_ms", int(CHIP_RENDER_BUDGET_MS)));
+
+	chip_build_tables();
+
+	g_rom_name.resize(0);
+	g_rom_f1.resize(0); g_rom_f2.resize(0); g_rom_f3.resize(0);
+	g_rom_nas.resize(0); g_rom_va.resize(0); g_rom_fa.resize(0);
+	g_rom_cls1.resize(0); g_rom_cls2.resize(0); g_rom_cc.resize(0);
+	string[]@ recs = CHIP_ROM_TABLE.split(";");
+	for (uint i = 0; i < recs.length(); i++) {
+		string rec = recs[i].trim_whitespace();
+		if (rec.length() == 0) continue;
+		string[]@ parts = rec.split(",");
+		if (parts.length() < 11) continue;
+		g_rom_name.insert_last(parts[1].trim_whitespace());
+		g_rom_f1.insert_last(parse_int(parts[2]));
+		g_rom_f2.insert_last(parse_int(parts[3]));
+		g_rom_f3.insert_last(parse_int(parts[4]));
+		g_rom_nas.insert_last(parse_int(parts[5]));
+		g_rom_va.insert_last(parse_int(parts[6]));
+		g_rom_fa.insert_last(parse_int(parts[7]));
+		g_rom_cls1.insert_last(parse_int(parts[8]));
+		g_rom_cls2.insert_last(parse_int(parts[9]));
+		g_rom_cc.insert_last(parse_int(parts[10]));
+	}
+
+	g_word_key.resize(0); g_word_code.resize(0);
+	string[]@ words = CHIP_WORDS.split(";");
+	for (uint i = 0; i < words.length(); i++) {
+		string rec = words[i].trim_whitespace();
+		int eq = rec.find_first("=");
+		if (eq <= 0) continue;
+		g_word_key.insert_last(rec.substr(0, uint(eq)));
+		g_word_code.insert_last(rec.substr(uint(eq) + 1).trim_whitespace());
+	}
+	/* The number words and the spelling rules, so a line the dictionary does not
+	   know is still spoken rather than spelled. */
+	chip_build_front_end();
+
+	g_chip_players.resize(0);
+	g_chip_player_until.resize(0);
+	g_chip_player_device.resize(0);
+	for (int i = 0; i < CHIP_PLAYERS; i++) {
+		g_chip_players.insert_last(sound());
+		g_chip_player_until.insert_last(0);
+		g_chip_player_device.insert_last(-1);
+	}
+	chip_silence();
+	log_line("chip", "hardware speech chips ready: " + g_rom_name.length() + " phonemes off the ROM, "
+		+ g_word_key.length() + " words in our own code, " + g_chip_computer.name + " at "
+		+ chip_fc(g_chip_computer) + " Hz of filter clock and " + g_chip_computer.sample_rate + " Hz out");
+	log_line("chip", "speech settings: terminal " + g_chip_computer.speed_pct + " per cent of normal at "
+		+ g_chip_computer.pitch_pct + " per cent pitch, phone " + g_chip_phone.speed_pct + " and "
+		+ g_chip_phone.pitch_pct + " per cent, so a frame lasts "
+		+ chip_frame_seconds(g_chip_computer) * 1000.0 + " ms on the terminal");
+}

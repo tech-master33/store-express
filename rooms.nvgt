@@ -1,0 +1,1046 @@
+/* ============================================================================
+   Store Express  -  rooms.nvgt
+   ----------------------------------------------------------------------------
+   The map. Six separate room grids rather than one large area:
+
+       0  ROOM_SHOP        the shop floor, register, ten aisles, entry doors
+       1  ROOM_OFFICE      manager terminal, safe and the secure back door
+       2  ROOM_APARTMENT   the studio apartment behind the office
+       3  ROOM_COOLER      the walk in cooler
+       4  ROOM_FREEZER     the walk in freezer
+       5  ROOM_FORECOURT   the fuel forecourt and the road
+
+   Responsibilities:
+     * Room definitions: size, floor material, ambience blurb.
+     * Coordinate vectors. Every tile is a metre square and the player always
+       stands at a tile centre, so a tile is x+0.5, y+0.5.
+     * Interactables ("things") the player can walk up to and use.
+     * Doorways / threshold vectors: stepping onto one moves you to another room.
+     * The multi-room audio isolation table, pushed into audio.nvgt.
+     * Mess on the floor: spills, wet patches, sick and broken glass.
+     * The overhead camera, which moves the ears without moving the body.
+     * Go-to, the location readout and the room scan.
+
+   SPEAKING ABOUT DIRECTIONS
+   Facing is real, so "to your right" means your right, not north's right. Every
+   spoken direction is rotated into listener space by world_to_rel() first, and
+   the same facing value is handed to the spatialiser, so what you hear and what
+   the shop says always agree. Facing is one of four quarter turns, so the
+   rotation is a table lookup and needs no trigonometry.
+
+   INCLUDE ORDER
+     Included after core.nvgt and audio.nvgt. This file never calls into money,
+     shop, staff, people, trouble, mechanics or main.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  ROOM IDENTITY
+   ========================================================================= */
+
+enum room_id {
+	ROOM_SHOP = 0, ROOM_OFFICE = 1, ROOM_APARTMENT = 2,
+	ROOM_COOLER = 3, ROOM_FREEZER = 4, ROOM_FORECOURT = 5
+};
+const int ROOM_COUNT = 6;
+
+/* Floor materials, which decide the footstep. */
+enum mat_id { MAT_TILE = 0, MAT_CARPET, MAT_CONCRETE, MAT_ASPHALT };
+
+string room_name(int r) {
+	switch (r) {
+		case ROOM_SHOP:      return "the main shop floor";
+		case ROOM_OFFICE:    return "the back office";
+		case ROOM_APARTMENT: return "your apartment";
+		case ROOM_COOLER:    return "the walk in cooler";
+		case ROOM_FREEZER:   return "the walk in freezer";
+		case ROOM_FORECOURT: return "the fuel forecourt";
+	}
+	return "an unknown place";
+}
+
+string room_ambience_word(int r) {
+	switch (r) {
+		case ROOM_SHOP:      return "coolers humming and the aisles ticking";
+		case ROOM_OFFICE:    return "a computer fan and a keyboard";
+		case ROOM_APARTMENT: return "a small fridge and a television";
+		case ROOM_COOLER:    return "cold air and compressor noise";
+		case ROOM_FREEZER:   return "a deep frozen hum and your own breathing";
+		case ROOM_FORECOURT: return "idling engines and a fuel pump";
+	}
+	return "silence";
+}
+
+class room_def {
+	int    id;
+	string name;
+	float  width;
+	float  height;
+	int    material;
+	room_def(int i, float w, float h, int m) {
+		id = i; name = room_name(i); width = w; height = h; material = m;
+	}
+}
+
+array<room_def@> g_rooms;
+
+room_def@ room_by_id(int id) {
+	for (uint i = 0; i < g_rooms.length(); i++) if (g_rooms[i].id == id) return g_rooms[i];
+	return null;
+}
+
+float room_width(int id)  { room_def@ r = room_by_id(id); return (@r is null) ? 10.0 : r.width; }
+float room_height(int id) { room_def@ r = room_by_id(id); return (@r is null) ? 10.0 : r.height; }
+int   room_material(int id) { room_def@ r = room_by_id(id); return (@r is null) ? MAT_TILE : r.material; }
+
+string room_size_text(int id) {
+	room_def@ r = room_by_id(id);
+	if (@r is null) return "unknown size";
+	return "" + int(r.width) + " tiles wide by " + int(r.height) + " tiles deep";
+}
+
+/* ==========================================================================
+   2.  INTERACTABLES
+   ========================================================================= */
+
+enum interact_kind {
+	IK_NONE = 0,
+	IK_QUEUE_TILL,      /* where customers queue, and where the owner serves */
+	IK_REGISTER,        /* the till itself */
+	IK_SHELF_FACE,      /* one face of one aisle; ref holds the face index */
+	IK_COUNTER,         /* the restricted goods behind the counter */
+	IK_COFFEE,          /* the coffee station */
+	IK_FOUNTAIN,        /* the soda fountain */
+	IK_FRIDGE_CASE,     /* a refrigerated display case */
+	IK_FROZEN_CASE,     /* a frozen food case */
+	IK_COOLER_DOOR,
+	IK_FREEZER_DOOR,
+	IK_COOLER_RACK,
+	IK_FREEZER_RACK,
+	IK_COMPUTER,        /* the manager terminal */
+	IK_SAFE,
+	IK_BACKDOOR,        /* the office back door, bolted, onto an empty alley */
+	IK_BED,
+	IK_TV,
+	IK_KITCHEN_FRIDGE,
+	IK_PUMP,
+	IK_AIRPUMP,
+	IK_SPEAKERS,        /* the ceiling speaker system */
+	IK_ROAD
+};
+
+string interact_label(int kind) {
+	switch (kind) {
+		case IK_QUEUE_TILL:     return "the end of the counter";
+		case IK_REGISTER:       return "the cash register";
+		case IK_SHELF_FACE:     return "an aisle shelf";
+		case IK_COUNTER:        return "the cigarette and vape cabinet";
+		case IK_COFFEE:         return "the coffee station";
+		case IK_FOUNTAIN:       return "the soda fountain";
+		case IK_FRIDGE_CASE:    return "the refrigerated display cases";
+		case IK_FROZEN_CASE:    return "the frozen food cases";
+		case IK_COOLER_DOOR:    return "the walk in cooler door";
+		case IK_FREEZER_DOOR:   return "the walk in freezer door";
+		case IK_COOLER_RACK:    return "a rack in the cooler";
+		case IK_FREEZER_RACK:   return "a rack in the freezer";
+		case IK_COMPUTER:       return "the manager terminal";
+		case IK_SAFE:           return "the office safe";
+		case IK_BACKDOOR:       return "the office back door";
+		case IK_BED:            return "your bed";
+		case IK_TV:             return "the television";
+		case IK_KITCHEN_FRIDGE: return "the kitchen fridge";
+		case IK_PUMP:           return "a fuel pump";
+		case IK_AIRPUMP:        return "the air and water pump";
+		case IK_SPEAKERS:       return "the ceiling speakers";
+		case IK_ROAD:           return "the road";
+	}
+	return "nothing";
+}
+
+class thing {
+	int    room;
+	float  x, y;         /* always a tile centre: a whole number plus 0.5 */
+	int    kind;
+	string label;
+	bool   solid;
+	int    ref;          /* an index into whatever table the kind belongs to */
+	bool   damaged;      /* knocked over by a drunk, and unusable until repaired */
+	thing(int r, float tx, float ty, int k, const string&in l, bool s, int rf = -1) {
+		room = r; x = tx; y = ty; kind = k; label = l; solid = s; ref = rf; damaged = false;
+	}
+}
+
+array<thing@> g_things;
+
+/* ==========================================================================
+   3.  DOORWAYS / THRESHOLD VECTORS
+   ========================================================================= */
+
+class portal {
+	int    from_room;
+	float  x, y;             // the tile in from_room that triggers the move
+	int    to_room;
+	float  dest_x, dest_y;   // where you appear in to_room
+	double dest_facing;      // the way you end up looking
+	string label;
+	int    sound;            // 0 interior door, 1 back door, 2 shop chime, 3 cold room
+	portal(int fr, float px, float py, int tr, float dx, float dy, double df,
+	       const string&in l, int s) {
+		from_room = fr; x = px; y = py; to_room = tr; dest_x = dx; dest_y = dy;
+		dest_facing = df; label = l; sound = s;
+	}
+}
+
+/* The shop's door bell is one recording twenty two seconds long, and a doorway
+   is the first moment of it. Only the shop's own door rings it: the back door
+   and the doors inside are just doors. */
+const int DOOR_CHIME_CUT_MS = 1500;
+
+array<portal@> g_portals;
+
+/* You pass through by standing on the doorway tile. Because every destination
+   tile is deliberately one full tile clear of the doorway that leads back, you
+   can never arrive already inside a trigger and bounce. */
+const float PORTAL_TRIGGER = 0.3;
+
+/* ==========================================================================
+   4.  PLAYER, CAMERA AND LISTENER STATE
+   ========================================================================= */
+
+int    g_player_room = ROOM_SHOP;
+float  g_px = 4.5;
+float  g_py = 2.5;
+double g_facing = 0.0;               // 0 north, 90 east, 180 south, 270 west
+
+bool   g_cam_up   = false;
+int    g_cam_room = ROOM_SHOP;
+float  g_cam_x = 4.5, g_cam_y = 2.5, g_cam_z = 1.0;
+double g_cam_rot = 0.0;
+bool   g_cam_ambience_off = false;
+
+/* The camera moves the ears without moving the body, so the listener's room can
+   differ from the player's. -1 means "wherever the body is". */
+int    g_lis_room_override = -1;
+
+int rooms_listener_room() { return (g_lis_room_override >= 0) ? g_lis_room_override : g_player_room; }
+
+float fabs2(float v) { return (v < 0.0) ? -v : v; }
+
+int facing_index() {
+	int f = int(g_facing / 90.0 + 0.5) % 4;
+	if (f < 0) f += 4;
+	return f;
+}
+
+string facing_word() {
+	switch (facing_index()) {
+		case 0: return "north";
+		case 1: return "east";
+		case 2: return "south";
+		case 3: return "west";
+	}
+	return "north";
+}
+
+void face_turn(int quarters) {
+	g_facing += 90.0 * quarters;
+	while (g_facing < 0.0) g_facing += 360.0;
+	while (g_facing >= 360.0) g_facing -= 360.0;
+}
+
+float dist2(float ax, float ay, float bx, float by) {
+	float dx = ax - bx;
+	float dy = ay - by;
+	return dx * dx + dy * dy;
+}
+
+float dist(float ax, float ay, float bx, float by) {
+	return float(sqrt(double(dist2(ax, ay, bx, by))));
+}
+
+/* The centre of tile (i, j). Every position in the game is one of these. */
+float tile_centre(int i) { return float(i) + 0.5; }
+
+/* ==========================================================================
+   5.  SPOKEN DIRECTIONS, RELATIVE TO THE WAY YOU ARE FACING
+   ========================================================================= */
+
+/* Rotate a world-space offset into listener space, so +ry is ahead of you and
+   +rx is to your right. Four quarter turns, so this is a table, not trigonometry. */
+void world_to_rel(float dx, float dy, float &out rx, float &out ry) {
+	switch (facing_index()) {
+		case 0:  rx =  dx; ry =  dy; break;   // facing north
+		case 1:  rx = -dy; ry =  dx; break;   // facing east
+		case 2:  rx = -dx; ry = -dy; break;   // facing south
+		default: rx =  dy; ry = -dx; break;   // facing west
+	}
+}
+
+string dir_word(float dx, float dy) {
+	float rx, ry;
+	world_to_rel(dx, dy, rx, ry);
+	bool left   = rx < -0.6;
+	bool right  = rx > 0.6;
+	bool ahead  = ry > 0.6;
+	bool behind = ry < -0.6;
+	if (ahead and right)  return "ahead and to your right";
+	if (ahead and left)   return "ahead and to your left";
+	if (behind and right) return "behind you and to your right";
+	if (behind and left)  return "behind you and to your left";
+	if (ahead)  return "straight ahead of you";
+	if (behind) return "somewhere behind you";
+	if (right)  return "to your right";
+	if (left)   return "to your left";
+	return "right next to you";
+}
+
+/* The arrow key that walks towards something, for go-to and for exits. */
+string key_towards(float dx, float dy) {
+	float rx, ry;
+	world_to_rel(dx, dy, rx, ry);
+	if (fabs2(ry) >= fabs2(rx)) return (ry >= 0.0) ? "the up arrow" : "the down arrow";
+	return (rx >= 0.0) ? "the right arrow" : "the left arrow";
+}
+
+string tiles_away(int n) {
+	if (n <= 0) return "right next to you";
+	if (n == 1) return "one tile away";
+	return "" + n + " tiles away";
+}
+
+/* ==========================================================================
+   6.  MESS ON THE FLOOR
+   --------------------------------------------------------------------------
+   Spilled drinks, sticky patches and, occasionally, a drunk's last meal. You
+   find them the way your customers do: by stepping in them. A wet spill dries
+   sticky after about an hour and a half of game time. Sick never dries.
+   ========================================================================= */
+
+enum mess_kind { MESS_SPILL = 0, MESS_WET, MESS_SICK, MESS_GLASS };
+
+class mess {
+	int    room;
+	float  x, y;
+	int    kind;
+	int    dry_in;      // minutes until a wet patch becomes sticky; -1 means never
+	mess(int r, float mx, float my, int k, int d) { room = r; x = mx; y = my; kind = k; dry_in = d; }
+}
+
+array<mess@> g_mess;
+
+string mess_word(int kind) {
+	switch (kind) {
+		case MESS_SPILL: return "a sticky spill";
+		case MESS_WET:   return "a wet patch";
+		case MESS_SICK:  return "something you would rather not identify";
+		case MESS_GLASS: return "broken glass";
+	}
+	return "a mess";
+}
+
+mess@ mess_at(int room, float x, float y) {
+	for (uint i = 0; i < g_mess.length(); i++) {
+		mess@ m = g_mess[i];
+		if (m.room == room and dist2(m.x, m.y, x, y) < 0.2) return m;
+	}
+	return null;
+}
+
+mess@ mess_add(int room, float x, float y, int kind) {
+	mess@ existing = mess_at(room, x, y);
+	if (@existing !is null) {
+		/* A second spill on a sticky patch makes it wet again. */
+		if (kind == MESS_WET or kind == MESS_SPILL) { existing.kind = MESS_WET; existing.dry_in = 90; }
+		return existing;
+	}
+	int dry = (kind == MESS_WET) ? 90 : -1;     // about an hour and a half of game time
+	mess@ m = mess(room, x, y, kind, dry);
+	g_mess.insert_last(m);
+	return m;
+}
+
+void mess_remove_at(int room, float x, float y) {
+	for (int i = int(g_mess.length()) - 1; i >= 0; i--) {
+		mess@ m = g_mess[i];
+		if (m.room == room and dist2(m.x, m.y, x, y) < 0.2) g_mess.remove_at(uint(i));
+	}
+}
+
+int mess_count_in(int room) {
+	int n = 0;
+	for (uint i = 0; i < g_mess.length(); i++) if (g_mess[i].room == room) n++;
+	return n;
+}
+
+/* Called once per simulated game minute by mechanics.nvgt. */
+void mess_tick_minute() {
+	for (uint i = 0; i < g_mess.length(); i++) {
+		mess@ m = g_mess[i];
+		if (m.kind != MESS_WET or m.dry_in < 0) continue;
+		m.dry_in--;
+		if (m.dry_in <= 0) { m.kind = MESS_SPILL; m.dry_in = -1; }
+	}
+}
+
+/* ==========================================================================
+   7.  FOOTSTEPS AND WALLS
+   ========================================================================= */
+
+void sfx_squish(int room, float x, float y, float gain) { sfx_at(room, x, y, 0.0, A("squish.mp3"), gain); }
+void sfx_glass(int room, float x, float y, float gain)  { sfx_at(room, x, y, 0.0, A("crash.mp3"), gain); }
+
+/* Every floor has a recording of its own, and every floor has three steps of it.
+   One step repeated on every foot is the sound of a machine walking, so a tile
+   step, a carpet step, a concrete step and a gravel step are each drawn from
+   three measured variants and played in turn.
+
+   A recording of somebody walking is not one cue: the tile and carpet files are
+   half a minute long, so a variant is an offset into a file - the moment that
+   step actually starts - with a short cut after it. The offsets and the level of
+   every step were measured with ffmpeg and the numbers are written down in
+   assets/manifest.txt; each variant's gain is what puts every step of a floor at
+   the same level, so walking never jumps in volume from one foot to the next.
+   No variant is played with a positive gain - a floor whose steps are quiet
+   plays quieter rather than louder - so the loudest variant of a floor sets the
+   ceiling for its three steps. Carpet used to be the one floor whose steps could
+   not be heard at all, however carefully its recording was levelled: a soft
+   recording of a foot on a soft floor is a quiet thing, and levelling it only
+   made it as loud as its own quietest neighbour. It is played from a different
+   recording now, of shoes rather than socks on the same carpet, whose steps land
+   at the same heard level as the shop's tile - the loudest floor, so that no
+   floor is lost under the room it is in.
+
+   A cue played from an offset needs its bundled tone to be silent up to the
+   smallest offset in its file, or a failed download is silence where the step
+   should be: see the placeholder tones in assets/placeholder/ and the recipe in
+   the manifest. */
+const int FOOTSTEP_CUT_MS = 450;
+const int STEP_VARIANTS   = 3;
+
+class step_variant {
+	string file;
+	double offset;
+	float  gain;
+	step_variant(const string&in f, double o, float g) { file = f; offset = o; gain = g; }
+}
+
+array<step_variant@> g_step_variants;   /* STEP_VARIANTS per material, in mat_id order */
+int g_step_variant = 0;                 /* which of them the next step takes */
+
+/* Three steps for every floor, in mat_id order: the file, where in it the step
+   is, and what it takes to sit level with its neighbours. */
+void footsteps_init() {
+	g_step_variants.resize(0);
+	/* MAT_TILE - the shop floor */
+	g_step_variants.insert_last(step_variant("step_tile.mp3",       7.02,   0.0));
+	g_step_variants.insert_last(step_variant("step_tile.mp3",      10.26,  -2.7));
+	g_step_variants.insert_last(step_variant("step_tile.mp3",      13.26,  -4.3));
+	/* MAT_CARPET - the office and the apartment */
+	g_step_variants.insert_last(step_variant("step_carpet.mp3",     3.60,  -6.2));
+	g_step_variants.insert_last(step_variant("step_carpet.mp3",     8.10,  -9.2));
+	g_step_variants.insert_last(step_variant("step_carpet.mp3",    14.10,  -7.8));
+	/* MAT_CONCRETE - the walk ins, from two recordings of them */
+	g_step_variants.insert_last(step_variant("step_concrete.mp3",   0.00, -11.5));
+	g_step_variants.insert_last(step_variant("step_concrete2.mp3",  3.90,  -1.1));
+	g_step_variants.insert_last(step_variant("step_concrete2.mp3",  7.96,  -1.2));
+	/* MAT_ASPHALT - the forecourt, including the gravel step it always had */
+	g_step_variants.insert_last(step_variant("footstep.mp3",        0.00, -11.4));
+	g_step_variants.insert_last(step_variant("step_asphalt.mp3",    4.42,  -2.3));
+	g_step_variants.insert_last(step_variant("step_asphalt.mp3",    6.72,   0.0));
+}
+
+/* The next step of that floor, in turn. The cursor moves on every step, so two
+   steps in a row are never the same recording of a foot. */
+step_variant@ footstep_pick(int mat) {
+	int base = mat*STEP_VARIANTS;
+	if (base < 0 or base + STEP_VARIANTS > int(g_step_variants.length())) base = 0;
+	int v = g_step_variant % STEP_VARIANTS;
+	g_step_variant = (g_step_variant + 1) % STEP_VARIANTS;
+	return g_step_variants[base + v];
+}
+
+/* The wall you walked into, in the room's own voice: plasterboard in the shop,
+   the office and the apartment, sheet metal in the walk in cooler and freezer.
+   It is positioned at the wall rather than played in your own head, so it says
+   which side you hit as well as that you hit one. */
+const int WALL_CUT_MS = 600;
+
+string wall_sound(int room) {
+	if (room == ROOM_COOLER or room == ROOM_FREEZER) return A("wall_metal.mp3");
+	return A("wall_bump.mp3");
+}
+
+float wall_gain(int room) {
+	return (room == ROOM_COOLER or room == ROOM_FREEZER) ? -2.2 : -11.8;
+}
+
+double wall_offset_for(int room) {
+	return (room == ROOM_COOLER or room == ROOM_FREEZER) ? 0.0 : 0.36;
+}
+
+/* Play the right footstep for where the feet actually are. Mess always wins:
+   a squelch or a crunch, never a clean step. */
+void footstep_at(int room, float x, float y) {
+	mess@ m = mess_at(room, x, y);
+	if (@m !is null) {
+		if (m.kind == MESS_GLASS) sfx_glass(room, x, y, -10.0);
+		else sfx_squish(room, x, y, -8.0);
+		return;
+	}
+	step_variant@ v = footstep_pick(room_material(room));
+	if (@v is null) return;
+	sfx_at(room, x, y, 0.0, A(v.file), v.gain, FOOTSTEP_CUT_MS, v.offset);
+}
+
+/* ==========================================================================
+   8.  ROOM AUDIBILITY  (drives the multi-room isolation in audio.nvgt)
+   ========================================================================= */
+
+bool rooms_are_adjacent(int a, int b) {
+	if (a == b) return true;
+	for (uint i = 0; i < g_portals.length(); i++) {
+		portal@ p = g_portals[i];
+		if ((p.from_room == a and p.to_room == b) or (p.from_room == b and p.to_room == a)) return true;
+	}
+	return false;
+}
+
+/* Rebuild the per-room gain table. Same room: full. Adjacent room: heavy
+   muffling, so you hear that something is happening through the wall but cannot
+   locate it. Anything further away: silent. */
+void rooms_refresh_audibility() {
+	array<float> gains;
+	gains.resize(ROOM_COUNT);
+	for (int r = 0; r < ROOM_COUNT; r++) {
+		if (r == rooms_listener_room()) gains[r] = 0.0;
+		else if (rooms_are_adjacent(rooms_listener_room(), r)) gains[r] = g_muffle_gain;
+		else gains[r] = -96.0;
+	}
+	audio_set_room_gains(gains);
+	diag("rooms", "audibility refreshed for " + room_name(rooms_listener_room()));
+}
+
+/* ==========================================================================
+   9.  LOOKUPS
+   ========================================================================= */
+
+thing@ thing_at(int room, float x, float y, float radius) {
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != room) continue;
+		if (dist2(t.x, t.y, x, y) <= radius * radius) return t;
+	}
+	return null;
+}
+
+thing@ thing_find(int room, int kind, int ref = -1) {
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != room or t.kind != kind) continue;
+		if (ref >= 0 and t.ref != ref) continue;
+		return t;
+	}
+	return null;
+}
+
+/* The nearest thing you could plausibly use, preferring whatever you are
+   actually facing. Two things side by side should not be a coin toss. */
+thing@ thing_under_player() {
+	thing@ best = null;
+	float best_score = 9999.0;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != g_player_room) continue;
+		float d2 = dist2(t.x, t.y, g_px, g_py);
+		if (d2 > 1.5 * 1.5) continue;
+		float rx, ry;
+		world_to_rel(t.x - g_px, t.y - g_py, rx, ry);
+		/* Ahead of you costs nothing; behind you costs a lot; sideways a little. */
+		float score = d2;
+		if (ry < -0.3) score += 3.0;
+		else if (fabs2(rx) > fabs2(ry)) score += 0.6;
+		if (score < best_score) { best_score = score; @ best = t; }
+	}
+	return best;
+}
+
+/* ==========================================================================
+   10.  THE OVERHEAD CAMERA
+   --------------------------------------------------------------------------
+   Z lifts your ears up above the room, as if you were a camera on the ceiling,
+   while your body stays put. It is the best way to hear where everybody is at
+   once. Push it through a doorway and it goes into the next room, so you can
+   listen in on the office while you stand at the till.
+   ========================================================================= */
+
+void rooms_camera_drop() { g_cam_up = false; g_lis_room_override = -1; rooms_refresh_audibility(); }
+
+void rooms_camera_raise() {
+	g_cam_up = true;
+	g_cam_room = g_player_room;
+	g_cam_x = g_px; g_cam_y = g_py; g_cam_z = 1.0; g_cam_rot = g_facing;
+	g_lis_room_override = g_cam_room;
+	rooms_refresh_audibility();
+	say("Overhead camera up, one metre above you in " + room_name(g_cam_room)
+		+ ". The arrows move the camera now, and Page Up and Page Down change its height. "
+		+ "Z brings your ears back to your body.", true);
+}
+
+void rooms_camera_toggle() {
+	if (g_cam_up) { rooms_camera_drop(); say("Your ears are back with your body.", true); }
+	else rooms_camera_raise();
+}
+
+void rooms_camera_center() {
+	g_cam_x = g_px; g_cam_y = g_py;
+	say("Camera centred on you.", true);
+}
+
+/* Move the camera, including through a doorway into the next room. */
+void rooms_camera_move(float dx, float dy) {
+	float nx = g_cam_x + dx;
+	float ny = g_cam_y + dy;
+	if (nx < 0.5 or ny < 0.5 or nx > (room_width(g_cam_room) - 0.5) or ny > (room_height(g_cam_room) - 0.5)) {
+		say("The camera has reached the edge of " + room_name(g_cam_room) + ".", false);
+		return;
+	}
+	g_cam_x = nx; g_cam_y = ny;
+	for (uint i = 0; i < g_portals.length(); i++) {
+		portal@ p = g_portals[i];
+		if (p.from_room != g_cam_room) continue;
+		if (dist(p.x, p.y, g_cam_x, g_cam_y) < 0.4) {
+			g_cam_room = p.to_room;
+			g_cam_x = p.dest_x; g_cam_y = p.dest_y;
+			g_lis_room_override = g_cam_room;
+			rooms_refresh_audibility();
+			sfx_ui(A("door_open.ogg"), -16.0);
+			say("The camera is now in " + room_name(g_cam_room) + ".", true);
+			return;
+		}
+	}
+}
+
+void rooms_camera_height(float dz) {
+	g_cam_z += dz;
+	if (g_cam_z < -5.0) g_cam_z = -5.0;
+	if (g_cam_z > 30.0) g_cam_z = 30.0;
+	say("Camera at " + num1(g_cam_z) + " metres.", true);
+}
+
+/* Whatever the ears are attached to this frame. */
+void rooms_listener(float &out lx, float &out ly, float &out lz, double &out rot, int &out room) {
+	if (g_cam_up) { lx = g_cam_x; ly = g_cam_y; lz = g_cam_z; rot = g_cam_rot; room = g_cam_room; }
+	else { lx = g_px; ly = g_py; lz = 0.0; rot = g_facing; room = g_player_room; }
+}
+
+/* ==========================================================================
+   11.  MOVEMENT AND THRESHOLDS
+   ========================================================================= */
+
+void rooms_enter(int to_room, float dx, float dy, double dfacing, const string&in label, int sound) {
+	int from = g_player_room;
+	g_player_room = to_room;
+	g_px = dx;
+	g_py = dy;
+	g_facing = dfacing;
+	if (g_cam_up) rooms_camera_drop();     // the camera comes back to you on a move
+	rooms_refresh_audibility();
+
+	/* The shop door rings its bell; the back door and the interior doors are just
+	   a door. The bell is cut to the ring: the recording is twenty two seconds
+	   long and only the first moment of it belongs to a doorway. */
+	string doorway_sound = A("door_open.ogg");
+	int doorway_cut = 0;
+	if (sound == 1) doorway_sound = A("back_door.ogg");
+	else if (sound == 2) { doorway_sound = A("chime.ogg"); doorway_cut = DOOR_CHIME_CUT_MS; }
+	sfx_ui(doorway_sound, -6.0, doorway_cut);
+
+	diag("rooms", "moved " + room_name(from) + " -> " + room_name(to_room));
+	say(label + ". You are now in " + room_name(to_room) + ", " + room_ambience_word(to_room) + ".", true);
+}
+
+void rooms_check_thresholds() {
+	for (uint i = 0; i < g_portals.length(); i++) {
+		portal@ p = g_portals[i];
+		if (p.from_room != g_player_room) continue;
+		if (dist(p.x, p.y, g_px, g_py) < PORTAL_TRIGGER) {
+			rooms_enter(p.to_room, p.dest_x, p.dest_y, p.dest_facing, p.label, p.sound);
+			return;
+		}
+	}
+}
+
+bool rooms_try_move(float dx, float dy) {
+	if (g_cam_up) return false;             // the camera has the arrows while it is up
+	float nx = g_px + dx;
+	float ny = g_py + dy;
+
+	if (nx < 0.5 or ny < 0.5 or nx > (room_width(g_player_room) - 0.5) or ny > (room_height(g_player_room) - 0.5)) {
+		/* At the wall's own position, not at the listener, so the thud is
+		   already in front of you when the words arrive. */
+		sfx_at(g_player_room, nx, ny, 0.0, wall_sound(g_player_room),
+			wall_gain(g_player_room), WALL_CUT_MS, wall_offset_for(g_player_room));
+		say("A wall.", false);
+		return false;
+	}
+
+	/* Only another solid object stops you. The target tile is exact, because
+	   every position in the game sits on a tile centre. */
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != g_player_room or !t.solid) continue;
+		if (dist2(t.x, t.y, nx, ny) < 0.2) {
+			sfx_ui(A("knock.wav"), -12.0);
+			say("You have walked into " + t.label + ".", false);
+			return false;
+		}
+	}
+
+	g_px = nx;
+	g_py = ny;
+	footstep_at(g_player_room, nx, ny);
+	rooms_check_thresholds();
+	return true;
+}
+
+/* Move one tile relative to the way you are facing.
+   which: 0 forward, 1 back, 2 left, 3 right. */
+bool rooms_step(int which) {
+	float fx = 0.0, fy = 0.0, rx = 0.0, ry = 0.0;
+	switch (facing_index()) {
+		case 0:  fx =  0.0; fy =  1.0; rx =  1.0; ry =  0.0; break;
+		case 1:  fx =  1.0; fy =  0.0; rx =  0.0; ry = -1.0; break;
+		case 2:  fx =  0.0; fy = -1.0; rx = -1.0; ry =  0.0; break;
+		default: fx = -1.0; fy =  0.0; rx =  0.0; ry =  1.0; break;
+	}
+	float dx = 0.0, dy = 0.0;
+	if (which == 0)      { dx =  fx; dy =  fy; }
+	else if (which == 1) { dx = -fx; dy = -fy; }
+	else if (which == 2) { dx = -rx; dy = -ry; }
+	else                 { dx =  rx; dy =  ry; }
+	return rooms_try_move(dx, dy);
+}
+
+/* ==========================================================================
+   12.  GO-TO
+   --------------------------------------------------------------------------
+   G lists every place in the room you are in. Pick one and you walk there, with
+   real footsteps and real travel time. Any key stops the walk. Go-to only covers
+   the room you are in; the list tells you which arrow key takes you through a
+   doorway instead.
+   ========================================================================= */
+
+class goto_rec {
+	string label;
+	float  x, y;
+	bool   is_portal;
+	goto_rec(const string&in l, float gx, float gy, bool p) { label = l; x = gx; y = gy; is_portal = p; }
+}
+
+array<goto_rec@> g_goto;
+bool  g_walking = false;
+uint  g_walk_next = 0;
+float g_walk_tx = 0.0, g_walk_ty = 0.0;
+
+void goto_build() {
+	g_goto.resize(0);
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != g_player_room) continue;
+		if (t.kind == IK_SHELF_FACE) continue;   // twenty of them; they live on the aisle menu
+		g_goto.insert_last(goto_rec(t.label, t.x, t.y, false));
+	}
+	for (uint i = 0; i < g_portals.length(); i++) {
+		portal@ p = g_portals[i];
+		if (p.from_room != g_player_room) continue;
+		g_goto.insert_last(goto_rec(p.label, p.x, p.y, true));
+	}
+}
+
+void goto_start(float tx, float ty, const string&in label) {
+	g_walking = true;
+	g_walk_tx = tx;
+	g_walk_ty = ty;
+	g_walk_next = ticks() + 240;
+	say("Walking to " + label + ". Any key stops you.", true);
+}
+
+void goto_stop(const string&in why) {
+	if (!g_walking) return;
+	g_walking = false;
+	if (why.length() > 0) say(why, true);
+}
+
+/* One step per frame while a go-to is running. */
+void goto_tick() {
+	if (!g_walking or g_cam_up) return;
+	float dx = g_walk_tx - g_px;
+	float dy = g_walk_ty - g_py;
+	if (dist2(g_px, g_py, g_walk_tx, g_walk_ty) < 0.5) { g_walking = false; return; }
+	if (ticks() < g_walk_next) return;
+	g_walk_next = ticks() + 240;
+	/* Take the largest axis first, so you walk in straight lines like a person. */
+	if (fabs2(dx) >= fabs2(dy)) {
+		if (!rooms_try_move((dx > 0.0) ? 1.0 : -1.0, 0.0)) {
+			if (!rooms_try_move(0.0, (dy > 0.0) ? 1.0 : -1.0)) g_walking = false;
+		}
+	} else {
+		if (!rooms_try_move(0.0, (dy > 0.0) ? 1.0 : -1.0)) {
+			if (!rooms_try_move((dx > 0.0) ? 1.0 : -1.0, 0.0)) g_walking = false;
+		}
+	}
+}
+
+/* ==========================================================================
+   13.  THE LOCATION READOUT  (the C key)
+   ========================================================================= */
+
+void rooms_where() {
+	string s = "You are in " + room_name(g_player_room) + ", " + room_size_text(g_player_room)
+		+ ", facing " + facing_word() + ". Standing at " + num1(g_px) + " east, " + num1(g_py) + " north. ";
+	if (g_cam_up) s += "Your overhead camera is in " + room_name(g_cam_room) + " at " + num1(g_cam_z) + " metres. ";
+	mess@ m = mess_at(g_player_room, g_px, g_py);
+	if (@m !is null) s += "You are standing in " + mess_word(m.kind) + ". ";
+	say(s, true);
+}
+
+/* ==========================================================================
+   14.  ROOM SCAN  (the B key)
+   ========================================================================= */
+
+void rooms_scan() {
+	room_def@ r = room_by_id(g_player_room);
+	if (@r is null) { say("The room cannot be found.", true); return; }
+
+	string s = room_name(g_player_room) + ", " + room_size_text(g_player_room) + ". ";
+	s += "You are standing at " + num1(g_px) + " east, " + num1(g_py) + " north, facing " + facing_word() + ". ";
+
+	mess@ under = mess_at(g_player_room, g_px, g_py);
+	if (@under !is null) s += "You are standing in " + mess_word(under.kind) + ". ";
+
+	/* Nearby objects. The twenty shelf faces are counted, not listed. */
+	int found = 0;
+	int aisles_here = 0;
+	float ax = 0.0, ay = 0.0;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.room != g_player_room) continue;
+		if (t.kind == IK_SHELF_FACE) {
+			if (aisles_here == 0) { ax = t.x; ay = t.y; }
+			aisles_here++;
+			continue;
+		}
+		int d = int(dist(t.x, t.y, g_px, g_py) + 0.5);
+		if (d <= 2) {
+			s += t.label + " is " + dir_word(t.x - g_px, t.y - g_py) + ", " + tiles_away(d) + ". ";
+			found++;
+		}
+	}
+	if (found == 0) {
+		thing@ best = null; int nearest = 9999;
+		for (uint i = 0; i < g_things.length(); i++) {
+			thing@ t = g_things[i];
+			if (t.room != g_player_room or t.kind == IK_SHELF_FACE) continue;
+			int d = int(dist(t.x, t.y, g_px, g_py) + 0.5);
+			if (d < nearest) { nearest = d; @ best = t; }
+		}
+		if (@best !is null) s += best.label + " is " + dir_word(best.x - g_px, best.y - g_py) + ", " + tiles_away(nearest) + ". ";
+	}
+	if (aisles_here > 0) s += "There are " + (aisles_here / 2) + " aisles here, the nearest " + dir_word(ax - g_px, ay - g_py) + ". ";
+
+	/* Exits. */
+	string exits = "";
+	for (uint i = 0; i < g_portals.length(); i++) {
+		portal@ p = g_portals[i];
+		if (p.from_room != g_player_room) continue;
+		exits += p.label + " is " + dir_word(p.x - g_px, p.y - g_py) + ", "
+			+ tiles_away(int(dist(p.x, p.y, g_px, g_py) + 0.5)) + "; press " + key_towards(p.x - g_px, p.y - g_py) + ". ";
+	}
+	s += (exits.length() > 0) ? ("Exits. " + exits) : "There are no exits from here. ";
+
+	/* What can actually be heard, given the isolation rules. */
+	string hear = "";
+	int loops_here = 0;
+	for (uint i = 0; i < g_beacons.length(); i++) {
+		beacon@ b = g_beacons[i];
+		if (!b.loopable) continue;
+		if (b.room == g_player_room) {
+			hear += b.id + " is " + dir_word(b.x - g_px, b.y - g_py) + ", "
+				+ tiles_away(int(dist(b.x, b.y, g_px, g_py) + 0.5)) + ". ";
+			loops_here++;
+		}
+	}
+	if (loops_here == 0) hear += "Nothing is running in this room. ";
+	for (int rr = 0; rr < ROOM_COUNT; rr++) {
+		if (rr == g_player_room) continue;
+		if (!rooms_are_adjacent(g_player_room, rr)) continue;
+		int n = 0; string first = "";
+		for (uint i = 0; i < g_beacons.length(); i++) {
+			beacon@ b = g_beacons[i];
+			if (!b.loopable or b.room != rr) continue;
+			n++;
+			if (first.length() == 0) first = b.id;
+		}
+		if (n > 0) hear += "Muffled through the wall from " + room_name(rr) + ", you can just make out " + first + ". ";
+	}
+	s += "Sound. " + hear;
+
+	/* Mess on the floor in this room. */
+	int spills = mess_count_in(g_player_room);
+	if (spills > 0) s += " There " + ((spills == 1) ? "is " : "are ") + plural(spills, "mess", "messes") + " on the floor here. ";
+
+	if (!g_power_on) s += " The power is out, so everything is silent.";
+
+	say(s, true);
+	diag("rooms", "scan performed in " + room_name(g_player_room));
+}
+
+/* ==========================================================================
+   15.  WORLD CONSTRUCTION
+   ========================================================================= */
+
+const int AISLE_COUNT = 10;
+const int FACE_WEST = 0;
+const int FACE_EAST = 1;
+
+/* Ten aisles run north to south through the middle of the shop floor. Aisle i
+   occupies the two tile columns 4+3i and 5+3i, leaving a one tile corridor
+   either side, and each column carries one shelf face with its own stock. */
+float aisle_face_x(int aisle, int face) {
+	return tile_centre(4 + aisle * 3 + face);
+}
+
+void rooms_init() {
+	g_rooms.resize(0);
+	g_things.resize(0);
+	g_portals.resize(0);
+	g_mess.resize(0);
+	footsteps_init();
+	audio_beacons_clear();
+
+	g_rooms.insert_last(room_def(ROOM_SHOP,      34.0, 26.0, MAT_TILE));
+	g_rooms.insert_last(room_def(ROOM_OFFICE,     8.0,  7.0, MAT_CARPET));
+	g_rooms.insert_last(room_def(ROOM_APARTMENT,  8.0,  7.0, MAT_CARPET));
+	g_rooms.insert_last(room_def(ROOM_COOLER,     8.0,  6.0, MAT_CONCRETE));
+	g_rooms.insert_last(room_def(ROOM_FREEZER,    8.0,  6.0, MAT_CONCRETE));
+	g_rooms.insert_last(room_def(ROOM_FORECOURT, 16.0, 14.0, MAT_ASPHALT));
+
+	/* ---- main shop floor ------------------------------------------------- */
+	/* The front door is the south west corner; the register counter sits just
+	   north east of it, with the coffee, the fountain and the restricted goods
+	   along the west wall. */
+	g_things.insert_last(thing(ROOM_SHOP,  7.5,  2.5, IK_QUEUE_TILL, "the end of the counter", false));
+	g_things.insert_last(thing(ROOM_SHOP,  8.5,  3.5, IK_REGISTER,   "the cash register", true));
+	g_things.insert_last(thing(ROOM_SHOP,  6.5,  3.5, IK_COUNTER,    "the counter", true, 0));
+	g_things.insert_last(thing(ROOM_SHOP,  7.5,  3.5, IK_COUNTER,    "the counter", true, 0));
+	g_things.insert_last(thing(ROOM_SHOP,  9.5,  3.5, IK_COUNTER,    "the counter", true, 0));
+	g_things.insert_last(thing(ROOM_SHOP,  1.5,  8.5, IK_COFFEE,     "the coffee station", true));
+	g_things.insert_last(thing(ROOM_SHOP,  1.5, 12.5, IK_FOUNTAIN,   "the soda fountain", true));
+	/* ref 0 is the till counter; ref 1 is the locked cabinet of restricted goods. */
+	g_things.insert_last(thing(ROOM_SHOP,  1.5, 16.5, IK_COUNTER,    "the cigarette and vape cabinet", true, 1));
+
+	/* Ten aisles, both faces. */
+	for (int a = 0; a < AISLE_COUNT; a++) {
+		g_things.insert_last(thing(ROOM_SHOP, aisle_face_x(a, FACE_WEST), 14.5, IK_SHELF_FACE,
+			"aisle " + (a + 1) + " west face", true, a * 2 + FACE_WEST));
+		g_things.insert_last(thing(ROOM_SHOP, aisle_face_x(a, FACE_EAST), 14.5, IK_SHELF_FACE,
+			"aisle " + (a + 1) + " east face", true, a * 2 + FACE_EAST));
+	}
+
+	/* The north wall: refrigerated display cases, the walk in cooler door in the
+	   middle of them, then the frozen cases and the freezer door. These hum,
+	   which makes the north wall a compass. */
+	g_things.insert_last(thing(ROOM_SHOP,  4.5, 24.5, IK_FRIDGE_CASE, "the refrigerated display cases", true));
+	g_things.insert_last(thing(ROOM_SHOP, 13.5, 24.5, IK_COOLER_DOOR, "the walk in cooler door", false));
+	g_things.insert_last(thing(ROOM_SHOP, 19.5, 24.5, IK_FROZEN_CASE, "the frozen food cases", true));
+	g_things.insert_last(thing(ROOM_SHOP, 25.5, 24.5, IK_FREEZER_DOOR,"the walk in freezer door", false));
+	g_things.insert_last(thing(ROOM_SHOP, 31.5, 24.5, IK_SPEAKERS,    "the ceiling speakers", false));
+
+	/* ---- back office ----------------------------------------------------- */
+	g_things.insert_last(thing(ROOM_OFFICE, 2.5, 5.5, IK_COMPUTER, "the manager terminal", true));
+	g_things.insert_last(thing(ROOM_OFFICE, 6.5, 5.5, IK_SAFE,     "the office safe", true));
+	g_things.insert_last(thing(ROOM_OFFICE, 4.5, 6.5, IK_BACKDOOR, "the office back door", false));
+
+	/* ---- studio apartment ------------------------------------------------ */
+	g_things.insert_last(thing(ROOM_APARTMENT, 5.5, 5.5, IK_BED, "your bed", true));
+	g_things.insert_last(thing(ROOM_APARTMENT, 2.5, 5.5, IK_TV,  "the television", true));
+	g_things.insert_last(thing(ROOM_APARTMENT, 6.5, 1.5, IK_KITCHEN_FRIDGE, "the kitchen fridge", true));
+
+	/* ---- walk in cooler and freezer -------------------------------------- */
+	g_things.insert_last(thing(ROOM_COOLER,  2.5, 4.5, IK_COOLER_RACK, "the dairy rack", true));
+	g_things.insert_last(thing(ROOM_COOLER,  6.5, 4.5, IK_COOLER_RACK, "the drinks rack", true));
+	g_things.insert_last(thing(ROOM_FREEZER, 2.5, 4.5, IK_FREEZER_RACK, "the frozen rack", true));
+	g_things.insert_last(thing(ROOM_FREEZER, 6.5, 4.5, IK_FREEZER_RACK, "the ice cream rack", true));
+
+	/* ---- fuel forecourt -------------------------------------------------- */
+	g_things.insert_last(thing(ROOM_FORECOURT,  3.5,  6.5, IK_PUMP,  "fuel pump one", true));
+	g_things.insert_last(thing(ROOM_FORECOURT,  3.5, 10.5, IK_PUMP,  "fuel pump two", true));
+	g_things.insert_last(thing(ROOM_FORECOURT, 12.5,  6.5, IK_PUMP,  "fuel pump three", true));
+	g_things.insert_last(thing(ROOM_FORECOURT, 12.5, 10.5, IK_PUMP,  "fuel pump four", true));
+	g_things.insert_last(thing(ROOM_FORECOURT,  1.5,  1.5, IK_AIRPUMP, "the air and water pump", true));
+	g_things.insert_last(thing(ROOM_FORECOURT,  8.5,  1.5, IK_ROAD,    "the road", false));
+
+	/* ---- doorways --------------------------------------------------------
+	   Every destination tile is one full tile clear of the doorway that leads
+	   back the other way, so arrivals never land inside a trigger. */
+	/* shop <-> forecourt through the entry doors, south west corner */
+	g_portals.insert_last(portal(ROOM_SHOP, 4.5, 0.5, ROOM_FORECOURT, 4.5, 12.5, 180.0,
+		"Pushing out through the entry doors onto the forecourt", 2));
+	g_portals.insert_last(portal(ROOM_FORECOURT, 4.5, 13.5, ROOM_SHOP, 4.5, 1.5, 0.0,
+		"Coming back in through the entry doors", 2));
+	/* shop <-> office, north east corner */
+	g_portals.insert_last(portal(ROOM_SHOP, 32.5, 23.5, ROOM_OFFICE, 1.5, 2.5, 0.0,
+		"Going through the doorway marked staff only", 0));
+	g_portals.insert_last(portal(ROOM_OFFICE, 1.5, 1.5, ROOM_SHOP, 32.5, 22.5, 180.0,
+		"Stepping back out onto the shop floor", 0));
+	/* shop <-> walk in cooler */
+	g_portals.insert_last(portal(ROOM_SHOP, 13.5, 23.5, ROOM_COOLER, 4.5, 1.5, 0.0,
+		"Pulling open the walk in cooler door", 3));
+	g_portals.insert_last(portal(ROOM_COOLER, 4.5, 0.5, ROOM_SHOP, 13.5, 22.5, 180.0,
+		"Stepping back out of the cooler", 3));
+	/* shop <-> walk in freezer */
+	g_portals.insert_last(portal(ROOM_SHOP, 25.5, 23.5, ROOM_FREEZER, 4.5, 1.5, 0.0,
+		"Hauling open the walk in freezer door", 3));
+	g_portals.insert_last(portal(ROOM_FREEZER, 4.5, 0.5, ROOM_SHOP, 25.5, 22.5, 180.0,
+		"Stepping back out of the freezer", 3));
+	/* office <-> apartment (behind the office, and NOT adjacent to the shop) */
+	g_portals.insert_last(portal(ROOM_OFFICE, 1.5, 4.5, ROOM_APARTMENT, 6.5, 5.5, 180.0,
+		"Unlocking the apartment door", 0));
+	g_portals.insert_last(portal(ROOM_APARTMENT, 7.5, 5.5, ROOM_OFFICE, 2.5, 4.5, 0.0,
+		"Letting yourself back into the office", 0));
+
+	/* ---- ambient sound beacons ------------------------------------------ */
+	/*                id                          room              x     y     z    file            loop  gain */
+	audio_beacon_add("the walk in cooler",      ROOM_SHOP,      13.5, 24.5, 0.0, "cooler.ogg",   true, -7.0);
+	audio_beacon_add("the refrigerated cases",  ROOM_SHOP,       4.5, 24.5, 0.0, "cooler.ogg",   true, -9.0);
+	/* The shop bed is a checkout counter with nothing playing in it. The recording
+	   it used to be was an Asian market whose own description says there is a TV
+	   tuned to Japanese programming behind the counter and a radio playing pop
+	   music nearby, which is exactly the music the player should not hear coming
+	   out of an aisle. */
+	audio_beacon_add("the shop ambience",       ROOM_SHOP,      17.5, 14.5, 0.0, "shop_amb.mp3", true, -10.0);
+	audio_beacon_add("the frozen food cases",   ROOM_SHOP,      19.5, 24.5, 0.0, "cooler.ogg",   true, -10.0);
+	audio_beacon_add("the manager terminal",    ROOM_OFFICE,     2.5,  5.5, 0.0, "keyboard.ogg", true, -8.0);
+	audio_beacon_add("the kitchen fridge",      ROOM_APARTMENT,  6.5,  1.5, 0.0, "cooler.ogg",   true, -7.0);
+	audio_beacon_add("the television",          ROOM_APARTMENT,  2.5,  5.5, 0.0, "tv.mp3",       true, -11.0);
+	audio_beacon_add("the cooler compressor",   ROOM_COOLER,     4.0,  3.0, 0.0, "cooler.ogg",   true, -3.0);
+	audio_beacon_add("the freezer compressor",  ROOM_FREEZER,    4.0,  3.0, 0.0, "cooler.ogg",   true, -3.0);
+	audio_beacon_add("an idling car",           ROOM_FORECOURT, 10.5,  3.5, 0.0, "car_idle.mp3", true, -7.0);
+	audio_beacon_add("a running fuel pump",     ROOM_FORECOURT,  3.5,  6.5, 0.0, "pump.mp3",     true, -6.0);
+	audio_beacon_add("the road",                ROOM_FORECOURT,  8.5,  1.5, 0.0, "road.mp3",     true, -11.0);
+
+	/* The shop's ceiling speakers are a sound source in room space, not a track
+	   played straight to the machine, so the room isolation table above takes the
+	   music away when the player walks out of earshot of them. See the speaker
+	   block in audio.nvgt and the music controller in mechanics.nvgt. */
+	music_speakers(ROOM_SHOP, 17.5, 14.5, 3.0);
+
+	/* You start on Monday, day one, at seven in the morning, just inside the
+	   front door on the shop floor, facing north. */
+	g_player_room = ROOM_SHOP;
+	g_px = 4.5;  g_py = 2.5;  g_facing = 0.0;
+	rooms_camera_drop();
+	rooms_refresh_audibility();
+
+	log_line("rooms", "world built: " + g_rooms.length() + " rooms, " + g_things.length()
+		+ " objects, " + g_portals.length() + " doorways, " + g_beacons.length() + " beacons");
+}

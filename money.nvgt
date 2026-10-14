@@ -1,0 +1,591 @@
+/* ============================================================================
+   Store Express  -  money.nvgt
+   ----------------------------------------------------------------------------
+   Every dollar in the game. Amounts are always an integer number of cents.
+
+     * The till. Every sale, order, fine and wage goes through money_earn() and
+       money_spend(), so the till can never quietly go negative.
+     * The week's profit and loss, kept in buckets so the bank page and the
+       income tax both have something honest to read.
+     * Bill day, every Friday at six in the morning. Property tax, utilities,
+       insurance, wages, loan payments and income tax all come out of the till.
+     * The foreclosure ladder: one missed Friday, then a final notice and the
+       wholesaler stops taking orders, then nothing but the emergency loan, then
+       the shop is gone.
+     * Loans from Crossroads Savings and Loan, and the emergency loan at 24
+       percent over twenty six weeks.
+     * Insurance, in the three tiers the previous owner's broker offers.
+     * The income tax declaration, and the eight weekly forty percent audit roll
+       that seizes the shop if any week was under declared.
+     * Ending the game, for the three failures that are money's business:
+       foreclosure, an audit that catches you, and running the till to zero while
+       owing the bank.
+
+   INCLUDE ORDER
+     Included after core.nvgt and rooms.nvgt. It never calls into shop, staff,
+     people, trouble, mechanics or main. Where it needs a number that one of
+     those owns, that module pushes the number in first.
+
+   WHAT "PROFIT" MEANS HERE
+     profit = sales - stock bought - wages paid - fines and fees - other costs.
+     Upkeep (property tax, utilities, insurance) is charged on bill day rather
+     than accumulated, because it is the same every week whether you are busy or
+     not, and the reference prices it that way.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS
+   ========================================================================= */
+
+/* Insurance. A weekly premium, and what it actually covers. */
+const int INS_NONE          = 0;
+const int INS_BASIC         = 1;   // fire, flood and the building only
+const int INS_BASIC_HALF    = 2;   // and half the stock
+const int INS_BASIC_ALL     = 3;   // and all of the stock
+
+const int INS_PREMIUM_NONE       = 0;
+const int INS_PREMIUM_BASIC      = 11500;   // about $500 a month
+const int INS_PREMIUM_BASIC_HALF = 17300;   // about $750 a month
+const int INS_PREMIUM_BASIC_ALL  = 23000;   // about $1,000 a month
+
+/* Property tax is a share of $6,000 a year, charged weekly. */
+const int PROPERTY_TAX_WEEKLY = 11500;
+
+/* Utilities run from $500 to $1,000 a month depending on how busy the week was,
+   and an always open shop pays the top rate. */
+const int UTILITIES_MIN_WEEKLY = 11500;
+const int UTILITIES_MAX_WEEKLY = 23000;
+
+const int INCOME_TAX_PERCENT = 25;    // of the week's profit, or of what you declare
+
+/* Loans. The bank charges more once you have ever missed a bill day. */
+const int LOAN_BASE_RATE_PCT = 8;
+const int LOAN_MISS_PENALTY_PCT = 3;  // added per bill day ever missed
+const int EMERGENCY_RATE_PCT = 24;
+const int EMERGENCY_WEEKS = 26;
+
+const int LATE_FEE_PERCENT = 15;
+
+/* The four stages of the ladder. Stage 4 is the end. */
+const int BILL_STAGE_OK        = 0;
+const int BILL_STAGE_MISSED    = 1;
+const int BILL_STAGE_NOTICE    = 2;
+const int BILL_STAGE_EMERGENCY = 3;
+const int BILL_STAGE_GONE      = 4;
+
+/* ==========================================================================
+   2.  STATE
+   ========================================================================= */
+
+int g_cash = 250000;                 // $2,500.00 of starting liquid cash
+int g_arrears = 0;                   // unpaid bills, with late fees already added
+int g_bill_stage = BILL_STAGE_OK;
+int g_missed_bill_days_ever = 0;     // this is what pushes the loan rate up
+bool g_account_hold = false;         // the wholesaler refuses new orders from here
+bool g_emergency_loan_taken = false;
+
+int g_insurance_tier = INS_BASIC;    // what the previous owner left you
+int g_insurance_weeks_unpaid = 0;
+int g_pending_insurance_claim = 0;   // paid on bill day, if the policy covers stock
+
+/* The current week, in buckets. Reset every bill day. */
+int g_wk_sales = 0;
+int g_wk_stock = 0;
+int g_wk_wages = 0;
+int g_wk_fines = 0;
+int g_wk_other = 0;
+int g_wk_customers = 0;              // drives the utility bill
+int g_wk_days_open = 0;
+
+/* The filing period, which is longer than a week and is what tax looks at. */
+int g_total_takings = 0;
+int g_declared_profit = 0;           // what you told the tax office you made
+int g_declared_pct = 100;            // and the percentage you used to work it out
+bool g_under_declared = false;       // any week this filing period was under declared
+int g_tax_paid = 0;
+int g_fines_paid = 0;
+
+/* The ending. mechanics.nvgt reads these every frame; money.nvgt sets them. */
+bool   g_game_over = false;
+string g_game_over_reason = "";
+int    g_game_over_title = 0;
+const int END_FORECLOSED = 1;
+const int END_AUDITED    = 2;
+const int END_DIED       = 3;
+const int END_BLACKOUT   = 4;
+
+class loan {
+	int    principal;      // what you borrowed
+	int    remaining;      // what is still owed
+	int    weekly;         // the payment taken on bill day
+	int    weeks_left;
+	int    rate_pct;
+	bool   emergency;
+	loan(int p, int w, int wl, int r, bool e) {
+		principal = p; remaining = p; weekly = w; weeks_left = wl; rate_pct = r; emergency = e;
+	}
+}
+
+array<loan@> g_loans;
+
+/* ==========================================================================
+   3.  SMALL HELPERS
+   ========================================================================= */
+
+bool money_can_afford(int cents) { return g_cash >= cents; }
+
+void money_earn(int cents) {
+	if (cents <= 0) return;
+	g_cash += cents;
+	g_wk_sales += cents;
+	g_total_takings += cents;
+}
+
+/* Try to pay something out of the till. Returns false without touching anything
+   if the till cannot cover it: the caller decides what a shortage means. */
+bool money_spend(int cents, int bucket) {
+	if (cents <= 0) return true;
+	if (g_cash < cents) return false;
+	g_cash -= cents;
+	switch (bucket) {
+		case 1: g_wk_stock += cents; break;
+		case 2: g_wk_wages += cents; break;
+		case 3: g_wk_fines += cents; break;
+		default: g_wk_other += cents; break;
+	}
+	return true;
+}
+
+int money_week_cost()  { return g_wk_stock + g_wk_wages + g_wk_fines + g_wk_other; }
+int money_week_profit() { return g_wk_sales - money_week_cost(); }
+
+int money_weekly_utilities() {
+	/* Scale with how busy the week was: a quiet week pays the minimum. */
+	if (g_wk_customers <= 40) return UTILITIES_MIN_WEEKLY;
+	int extra = UTILITIES_MAX_WEEKLY - UTILITIES_MIN_WEEKLY;
+	int span = 260 - 40;
+	int n = g_wk_customers - 40;
+	if (n > span) n = span;
+	return UTILITIES_MIN_WEEKLY + (extra * n) / span;
+}
+
+int money_insurance_premium() {
+	switch (g_insurance_tier) {
+		case INS_BASIC:      return INS_PREMIUM_BASIC;
+		case INS_BASIC_HALF: return INS_PREMIUM_BASIC_HALF;
+		case INS_BASIC_ALL:  return INS_PREMIUM_BASIC_ALL;
+	}
+	return 0;
+}
+
+string money_insurance_name() {
+	switch (g_insurance_tier) {
+		case INS_NONE:       return "no insurance at all";
+		case INS_BASIC:      return "basic cover, fire, flood and the building only";
+		case INS_BASIC_HALF: return "basic cover and half the stock";
+		case INS_BASIC_ALL:  return "basic cover and all the stock";
+	}
+	return "no insurance";
+}
+
+/* Does the policy pay out for stock that was stolen or destroyed? */
+bool money_insurance_covers_stock() { return g_insurance_tier >= INS_BASIC_HALF; }
+
+/* A stock loss claim. It is only paid on bill day, and only if the policy
+   covers stock and you have kept the premium paid. */
+void money_claim_stock(int cents, const string&in why) {
+	if (cents <= 0) return;
+	if (!money_insurance_covers_stock()) {
+		say("You put in a claim for " + money(cents) + " of stock lost to " + why
+			+ ", but " + money_insurance_name() + " does not cover stock. Nothing will be paid.", true);
+		return;
+	}
+	g_pending_insurance_claim += cents;
+	say("You claimed " + money(cents) + " of stock lost to " + why
+		+ ". It is paid on your next bill day.", true);
+}
+
+/* ==========================================================================
+   4.  LOANS
+   ========================================================================= */
+
+int money_loan_rate() {
+	int r = LOAN_BASE_RATE_PCT + g_missed_bill_days_ever * LOAN_MISS_PENALTY_PCT;
+	if (r > 30) r = 30;
+	return r;
+}
+
+int money_loan_weekly(int principal, int rate_pct, int weeks) {
+	/* Flat interest over the term, simple and predictable, which is what the
+	   reference implies by quoting a rate and a term. */
+	int total = principal + (principal * rate_pct) / 100;
+	return total / weeks;
+}
+
+void money_take_loan(int principal) {
+	int rate = money_loan_rate();
+	int weeks = 52;
+	int weekly = money_loan_weekly(principal, rate, weeks);
+	g_loans.insert_last(loan(principal, weekly, weeks, rate, false));
+	g_cash += principal;
+	sfx_ui(A("register.ogg"), -8.0);
+	say("The bank approved " + money(principal) + " at " + rate + " percent over a year. "
+		+ "The payment is " + money(weekly) + " every bill day. The money is in the till.", true);
+	log_line("money", "loan taken: " + money(principal) + " at " + rate + "%");
+}
+
+void money_take_emergency_loan() {
+	if (g_emergency_loan_taken) {
+		say("The bank has already bailed you out once. There will not be a second time.", true);
+		return;
+	}
+	int owed = g_arrears;
+	int weekly = money_loan_weekly(owed, EMERGENCY_RATE_PCT, EMERGENCY_WEEKS);
+	g_loans.insert_last(loan(owed, weekly, EMERGENCY_WEEKS, EMERGENCY_RATE_PCT, true));
+	g_emergency_loan_taken = true;
+	g_arrears = 0;
+	g_account_hold = false;
+	g_bill_stage = BILL_STAGE_OK;
+	sfx_ui(A("register.ogg"), -8.0);
+	say("The emergency loan clears every penny you owed, " + money(owed) + ", at "
+		+ EMERGENCY_RATE_PCT + " percent over twenty six weeks. That is "
+		+ money(weekly) + " a week, starting on the next bill day. "
+		+ "The wholesaler has taken your account off hold.", true);
+	log_line("money", "emergency loan taken for " + money(owed));
+}
+
+void money_pay_off_loan(int index) {
+	if (index < 0 or uint(index) >= g_loans.length()) return;
+	loan@ l = g_loans[index];
+	if (!money_can_afford(l.remaining)) {
+		say("That would take " + money(l.remaining) + " and the till holds " + money(g_cash) + ".", true);
+		return;
+	}
+	int amount = l.remaining;
+	g_cash -= amount;
+	sfx_ui(A("coins.ogg"), -6.0);
+	say("You paid the loan off in full, " + money(amount) + ". Well. That one is over.", true);
+	g_loans.remove_at(uint(index));
+	log_line("money", "loan paid off: " + money(amount));
+}
+
+/* ==========================================================================
+   5.  THE DECLARATION AND THE AUDIT
+   ========================================================================= */
+
+int money_tax_due() {
+	int taxable = (g_declared_pct * money_week_profit()) / 100;
+	if (taxable < 0) taxable = 0;
+	return (taxable * INCOME_TAX_PERCENT) / 100;
+}
+
+void money_declare(int pct) {
+	if (pct < 0) pct = 0;
+	if (pct > 100) pct = 100;
+	int profit = money_week_profit();
+	int honest = (profit * pct) / 100;
+	g_declared_pct = pct;
+	g_declared_profit = honest;
+	string s = "You declared " + pct + " percent of the week's profit, which is "
+		+ money(honest) + " out of " + money(profit) + ". ";
+	if (pct < 100 and profit > 0) {
+		g_under_declared = true;
+		s += "That is less than you made. Every eight weeks there is a forty percent chance the tax office "
+			+ "looks at it, and an audit that finds a single under declared week takes the shop.";
+	} else {
+		s += "That is every penny, so there is nothing for anyone to find.";
+	}
+	say(s, true);
+	sfx_ui(A("keyboard.ogg"), -20.0);
+	diag("money", "declared " + pct + "% of " + profit);
+}
+
+/* ==========================================================================
+   6.  BILL DAY
+   ========================================================================= */
+
+int money_bill_total_estimate() {
+	int total = PROPERTY_TAX_WEEKLY + money_weekly_utilities() + money_insurance_premium() + g_wk_wages;
+	total += money_tax_due();
+	for (uint i = 0; i < g_loans.length(); i++) total += g_loans[i].weekly;
+	return total;
+}
+
+/* Charge one bill, out of the till if it can be, into arrears with a late fee if
+   it cannot. Returns what was charged. */
+int money_charge(const string&in label, int cents, bool late_fee) {
+	if (cents <= 0) return 0;
+	if (g_cash >= cents) {
+		g_cash -= cents;
+		diag("money", "bill paid: " + label + " " + money(cents));
+		return cents;
+	}
+	/* Take whatever is in the till, and put the rest on the slate with a late
+	   fee on the part that actually went unpaid. */
+	int from_till = g_cash;
+	g_cash = 0;
+	int unpaid = cents - from_till;
+	if (late_fee) unpaid += (unpaid * LATE_FEE_PERCENT) / 100;
+	g_arrears += unpaid;
+	diag("money", "bill short: " + label + " unpaid " + money(unpaid));
+	return cents;
+}
+
+/* Friday, six in the morning. Everything comes out of the till at once. */
+void money_bill_day() {
+	int paid = 0;
+	string lines = "";
+
+	int prop = PROPERTY_TAX_WEEKLY;
+	if (g_cash >= prop) { g_cash -= prop; paid += prop; } else { money_charge("property tax", prop, true); }
+	lines += "Property tax, " + money(prop) + ". ";
+
+	int util = money_weekly_utilities();
+	if (g_cash >= util) { g_cash -= util; paid += util; } else { money_charge("utilities", util, true); }
+	lines += "Utilities, " + money(util) + ". ";
+
+	if (g_insurance_tier != INS_NONE) {
+		int prem = money_insurance_premium();
+		if (g_cash >= prem) { g_cash -= prem; paid += prem; g_insurance_weeks_unpaid = 0; }
+		else {
+			money_charge("insurance", prem, true);
+			g_insurance_weeks_unpaid++;
+			lines += "You could not pay the insurance premium, so you were not covered this week. ";
+		}
+		lines += "Insurance, " + money(prem) + ". ";
+	}
+
+	/* Wages are pushed in by staff.nvgt before this runs. */
+	if (g_wk_wages > 0) {
+		if (g_cash >= g_wk_wages) { g_cash -= g_wk_wages; paid += g_wk_wages; }
+		else money_charge("wages", g_wk_wages, true);
+		lines += "Wages, " + money(g_wk_wages) + ". ";
+	}
+
+	/* Loan payments. A missed payment is just another bill. */
+	for (uint i = 0; i < g_loans.length(); i++) {
+		loan@ l = g_loans[i];
+		if (g_cash >= l.weekly) {
+			g_cash -= l.weekly;
+			l.remaining -= l.weekly;
+			l.weeks_left--;
+			paid += l.weekly;
+		} else {
+			money_charge("a loan payment", l.weekly, true);
+		}
+	}
+	/* Write off anything that is fully paid. */
+	for (int i = int(g_loans.length()) - 1; i >= 0; i--) {
+		if (g_loans[i].remaining <= 0 or g_loans[i].weeks_left <= 0) {
+			lines += "One loan is finished. ";
+			g_loans.remove_at(uint(i));
+		}
+	}
+
+	/* Income tax on what you declared. */
+	int tax = money_tax_due();
+	if (tax > 0) {
+		if (g_cash >= tax) { g_cash -= tax; paid += tax; g_tax_paid += tax; }
+		else { money_charge("income tax", tax, true); g_tax_paid += tax; }
+		lines += "Income tax, " + money(tax) + ". ";
+	}
+
+	/* Insurance claims and stock claims are paid today. */
+	if (g_pending_insurance_claim > 0 and money_insurance_covers_stock()) {
+		int claim = g_pending_insurance_claim;
+		g_cash += claim;
+		g_pending_insurance_claim = 0;
+		lines += "The insurance paid " + money(claim) + " for claimed stock. ";
+	} else if (g_pending_insurance_claim > 0) {
+		lines += "Your claims for " + money(g_pending_insurance_claim) + " were refused: the policy does not cover stock. ";
+		g_pending_insurance_claim = 0;
+	}
+
+	/* Now settle the arrears, if there is anything in the till to settle them with. */
+	if (g_arrears > 0 and g_cash > 0) {
+		int use = g_arrears;
+		if (use > g_cash) use = g_cash;
+		g_cash -= use;
+		g_arrears -= use;
+		lines += "You put " + money(use) + " towards what you owed. ";
+	}
+
+	if (g_arrears > 0) {
+		/* A missed bill day. The ladder goes up one rung per Friday in a row. */
+		g_missed_bill_days_ever++;
+		if (g_bill_stage < BILL_STAGE_GONE) g_bill_stage++;
+		sfx_ui(A("siren.ogg"), -14.0);
+
+		if (g_bill_stage == BILL_STAGE_MISSED) {
+			lines += "You are " + money(g_arrears) + " short. That is a missed payment, with a "
+				+ LATE_FEE_PERCENT + " percent late fee already added. ";
+		} else if (g_bill_stage == BILL_STAGE_NOTICE) {
+			g_account_hold = true;
+			lines += "Second Friday in a row. That is a final notice, and the wholesaler has put your "
+				+ "account on hold, so there will be no more orders until you pay. ";
+		} else if (g_bill_stage == BILL_STAGE_EMERGENCY) {
+			g_account_hold = true;
+			lines += "Third Friday. The bank will not lend to you on the usual terms any more. "
+				+ "The only way out now is the emergency loan, on the computer, and it is expensive. ";
+		} else {
+			lines += "Fourth Friday in a row. The bank has called the loan. ";
+			money_foreclose();
+			return;
+		}
+	} else if (g_bill_stage != BILL_STAGE_OK) {
+		/* Paying everything you owe puts you straight back into good standing.
+		   The bank has a short memory for good news. */
+		g_bill_stage = BILL_STAGE_OK;
+		g_account_hold = false;
+		lines += "You are square with everyone again. ";
+	}
+
+	string s = "Bill day, " + day_name(FRIDAY) + " morning. " + lines
+		+ "That is " + money(paid) + " out of the till. The till holds " + money(g_cash) + ".";
+	say(s, true);
+	log_line("money", "bill day: paid " + money(paid) + " arrears " + money(g_arrears) + " stage " + g_bill_stage);
+}
+
+/* ==========================================================================
+   7.  ENDINGS THAT MONEY OWNS
+   ========================================================================= */
+
+void money_end_game(int which, const string&in reason) {
+	if (g_game_over) return;
+	g_game_over = true;
+	g_game_over_title = which;
+	g_game_over_reason = reason;
+	stop_all_speech();
+	sfx_ui(A("siren.ogg"), -6.0);
+	say("The game is over. " + reason, true);
+	log_line("money", "game over: " + reason);
+}
+
+void money_foreclose() {
+	g_bill_stage = BILL_STAGE_GONE;
+	money_end_game(END_FORECLOSED,
+		"You missed four bill days in a row, so Crossroads Savings and Loan has taken the shop. "
+		+ "The shelves are emptied, the doors are locked, and the keys go back to the bank.");
+}
+
+void money_audit_catch() {
+	money_end_game(END_AUDITED,
+		"The audit found a week where you declared less profit than you made. "
+		+ "That is the end of Store Express: the shop is seized this morning.");
+}
+
+/* ==========================================================================
+   8.  THE EIGHT WEEK AUDIT ROLL
+   ========================================================================= */
+
+void money_audit_check() {
+	if (g_current_week % 8 != 0) return;
+	if (!g_under_declared) {
+		diag("money", "audit window passed with nothing to find");
+		return;
+	}
+	if (random(1, 100) > 40) {
+		say("There was an audit window this week, and the tax office did not look at your books. "
+			+ "That is luck, not safety.", true);
+		return;
+	}
+	money_audit_catch();
+}
+
+/* ==========================================================================
+   9.  THE READOUTS
+   ========================================================================= */
+
+string money_pnl_text() {
+	int profit = money_week_profit();
+	string s = "This week so far. Sales " + money(g_wk_sales)
+		+ ". Stock bought " + money(g_wk_stock)
+		+ ". Wages " + money(g_wk_wages)
+		+ ". Fines and fees " + money(g_wk_fines)
+		+ ". Other costs " + money(g_wk_other) + ". ";
+	s += (profit >= 0) ? ("That is a profit of " + money(profit) + ". ")
+		: ("That is a loss of " + money(-profit) + ". ");
+	return s;
+}
+
+string money_status_text() {
+	string s = "The till holds " + money(g_cash) + ". ";
+	s += money_pnl_text();
+	s += "The next bill day is Friday, and it will be about " + money(money_bill_total_estimate()) + ". ";
+	if (g_arrears > 0) s += "You owe " + money(g_arrears) + " in unpaid bills. ";
+	if (g_loans.length() > 0) {
+		int owed = 0;
+		for (uint i = 0; i < g_loans.length(); i++) owed += g_loans[i].remaining;
+		s += "You owe the bank " + money(owed) + " across " + plural(int(g_loans.length()), "loan", "loans") + ". ";
+	}
+	if (g_account_hold) s += "Your wholesaler account is on hold, so no orders will be accepted. ";
+	return s;
+}
+
+string money_bills_text() {
+	string s = "Bills and the bank. ";
+	if (g_bill_stage == BILL_STAGE_OK) s += "You are in good standing. ";
+	else if (g_bill_stage == BILL_STAGE_MISSED) s += "You have one missed payment against you. ";
+	else if (g_bill_stage == BILL_STAGE_NOTICE) s += "You are on a final notice, and your account is on hold. ";
+	else if (g_bill_stage == BILL_STAGE_EMERGENCY) s += "You are one Friday away from losing the shop, and only the emergency loan can save you. ";
+	s += "Bill day is every Friday at six in the morning. ";
+	s += "Property tax " + money(PROPERTY_TAX_WEEKLY) + " a week. ";
+	s += "Utilities " + money(money_weekly_utilities()) + " this week. ";
+	s += "Insurance: " + money_insurance_name() + ", " + money(money_insurance_premium()) + " a week. ";
+	s += "Income tax is " + INCOME_TAX_PERCENT + " percent of the week's profit, and you have declared " + g_declared_pct + " percent of it. ";
+	if (g_under_declared) s += "You have under declared at least one week this filing period, and every eight weeks there is a forty percent chance an audit finds it. ";
+	if (g_arrears > 0) s += "You owe " + money(g_arrears) + " in arrears. Paying it puts you straight back into good standing. ";
+	if (g_pending_insurance_claim > 0) s += "You have " + money(g_pending_insurance_claim) + " of stock claims waiting to be paid on the next bill day. ";
+	return s;
+}
+
+string money_loans_text() {
+	string s = "Loans. ";
+	if (g_loans.length() == 0) s += "You owe the bank nothing. ";
+	for (uint i = 0; i < g_loans.length(); i++) {
+		loan@ l = g_loans[i];
+		s += "Loan " + (i + 1) + ", " + money(l.remaining) + " left of " + money(l.principal)
+			+ ", at " + l.rate_pct + " percent, " + money(l.weekly) + " a week for "
+			+ plural(l.weeks_left, "week", "weeks") + " more. ";
+		if (l.emergency) s += "That is the emergency loan. ";
+	}
+	s += "The bank will lend " + money(100000) + ", " + money(250000) + " or " + money(500000)
+		+ " over a year at " + money_loan_rate() + " percent";
+	s += (money_loan_rate() != LOAN_BASE_RATE_PCT)
+		? ", raised from " + LOAN_BASE_RATE_PCT + " percent by the bill days you have missed. "
+		: ". ";
+	if (g_arrears > 0 and !g_emergency_loan_taken) s += "The emergency loan is available, and it clears every penny you owe. ";
+	return s;
+}
+
+void money_set_insurance(int tier) {
+	if (tier < 0 or tier > 3) return;
+	g_insurance_tier = tier;
+	say("Insurance is now " + money_insurance_name() + ", which costs "
+		+ money(money_insurance_premium()) + " a week from the next bill day.", true);
+}
+
+/* ==========================================================================
+   10.  THE WEEK ROLLS OVER
+   --------------------------------------------------------------------------
+   Called by mechanics.nvgt when Friday's bill day has finished, so the buckets
+   the next week is measured against start empty.
+   ========================================================================= */
+
+void money_start_new_week() {
+	g_wk_sales = 0;
+	g_wk_stock = 0;
+	g_wk_wages = 0;
+	g_wk_fines = 0;
+	g_wk_other = 0;
+	g_wk_customers = 0;
+	g_wk_days_open = 0;
+	diag("money", "new week started, till holds " + money(g_cash));
+}
+
+void money_init() {
+	g_cash = cfg_int("starting_cash_cents", 250000);
+	g_declared_pct = cfg_int("declared_profit_percent", 100);
+	g_insurance_tier = cfg_int("starting_insurance", INS_BASIC);
+	log_line("money", "till opened with " + money(g_cash) + ", loan rate " + money_loan_rate() + " percent");
+}

@@ -1,0 +1,2048 @@
+/* ============================================================================
+   Store Express  -  audio.nvgt
+   ----------------------------------------------------------------------------
+   Owns every sound the game makes:
+
+     1. Configuration loading (config.ini) and diagnostic logging to
+        logs/speech.log.
+     2. The speech layer, which has two channels and keeps them apart.
+
+        The player's own channel is the screen reader they are already
+        listening to - NVDA, JAWS, whatever is running - at their own speed and
+        in their own voice, because the menus, the prompts and the reports are
+        the game talking TO the player and that is the voice they are listening
+        with. With no screen reader running it is a Windows voice instead.
+
+        The people's channel is the voice pool: every customer and every member
+        of staff gets a voice of their own, from the remote voice servers when
+        they answer and from this computer's own installed voices when they do
+        not, so a shop full of people does not sound like one person. Nothing
+        the player's own channel says ever goes through the pool, and nothing a
+        person in the building says ever goes through the screen reader.
+     3. The first-run asset bootstrap. Every sound in assets/manifest.txt is
+        downloaded (paced, with retry and backoff) into the live assets/
+        directory. A bundled placeholder tone is used for anything that cannot
+        be fetched, so the game is always playable offline.
+     4. The 3D spatial audio field. Beacon loops are positioned in room space and
+        every listener update recalculates pan and attenuation. Multi-room
+        isolation is enforced here: a beacon is only spatialised if it lives in
+        the room the player is standing in, heavily muffled if it lives in an
+        adjacent room, and completely silent otherwise.
+
+   ARCHITECTURAL NOTE ON INCLUDE ORDER
+   NVGT compiles AngelScript, which has no function prototypes: a function must
+   be defined before it is called. This file therefore never calls into
+   rooms.nvgt or mechanics.nvgt. Instead rooms.nvgt pushes the room audibility
+   table into audio_set_room_gains() once per room change. All dependencies point
+   one way:  audio.nvgt  <-  rooms.nvgt  <-  mechanics.nvgt  <-  main.nvgt
+   ========================================================================= */
+
+#include "sound_pool.nvgt"
+
+/* ==========================================================================
+   1.  CONFIGURATION
+   ========================================================================= */
+
+const int MAX_ROOMS = 8;      // upper bound on room ids used by the audio field
+
+array<string> g_cfg_keys;
+array<string> g_cfg_vals;
+
+bool cfg_load(const string&in path) {
+	g_cfg_keys.resize(0);
+	g_cfg_vals.resize(0);
+	file f;
+	if (!f.open(path, "rb")) return false;
+	string all = f.read();
+	f.close();
+	string[]@ lines = all.split("\n");
+	for (uint i = 0; i < lines.length(); i++) {
+		string ln = lines[i].trim_whitespace();
+		if (ln.length() == 0) continue;
+		if (ln.substr(0, 1) == "#") continue;
+		int eq = ln.find_first("=");
+		if (eq < 0) continue;
+		string k = ln.substr(0, eq).trim_whitespace();
+		string v = ln.substr(eq + 1).trim_whitespace();
+		g_cfg_keys.insert_last(k);
+		g_cfg_vals.insert_last(v);
+	}
+	return true;
+}
+
+string cfg_raw(const string&in key, const string&in fallback) {
+	for (uint i = 0; i < g_cfg_keys.length(); i++) {
+		if (g_cfg_keys[i] == key) return g_cfg_vals[i];
+	}
+	return fallback;
+}
+
+int cfg_int(const string&in key, int fallback) {
+	string v = cfg_raw(key, "");
+	if (v.length() == 0) return fallback;
+	return parse_int(v);
+}
+
+double cfg_double(const string&in key, double fallback) {
+	string v = cfg_raw(key, "");
+	if (v.length() == 0) return fallback;
+	return parse_double(v);
+}
+
+bool cfg_bool(const string&in key, bool fallback) {
+	string v = cfg_raw(key, "");
+	if (v.length() == 0) return fallback;
+	return v == "1" or v == "true" or v == "yes" or v == "on";
+}
+
+/* ==========================================================================
+   2.  PATHS, SMALL HELPERS, DIAGNOSTIC LOGGING
+   ========================================================================= */
+
+const string LOG_DIR     = "logs";
+const string SAVE_DIR    = "saves";
+const string CACHE_DIR   = "cache/voice";
+const string ASSET_DIR   = "assets";
+const string PLACE_DIR   = "assets/placeholder";
+const string MANIFEST    = "assets/manifest.txt";
+const string CONFIG_FILE = "config.ini";
+const string LOG_FILE    = "logs/speech.log";
+const string ISSUE_FILE  = "logs/issues.log";
+const string SAVE_FILE   = "saves/store_express.save";
+
+bool g_diag_enabled = false;
+uint g_started_at = 0;
+
+string pad(int v, int width) {
+	string s = "" + v;
+	while (s.length() < uint(width)) s = "0" + s;
+	return s;
+}
+
+string stamp(uint ms) {
+	return pad(int(ms / 60000), 2) + ":" + pad(int((ms / 1000) % 60), 2) + "." + pad(int(ms % 1000), 3);
+}
+
+/* directory_create does not build parents, so walk the path one level at a time. */
+void ensure_dir(const string&in path) {
+	string[]@ parts = path.split("/");
+	string sofar = "";
+	for (uint i = 0; i < parts.length(); i++) {
+		if (parts[i].length() == 0) continue;
+		sofar = (sofar.length() == 0) ? parts[i] : (sofar + "/" + parts[i]);
+		if (!directory_exists(sofar)) directory_create(sofar);
+	}
+}
+
+void ensure_all_dirs() {
+	ensure_dir(LOG_DIR);
+	ensure_dir(SAVE_DIR);
+	ensure_dir(CACHE_DIR);
+	ensure_dir(ASSET_DIR);
+}
+
+/* Append a timestamped line to logs/speech.log. */
+void log_line(const string&in tag, const string&in msg) {
+	file f;
+	if (f.open(LOG_FILE, "ab")) {
+		f.write("[" + stamp(ticks()) + "] " + tag + " | " + msg + "\r\n");
+		f.close();
+	}
+}
+
+/* Diagnostics only write when enabled (Ctrl+Shift+R / Ctrl+F1). */
+void diag(const string&in tag, const string&in msg) {
+	if (!g_diag_enabled) return;
+	log_line(tag, msg);
+}
+
+string num1(double v) {
+	int whole = int(v);
+	int frac = int((v - double(whole)) * 10.0 + 0.5);
+	if (frac < 0) frac = 0;
+	if (frac > 9) frac = 9;
+	return "" + whole + "." + frac;
+}
+
+/* ==========================================================================
+   3.  SPEECH  -  remote voice server with local engine fallback
+   ========================================================================= */
+
+/* PERFORMANCE, DO NOT "SIMPLIFY" THIS.
+   Constructing a tts_voice is pathologically slow on some Windows setups because
+   it enumerates every SAPI voice. It measured 51 SECONDS on the development
+   machine for this project, while a bare sound or http object costs under a
+   millisecond. Declared at global scope it delayed the whole game, before a
+   single key could be read, every single run. It is therefore created lazily on
+   first actual use and never at all when a screen reader is doing the talking,
+   which is the normal case for this audience. */
+tts_voice@ g_tts = null;
+sound      g_voice_player;
+
+bool   g_sr_preferred   = true;    // prefer the running screen reader over SAPI
+bool   g_braille_mirror = true;    // also send utterances to a braille display
+bool   g_voice_probed   = false;   // the servers have been probed this session
+bool   g_voice_remote   = false;   // at least one remote server answered
+string g_voice_endpoint = "";     // the first one that answered, for the log
+string g_last_utterance = "";
+
+/* ==========================================================================
+   3a.  THE VOICE POOL
+   --------------------------------------------------------------------------
+   A shop full of people should not sound like one person, so every character
+   in the shop is given a voice of their own out of this pool:
+
+     * One voice per endpoint in voice_endpoints that answers. Each family is
+       then expanded into the voices it actually offers: Google Translate into
+       one voice per English dialect, ResponsiveVoice into one per locale.
+       These cost nothing to start and need no key.
+     * The local text to speech voices this computer already has, alongside
+       whatever the servers gave us rather than instead of them: online and
+       offline voices sit in the one pool together, so a quiet server costs the
+       shop variety and never the crowd. Constructing
+       tts_voice enumerates every installed voice and measured about 50 seconds
+       on the development machine, so this is deliberately opt in: it is a
+       one-off wait, announced, and everything after it is instant.
+     * The built in fallback voice, handed out only when there is nothing else.
+
+   Every slot here is a person's voice. The menus and the reports are NOT in
+   this pool: they are the player's own channel and go to the screen reader, so
+   the pool can be handed out to the people in the shop in any order it likes.
+   ========================================================================= */
+
+const int VOICE_REMOTE = 0;
+const int VOICE_LOCAL  = 1;
+
+class voice_slot {
+	string label;        // e.g. "Google en-GB", "ResponsiveVoice en-AU", "SAPI David"
+	int    kind;         // VOICE_REMOTE or VOICE_LOCAL
+	string prefix;       // remote: endpoint prefix, its own text parameter included
+	int    local_index;  // local: index into the engine's own voice list
+	float  rate;         // local: speaking rate, used to push similar voices apart
+	float  pitch;        // local: speaking pitch, same reason
+	int    lines;        // how many lines this voice has spoken this session
+	voice_slot(const string&in l, int k) {
+		label = l; kind = k; prefix = ""; local_index = -1;
+		rate = 1.0; pitch = 1.0; lines = 0;
+	}
+}
+
+array<voice_slot@> g_voice_pool;
+int  g_voice_speaker      = -1;     // the character the next line belongs to, or -1
+/* Voices that have been dropped this frame and nobody has dealt with yet. The
+   people who had them are given new ones by the frame (mechanics.nvgt), which
+   is the only file that can see both the customers and the staff. */
+array<int> g_voice_lost_slots;
+
+int voice_lost_take() {
+	if (g_voice_lost_slots.length() == 0) return -1;
+	int slot = g_voice_lost_slots[0];
+	g_voice_lost_slots.remove_at(0);
+	return slot;
+}
+bool g_voice_local_ready  = false;  // the local engine has been built this session
+int  g_voice_local_built  = 0;      // how many local voices went into the pool
+bool g_pending_fallback_line = false; // "no voice server" line held back for the local build
+int  g_voice_assign_next  = 1;      // round robin cursor for character voices
+int  g_voice_assign_calls = 0;
+
+/* ---- the computer's own voices, built behind the game ---------------------
+   Constructing a tts_voice enumerates every installed SAPI voice, and this
+   machine has 617 of them: it measured 52 SECONDS. It is therefore built on a
+   worker thread while the shop is already open, and the voices join the pool
+   when it lands. Measured on this machine: the worker takes about 52s, the
+   frame loop never waits for it, and the engine the worker built is usable from
+   the main thread afterwards (set_voice and speak both answered yes).
+
+   The worker fills the two pending arrays and sets g_local_pending_ready last;
+   the frame loop then does the actual pool insertion itself, so the pool is only
+   ever written from one thread. */
+bool   g_local_build_started = false;
+bool   g_local_pending_ready = false;   // set last, by the worker
+array<string> g_local_pending_names;
+array<int>    g_local_pending_index;
+thread g_local_thread;
+
+/* ---- remote speech, fetched without ever blocking the frame ---------------
+   The clip for a spoken line is fetched by the same kind of frame-driven state
+   machine the asset bootstrap uses, and only then decoded and played. It used to
+   be played straight off the URL with sound::stream_url(), which has no timeout
+   and blocks the main thread: one endpoint that went quiet mid-request froze the
+   whole game with the window unresponsive and nothing in the log. It also sent
+   whole sentences, and Google's endpoint answers 400 above about 200 characters,
+   so every long line cost a voice and a failed request.
+
+   Two consequences worth knowing: speaking is now asynchronous, so a line is
+   queued rather than already playing when say() returns; and a sentence longer
+   than SPEECH_CHUNK_MAX arrives as several requests, played back to back. */
+int    g_speech_chunk_max = 170;      // voice_chunk_chars: endpoint limits start at ~200
+const int SPEECH_MIN_BYTES   = 256;   // anything smaller is an error page, not audio
+const int SPEECH_MAX_ATTEMPTS = 3;    // tries per line before reading it locally
+
+class speech_line {
+	int    slot;
+	string text;
+	/* The pitch this line is played at, which is how a drunk's voice wobbles
+	   without changing who they are. 1.0 is the voice as it comes. */
+	float  pitch;
+	speech_line(int s, const string&in t, float p) { slot = s; text = t; pitch = p; }
+}
+
+/* A line can ask to be spoken a little high or a little low. It applies to the
+   one line that set it and is then forgotten, so nothing leaks into the next
+   thing anybody says. */
+float g_line_pitch = 1.0;
+
+void voice_pitch_for_line(float p) {
+	if (p < 0.5) p = 0.5;
+	if (p > 1.6) p = 1.6;
+	g_line_pitch = p;
+}
+
+array<speech_line@> g_speech_queue;
+http   g_speech_http;
+bool   g_speech_waiting  = false;
+int    g_speech_slot     = -1;
+string g_speech_text     = "";
+float  g_speech_pitch    = 1.0;    /* the pitch the request in flight was made at */
+string g_speech_body     = "";
+int    g_speech_drains   = 0;
+uint   g_speech_sent     = 0;
+int    g_speech_attempts = 0;
+int    g_speech_timeout  = 5000;     // set from config in voice_init
+
+int voice_pool_count() { return int(g_voice_pool.length()); }
+
+string voice_pool_label(int slot) {
+	if (slot < 0 or slot >= int(g_voice_pool.length())) return "none";
+	return g_voice_pool[slot].label;
+}
+
+/* One line the player can ask for, so it is obvious where the shop's voices
+   are coming from and which one got the short straw. */
+string voice_pool_text() {
+	int remote = 0, local = 0;
+	for (uint i = 0; i < g_voice_pool.length(); i++) {
+		if (g_voice_pool[i].kind == VOICE_REMOTE) remote++;
+		else local++;
+	}
+	/* No plural() here: core.nvgt is included after this file, so audio.nvgt
+	   cannot call into it. */
+	string s = "" + voice_pool_count() + (voice_pool_count() == 1 ? " voice" : " voices")
+		+ " in the shop: " + remote + " from the voice servers";
+	if (local > 0) s += ", " + local + " from this computer";
+	else s += ", and none from this computer yet";
+	/* These are the people in the building. The player's own lines and the menus
+	   are not in here at all: they belong to the screen reader. */
+	s += ". They are the people in the building: the menus and the reports are read "
+		+ "by your own screen reader, not from here. ";
+	if (g_voice_speaker >= 0) s += "The last character to speak used " + voice_pool_label(g_voice_speaker) + ". ";
+	return s;
+}
+
+/* Percent-encode just enough to survive a query string without needing byte
+   arithmetic: the endpoint tolerates '+' for space, and we strip the
+   characters that would otherwise break the request. */
+string url_safe(const string&in text) {
+	string t = text;
+	t = t.replace("\r", " ", true);
+	t = t.replace("\n", " ", true);
+	t = t.replace("\"", " ", true);
+	t = t.replace("&", " and ", true);
+	t = t.replace("?", " ", true);
+	t = t.replace("#", " ", true);
+	t = t.replace("%", " percent ", true);
+	t = t.replace("=", " ", true);
+	t = t.replace(" ", "+", true);
+	return t;
+}
+
+/* Set one query parameter in a voice endpoint prefix, leaving the rest of the
+   URL (including the text parameter at the end) alone. Every provider names its
+   dialect differently, so this is how one endpoint becomes a family of voices. */
+string url_set_param(const string&in url, const string&in name, const string&in value) {
+	string needle = name + "=";
+	int at = url.find_first(needle);
+	if (at < 0) return url;
+	uint val_start = uint(at) + uint(needle.length());
+	int amp = url.find_first("&", val_start);
+	string head = url.substr(0, val_start);
+	string tail = (amp < 0) ? "" : url.substr(uint(amp));
+	return head + value + tail;
+}
+
+/* A comma separated list out of config.ini, trimmed, with the blanks dropped. */
+array<string>@ cfg_list(const string&in key, const string&in fallback) {
+	/* "out" is a reserved word in this engine; the local is "items". */
+	array<string>@ items = array<string>();
+	string raw = cfg_raw(key, fallback);
+	string[]@ parts = raw.split(",");
+	for (uint i = 0; i < parts.length(); i++) {
+		string p = parts[i].trim_whitespace();
+		if (p.length() > 0) items.insert_last(p);
+	}
+	return items;
+}
+
+/* When the background build is in flight, do not start a second one: building
+   the engine twice at once would cost the player the whole wait twice over. If
+   the worker has not landed after BUILD_GIVE_UP_MS, it is treated as failed and
+   the synchronous path is allowed again. */
+const uint LOCAL_BUILD_GIVE_UP_MS = 240000;
+uint g_local_build_started_at = 0;
+
+/* Create the local tts engine on first use. See the note on g_tts above. */
+bool tts_ensure() {
+	if (@g_tts != null) return true;
+	if (g_local_build_started and !g_voice_local_ready
+		and (ticks() - g_local_build_started_at) < LOCAL_BUILD_GIVE_UP_MS) {
+		/* The worker is still enumerating installed voices. Waiting for it here
+		   would freeze the game for the rest of that minute, which is the whole
+		   reason it runs on its own thread. Silent until it lands. */
+		return false;
+	}
+	uint t0 = ticks();
+	@g_tts = tts_voice();
+	log_line("speech", "local text to speech engine created lazily in " + (ticks() - t0) + "ms");
+	return @g_tts != null;
+}
+
+/* Speak through the local engine with one particular voice. This is what gives
+   the shop's characters separate voices out of the voices already installed on
+   this computer. */
+bool say_slot_local(voice_slot@ s, const string&in text, bool interrupt) {
+	if (@s is null) return false;
+	if (!tts_ensure()) return false;
+	if (s.local_index < 0 or s.local_index >= g_tts.voice_count) return false;
+	g_tts.set_voice(s.local_index);
+	g_tts.set_rate(s.rate);
+	g_tts.set_pitch(s.pitch * g_line_pitch);
+	g_line_pitch = 1.0;
+	return g_tts.speak(text, interrupt);
+}
+
+/* The player's own voice: the screen reader that is already running, at the
+   player's own speed, or the built in SAPI voice when there is no screen
+   reader. Never touches the network, and never uses one of the people's voices.
+
+   Returns true when the line is handled. False means this machine can offer
+   neither a screen reader nor a voice of its own, which is the one case
+   say_player() has to answer for - and its answer is to drop the line and say
+   so in the log, never to borrow a voice out of the people's pool. That pool is
+   for what the people in the building say and for nothing else. */
+bool say_local(const string&in text, bool interrupt) {
+	g_last_utterance = text;
+	diag("local-speech", text);
+	if (g_sr_preferred and SCREEN_READER_AVAILABLE) {
+		screen_reader_speak(text, interrupt);
+		if (g_braille_mirror) screen_reader_braille(text);
+		return true;
+	}
+	if (!tts_ensure()) return false;
+	g_tts.speak(text, interrupt);
+	return true;
+}
+
+/* The exact sentences the design asks for when a voice server is unreachable. */
+const string VOICE_STOPPED_LINE =
+	"The voice server stopped answering, so the shop is using this computer's voices from now on.";
+
+/* A voice that let us down is dropped for the session, so one dead server does
+   not cost a failed request per line forever. When the last remote voice goes,
+   the shop says so, out loud, once. */
+void voice_drop_slot(int slot, const string&in why) {
+	if (slot < 0 or slot >= int(g_voice_pool.length())) return;
+	voice_slot@ s = g_voice_pool[slot];
+	log_line("voice", "dropping " + s.label + ": " + why);
+	s.kind = VOICE_LOCAL;
+	s.prefix = "";
+	s.local_index = -1;                 // a dead slot, skipped when assigning
+	s.label = s.label + " (lost)";
+	int remaining = 0;
+	for (uint i = 0; i < g_voice_pool.length(); i++) {
+		if (g_voice_pool[i].kind == VOICE_REMOTE and g_voice_pool[i].prefix.length() > 0) remaining++;
+	}
+	/* The people who had this voice need another one. audio.nvgt cannot see them
+	   (it is included first), so the slot is left on a flag for the frame to pick
+	   up, the same way the hardware hands g_hw_need_save up the chain. */
+	g_voice_lost_slots.insert_last(slot);
+	if (remaining == 0 and g_voice_remote) {
+		g_voice_remote = false;
+		log_line("voice", "no remote voices left, using this computer's own voices");
+		say_local(VOICE_STOPPED_LINE, true);
+	}
+}
+
+/* Which voice the next line uses, and who it belongs to. The game sets the
+   speaker before a person in the building speaks and clears it afterwards, and
+   between the two the line is that person's; with nobody set, the line is the
+   player's own channel. -1 therefore means "no character", not "no voice". */
+void voice_use(int slot) { g_voice_speaker = slot; }
+void voice_clear() { g_voice_speaker = -1; }
+int  voice_current() {
+	if (g_voice_speaker >= 0 and g_voice_speaker < int(g_voice_pool.length())) return g_voice_speaker;
+	return -1;
+}
+
+/* Hand a person in the building a voice of their own: round robin, so the
+   people in the shop at the same time all sound different. -1 when there is no
+   voice to give, which sends the line back to the player's own channel rather
+   than to somebody else's voice. */
+int voice_pool_assign() {
+	int n = int(g_voice_pool.length());
+	if (n < 1) return -1;
+	for (int tries = 0; tries < n; tries++) {
+		if (g_voice_assign_next >= n) g_voice_assign_next = 0;
+		int slot = g_voice_assign_next;
+		g_voice_assign_next++;
+		voice_slot@ s = g_voice_pool[slot];
+		if (s.kind == VOICE_REMOTE and s.prefix.length() == 0) continue;
+		if (s.kind == VOICE_LOCAL and s.local_index < 0) continue;
+		g_voice_assign_calls++;
+		return slot;
+	}
+	return -1;
+}
+
+/* The first voice in the pool that can actually be used right now, or -1. */
+int voice_pool_first_live() {
+	for (uint i = 0; i < g_voice_pool.length(); i++) {
+		voice_slot@ s = g_voice_pool[i];
+		if (s.kind == VOICE_REMOTE and s.prefix.length() > 0) return int(i);
+		if (s.kind == VOICE_LOCAL and s.local_index >= 0) return int(i);
+	}
+	return -1;
+}
+
+/* ---- the speech fetch machine ------------------------------------------ */
+
+/* Can this slot speak right now? A voice that has been dropped, or a local one
+   whose engine was never built, cannot. */
+bool speech_slot_usable(int slot) {
+	if (slot < 0 or slot >= int(g_voice_pool.length())) return false;
+	voice_slot@ s = g_voice_pool[slot];
+	if (s.kind == VOICE_REMOTE) return g_voice_remote and s.prefix.length() > 0;
+	return g_voice_local_ready and s.local_index >= 0;
+}
+
+/* Cut a line into pieces an endpoint will accept, at word boundaries. Google's
+   translate_tts answers 400 above about 200 characters, which is shorter than
+   some of this game's own sentences. */
+array<string>@ speech_chunks(const string&in text) {
+	array<string>@ parts = array<string>();
+	string rest = text.trim_whitespace();
+	while (rest.length() > uint(g_speech_chunk_max)) {
+		int cut = g_speech_chunk_max;
+		/* Look back a little for a space, so a word is never sliced in half. */
+		for (int i = g_speech_chunk_max; i > g_speech_chunk_max - 40 and i > 0; i--) {
+			if (i >= int(rest.length())) continue;
+			if (rest.substr(uint(i), 1) == " ") { cut = i; break; }
+		}
+		parts.insert_last(rest.substr(0, uint(cut)).trim_whitespace());
+		rest = rest.substr(uint(cut)).trim_whitespace();
+	}
+	if (rest.length() > 0) parts.insert_last(rest);
+	return parts;
+}
+
+/* Throw away whatever is queued and abandon a fetch that is in flight. */
+void speech_queue_clear() {
+	g_speech_queue.resize(0);
+	g_speech_http.reset();
+	g_speech_waiting = false;		g_speech_slot = -1;
+	g_speech_text = "";
+	g_speech_pitch = 1.0;
+	g_speech_body = "";
+	g_speech_drains = 0;
+	g_speech_attempts = 0;
+}
+
+/* Queue a line for a voice. interrupt replaces what is queued and drops the
+   request in flight, which is what an interrupting say() means. */
+void speech_enqueue(int slot, const string&in text, bool interrupt) {
+	if (interrupt) speech_queue_clear();
+	array<string>@ parts = speech_chunks(text);
+	float pitch = g_line_pitch;
+	g_line_pitch = 1.0;
+	for (uint i = 0; i < parts.length(); i++) {
+		g_speech_queue.insert_last(speech_line(slot, parts[i], pitch));
+	}
+}
+
+/* The frame-driven half. Called once per frame: fetches the clip for the head of
+   the queue, plays it when the whole body has arrived, and gives up on a voice
+   that fails or times out instead of waiting forever. */
+void speech_update() {
+	/* No remote voices left: everything still queued is read out locally. */
+	if (!g_voice_remote) {
+		while (g_speech_queue.length() > 0) {
+			speech_line@ l = g_speech_queue[0];
+			g_speech_queue.remove_at(0);
+			say_local(l.text, false);
+		}
+		if (g_speech_waiting) { g_speech_http.reset(); g_speech_waiting = false; }
+		return;
+	}
+
+	if (g_speech_waiting) {
+		string chunk = g_speech_http.response_body;
+		if (chunk.length() > 0) g_speech_body += chunk;
+		uint elapsed = ticks() - g_speech_sent;
+		bool timed_out = (elapsed > uint(g_speech_timeout));
+		if (!g_speech_http.complete and !timed_out) return;
+		/* The last of a body can land just after complete flips, and response_body
+		   drains on read, so drain twice more before judging it. */
+		if (g_speech_http.complete and g_speech_drains < 2) { g_speech_drains++; return; }
+
+		int    status    = g_speech_http.status_code;
+		int    slot      = g_speech_slot;
+		string text      = g_speech_text;
+		string body      = g_speech_body;
+		bool   played    = false;
+		if (!timed_out and status == 200 and body.length() >= uint(SPEECH_MIN_BYTES)) {
+			g_voice_player.pitch = float(g_speech_pitch);
+			if (g_voice_player.load_memory(body)) played = g_voice_player.play();
+		}
+		g_speech_http.reset();
+		g_speech_waiting = false;
+		g_speech_body = "";
+		g_speech_drains = 0;
+		if (played) {
+			diag("remote-speech", voice_pool_label(slot) + ": " + text);
+			if (g_speech_queue.length() > 0) g_speech_queue.remove_at(0);
+			g_speech_attempts = 0;
+			return;
+		}
+		/* The voice let us down. Drop it, then retry the line on the next live
+		   voice while there is one, and read it locally when there is not. */
+		voice_drop_slot(slot, timed_out ? "timed out after " + (g_speech_timeout / 1000) + "s" : "http " + status);
+		g_speech_attempts++;
+		int live = voice_pool_first_live();
+		if (g_voice_remote and live >= 0 and g_speech_attempts < SPEECH_MAX_ATTEMPTS
+			and g_speech_queue.length() > 0) {
+			g_speech_queue[0].slot = live;      /* retried, still at the head */
+		} else {
+			if (g_speech_queue.length() > 0) g_speech_queue.remove_at(0);
+			say_local(text, false);
+		}
+		return;
+	}
+
+	if (g_speech_queue.length() == 0) return;
+	speech_line@ line = g_speech_queue[0];
+	int slot = line.slot;
+	if (!speech_slot_usable(slot)) {
+		slot = voice_pool_first_live();
+		if (slot < 0) {
+			g_speech_queue.remove_at(0);
+			say_local(line.text, false);
+			return;
+		}
+		line.slot = slot;
+	}
+	voice_slot@ s = g_voice_pool[slot];
+	s.lines++;
+	g_speech_http.reset();
+	g_speech_http.user_agent = VOICE_USER_AGENT;
+	if (!g_speech_http.get(s.prefix + url_safe(line.text), null)) {
+		voice_drop_slot(slot, "could not start a request");
+		return;
+	}
+	g_speech_slot = slot;
+	g_speech_text = line.text;
+	g_speech_pitch = line.pitch;
+	g_speech_body = "";
+	g_speech_drains = 0;
+	g_speech_sent = ticks();
+	g_speech_waiting = true;
+}
+
+/* Speak one line in one voice. This is the funnel every other speech function
+   comes through, so a voice that cannot reach its server costs one failed line
+   and never a silent one. Remote lines are queued and fetched over the next
+   frames; local ones are spoken immediately. */
+void say_as(int slot, const string&in text, bool interrupt = true) {
+	g_last_utterance = text;
+	if (slot < 0 or slot >= int(g_voice_pool.length())) { say_local(text, interrupt); return; }
+	voice_slot@ s = g_voice_pool[slot];
+	if (s.kind == VOICE_REMOTE and g_voice_remote and s.prefix.length() > 0) {
+		speech_enqueue(slot, text, interrupt);
+		return;
+	}
+	if (s.kind == VOICE_LOCAL and g_voice_local_ready) {
+		if (say_slot_local(s, text, interrupt)) return;
+	}
+	/* This voice cannot speak at this moment. A person in the building is still a
+	   person: they borrow another of the people's voices for this line - the
+	   frame will hand them one of their own for good - rather than turning into
+	   the player's screen reader mid-sentence. Only a shop with no voices left at
+	   all leaves the line to the player's own channel. */
+	int live = voice_pool_first_live();
+	if (live >= 0 and live != slot) {
+		voice_slot@ t = g_voice_pool[live];
+		if (t.kind == VOICE_REMOTE) { speech_enqueue(live, text, interrupt); return; }
+		if (t.kind == VOICE_LOCAL and say_slot_local(t, text, interrupt)) return;
+	}
+	say_local(text, interrupt);
+}
+
+/* The one way the rest of the game speaks, in the current character's voice if
+   one has been set and in the narration voice if not. */
+/* ---- the machine's own voice ----------------------------------------------
+   The manager terminal does not speak with the player's voice. When the player
+   is using the terminal, the lines the terminal itself produces - the result of
+   an order, a readout, the answer to a keypress - are the machine's, and they
+   come out of the back office chip (hardware.nvgt), which is why this file only
+   has to hold them for a moment instead of reading them out.
+
+   The capture is deliberately narrow: it is on only while one terminal menu
+   action is running, so the player's own keys (the time, the help list, the
+   money report) and everything in the shop are unaffected, and a customer
+   walking in while the terminal is open is still announced in the player's
+   voice. */
+bool   g_terminal_capture  = false;
+string g_terminal_captured = "";
+
+void terminal_capture_begin() {
+	g_terminal_capture = true;
+	g_terminal_captured = "";
+}
+
+/* Stop capturing and hand back what the machine wanted to say. An empty string
+   means the action had nothing to say, which is not a failure. */
+string terminal_capture_take() {
+	g_terminal_capture = false;
+	string line = g_terminal_captured;
+	g_terminal_captured = "";
+	return line;
+}
+
+/* ---- the player's own channel --------------------------------------------
+   The menus, the prompts, the reports and everything else the game says TO the
+   player. It goes to their screen reader, or to a Windows voice when they have
+   none. It does not go to the people's voices and never has: that pool is for
+   what the people in the building say, and a menu read out in a customer's
+   voice is a worse failure than a menu that says nothing. */
+int g_lines_to_player = 0;    /* the routing decision, not the audio: counted here
+                                 and written into the Ctrl+F1 snapshot, which is
+                                 how you tell which channel a line went to */
+int g_lines_to_people = 0;
+bool g_player_speech_warned = false;   /* the "nothing to speak with" line is logged once */
+string g_player_held_line = "";       /* one player line held while its own voice is still being built */
+
+void say_player(const string&in text, bool interrupt) {
+	if (say_local(text, interrupt)) return;
+	/* No screen reader is running, and this machine's own voices are still being
+	   enumerated (which measured 52 seconds): hold the line rather than lose it,
+	   and voice_local_update() speaks it the moment there is something to speak
+	   with. Holding one line is deliberate - it is the last thing the game said,
+	   and a queue of menus read out a minute late is worse than a menu that
+	   arrives late. */
+	if (g_local_build_started and !g_voice_local_ready
+		and (ticks() - g_local_build_started_at) < LOCAL_BUILD_GIVE_UP_MS) {
+		g_player_held_line = text;
+		return;
+	}
+	/* There is nothing to read it with at all. The pool belongs to the people - a
+	   menu line read out in a customer's voice is worse than a menu line the
+	   player never hears - so the line is dropped and logged, once. */
+	if (!g_player_speech_warned) {
+		g_player_speech_warned = true;
+		log_line("speech", "no screen reader and no local voice: the player's channel has nothing to speak with");
+	}
+}
+
+void say(const string&in text, bool interrupt = true) {
+	if (g_terminal_capture) { g_terminal_captured = text; return; }
+	/* Recorded here, at the funnel, so it is the last thing the game SAID whatever
+	   channel said it. */
+	g_last_utterance = text;
+	/* Whose line is it? A voice set by voice_use() means somebody in the building
+	   is talking; with nobody set, it is the player's channel. */
+	if (g_voice_speaker >= 0) { g_lines_to_people++; say_as(g_voice_speaker, text, interrupt); return; }
+	g_lines_to_player++;
+	say_player(text, interrupt);
+}
+
+void stop_all_speech() {
+	screen_reader_silence();
+	if (@g_tts != null) g_tts.stop();
+	if (g_voice_player.active) g_voice_player.stop();
+	speech_queue_clear();
+}
+
+/* The exact sentence the design asks for when the server is unreachable. Worth
+   knowing what it means: the computer's own voices are not a stand in for the
+   servers, they are in the pool whether or not one answered. The sentence names
+   which of the two the people in here are being cast from today. */
+const string VOICE_FALLBACK_LINE =
+	"The voice server did not answer, so the shop is using this computer's voices for this session.";
+
+/* A browser-like agent. Public speech endpoints routinely answer a bare client
+   with 401 or 403, and this one costs nothing to send. */
+const string VOICE_USER_AGENT =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
+/* Fire one request at a speech endpoint prefix and report whether it returned a
+   non empty 200. Note each provider names its text parameter differently, so the
+   prefix carries the parameter name with it. */
+bool voice_probe_endpoint(const string&in prefix, const string&in probe_text, int timeout_ms, int &out code) {
+	code = 0;
+	http h;
+	h.user_agent = VOICE_USER_AGENT;
+	if (!h.get(prefix + url_safe(probe_text), null)) { code = -1; return false; }
+	uint start = ticks();
+	string body = "";
+	while (!h.complete and (ticks() - start) < uint(timeout_ms)) {
+		string chunk = h.response_body;
+		if (chunk.length() > 0) body += chunk;
+		wait(10);
+	}
+	/* Drain once more: the tail of a body can land just after complete flips, and
+	   counting the body only in the loop above reports a working endpoint as an
+	   empty one about as often as not. */
+	string tail = h.response_body;
+	if (tail.length() > 0) body += tail;
+	code = h.status_code;
+	uint bytes = body.length();
+	h.reset();
+	return code == 200 and bytes > 0;
+}
+
+/* ---- building the pool ------------------------------------------------- */
+
+void voice_add_remote(const string&in label, const string&in prefix) {
+	if (prefix.length() == 0) return;
+	voice_slot@ s = voice_slot(label, VOICE_REMOTE);
+	s.prefix = prefix;
+	g_voice_pool.insert_last(s);
+}
+
+/* One endpoint that answered becomes as many voices as that family offers.
+   Google Translate speaks a different voice per dialect and ResponsiveVoice one
+   per locale, and both take the dialect in a query parameter, so every extra
+   voice costs one URL and no extra setup. Providers whose dialect parameter is
+   not known here contribute the single voice their prefix already describes. */
+void voice_add_family(const string&in prefix) {
+	if (prefix.length() == 0) return;
+	if (prefix.find_first("translate.google") >= 0) {
+		array<string>@ dialects = cfg_list("voice_google_dialects", "en,en-gb,en-au,en-in,en-ie,en-za,en-ca");
+		for (uint i = 0; i < dialects.length(); i++) {
+			voice_add_remote("Google " + dialects[i], url_set_param(prefix, "tl", dialects[i]));
+		}
+		return;
+	}
+	if (prefix.find_first("responsivevoice.org") >= 0) {
+		array<string>@ locales = cfg_list("voice_responsive_locales", "en,en-GB,en-AU,en-IN,en-US");
+		array<string>@ engines = cfg_list("voice_responsive_engines", "g1,g2,g3");
+		for (uint i = 0; i < locales.length(); i++) {
+			string e = engines[(engines.length() == 0) ? 0 : (i % engines.length())];
+			string one = url_set_param(prefix, "tl", locales[i]);
+			one = url_set_param(one, "sv", e);
+			voice_add_remote("ResponsiveVoice " + locales[i] + " " + e, one);
+		}
+		return;
+	}
+	voice_add_remote("voice server", prefix);
+}
+
+/* Turn a list of names into local voices. Kept separate from the engine walk
+   below so the pool can be tested without paying for the engine, and so the
+   rate and pitch spread is in one place.
+
+   engine_index matters: engine_index[i] is that voice's position in the
+   engine's OWN list. The pool hands that index back to set_voice(), so filtering
+   the names (English only, say) without carrying the engine index along makes
+   every character after the first filtered voice speak with somebody else's
+   voice. The list used to be numbered 0,1,2..., which was wrong at the first
+   voice the filter dropped. */
+void voice_add_local_names(array<string>@ names, array<int>@ engine_index) {
+	double rate_spread  = cfg_double("local_voice_rate_spread", 0.12);
+	double pitch_spread = cfg_double("local_voice_pitch_spread", 0.08);
+	int max_voices = cfg_int("local_voices_max", 12);		int added = 0;
+	for (uint i = 0; i < names.length(); i++) {
+		if (added >= max_voices) break;
+		voice_slot@ s = voice_slot("this computer: " + names[i], VOICE_LOCAL);
+		s.local_index = (i < engine_index.length()) ? engine_index[i] : int(i);
+		/* Two installed voices can be near identical; a small rate and pitch
+		   spread stops the shop sounding like one person doing all of it. */
+		s.rate  = 1.0 + ((double(added % 3) - 1.0) * rate_spread);
+		s.pitch = 1.0 + ((double(added % 2) == 0.0 ? 0.0 : 1.0) * pitch_spread);
+		g_voice_pool.insert_last(s);
+		added++;
+	}
+	g_voice_local_built = added;
+	g_voice_local_ready = true;
+	log_line("speech", "local voices added to the pool: " + added);
+}
+
+/* Ask this computer for the voices it already has. This is the expensive one:
+   enumerating installed voices measured 52 seconds on this machine, which is why
+   it runs on a worker thread (voice_local_start) instead of in the way of the
+   frame loop. This synchronous form is the path when threads are somehow
+   unavailable. English only by default, because the game
+   speaks English and 617 voices is not a shop. */
+void voice_build_local_engine() {
+	if (g_voice_local_ready) return;
+	string engines_wanted = cfg_raw("local_voice_engines", "sapi5");
+	uint t0 = ticks();
+	if (engines_wanted.length() > 0) @g_tts = tts_voice(engines_wanted);
+	else tts_ensure();
+	int ms = int(ticks() - t0);
+	if (@g_tts == null and engines_wanted.length() > 0) {
+		/* No such engine on this machine: take whatever is installed. */
+		log_line("speech", "engine list \"" + engines_wanted + "\" gave nothing, using every engine");
+		@g_tts = tts_voice();
+	}
+	if (@g_tts == null) {
+		log_line("speech", "no local text to speech engine available");
+		g_voice_local_ready = true;
+		return;
+	}
+	bool english_only = cfg_bool("local_voices_english_only", true);
+	array<string>@ names = array<string>();
+	array<int>@ index = array<int>();
+	int count = g_tts.voice_count;
+	for (int i = 0; i < count; i++) {
+		string name = g_tts.get_voice_name(i);
+		string lang = g_tts.get_voice_language(i);
+		if (name.find_first("builtin fallback") >= 0) continue;
+		if (name.find_first("fallback") >= 0) continue;
+		if (english_only) {
+			bool is_english = (lang.find_first("en") == 0) or (lang.find_first("English") >= 0)
+				or (name.find_first("English") >= 0);
+			if (!is_english) continue;
+		}
+		names.insert_last(name);
+		index.insert_last(i);
+	}
+	log_line("speech", "local voice engine built in " + ms + "ms: " + count + " installed, "
+		+ names.length() + " usable");
+	voice_add_local_names(names, index);
+}
+
+/* The worker. It builds the engine, collects the voice names and their engine
+   indices, hands the engine over, and flags the frame loop last. Nothing else
+   touches the pool from here. */
+void voice_local_worker(dictionary@ args) {
+	string engines_wanted = cfg_raw("local_voice_engines", "sapi5");
+	uint t0 = ticks();
+	tts_voice@ v = null;
+	if (engines_wanted.length() > 0) @v = tts_voice(engines_wanted);
+	else @v = tts_voice();
+	int ms = int(ticks() - t0);
+	if (@v == null and engines_wanted.length() > 0) {
+		@v = tts_voice();
+	}
+	if (@v == null) {
+		log_line("speech", "local voice worker found no text to speech engine");
+		g_local_pending_ready = true;
+		return;
+	}
+	double rate_spread  = cfg_double("local_voice_rate_spread", 0.12);
+	double pitch_spread = cfg_double("local_voice_pitch_spread", 0.08);
+	int max_voices = cfg_int("local_voices_max", 12);
+	bool english_only = cfg_bool("local_voices_english_only", true);
+	int count = v.voice_count;
+	int usable = 0;
+	for (int i = 0; i < count; i++) {
+		string name = v.get_voice_name(i);
+		string lang = v.get_voice_language(i);
+		if (name.find_first("builtin fallback") >= 0) continue;
+		if (name.find_first("fallback") >= 0) continue;
+		if (english_only) {
+			bool is_english = (lang.find_first("en") == 0) or (lang.find_first("English") >= 0)
+				or (name.find_first("English") >= 0);
+			if (!is_english) continue;
+		}
+		if (usable >= max_voices) break;
+		g_local_pending_names.insert_last(name);
+		g_local_pending_index.insert_last(i);
+		usable++;
+	}
+	@g_tts = v;
+	log_line("speech", "local voice worker built the engine in " + ms + "ms: " + count
+		+ " installed, " + usable + " taking part in the shop");
+	g_local_pending_ready = true;      /* last: the frame loop watches this */
+}
+
+/* Start the worker once. Never blocks: the shop opens while this runs. */
+void voice_local_start() {
+	if (g_local_build_started or g_voice_local_ready) return;
+	g_local_build_started = true;
+	g_local_build_started_at = ticks();
+	log_line("speech", "asking this computer for its voices in the background");
+	g_local_thread.start(@voice_local_worker);
+}
+
+/* The frame loop's half: when the worker lands, its voices join the pool and
+   the shop says so. Called every frame from main.nvgt; costs a flag test until
+   the build arrives, and nothing at all after it. */
+void voice_local_update() {
+	if (!g_local_pending_ready or g_voice_local_ready) return;
+	int before = voice_pool_count();
+	voice_add_local_names(g_local_pending_names, g_local_pending_index);
+	int added = voice_pool_count() - before;
+	/* Anything the player's channel had to hold because there was no voice yet
+	   can be said now, before the announcement about the voices themselves. */
+	if (g_player_held_line.length() > 0) {
+		string held = g_player_held_line;
+		g_player_held_line = "";
+		say_local(held, false);
+	}
+	if (added <= 0) return;
+	/* No plural() here: audio.nvgt is included before core.nvgt. */
+	int voice = voice_pool_first_live();
+	string line = "This computer's own voices have joined the shop, "
+		+ added + ((added == 1) ? " more voice" : " more voices")
+		+ ", so the people in here no longer sound alike.";
+	if (g_pending_fallback_line) { line = VOICE_FALLBACK_LINE + " " + line; g_pending_fallback_line = false; }
+	/* The player's own channel: this is the game telling the player what its
+	   voices are, not one of the people in the building saying something. */
+	say(line, false);
+	g_local_pending_names.resize(0);
+	g_local_pending_index.resize(0);
+}
+
+/* ---- startup ------------------------------------------------------------ */
+
+/* Probe every configured voice server once. Every server that answers
+   contributes voices, not just the first, because a shop full of people needs
+   more than one. The computer's own voices are asked for alongside the servers
+   rather than instead of them, so the pool is the same pool either way and the
+   people never all share one voice. */
+void voice_init() {
+	ensure_dir(CACHE_DIR);
+	g_sr_preferred   = cfg_bool("screen_reader_preferred", true);
+	g_braille_mirror = cfg_bool("braille_mirror", true);
+	/* How long one spoken line may take to arrive before its voice is abandoned.
+	   Speech is fetched in the background, so this is a patience limit and not a
+	   freeze: the game carries on regardless. */
+	g_speech_timeout = cfg_int("voice_fetch_timeout_ms", 5000);
+	g_speech_chunk_max = cfg_int("voice_chunk_chars", 170);
+
+	if (g_voice_probed) return;
+	g_voice_probed = true;
+
+	if (!cfg_bool("voice_server_enabled", true)) {
+		g_voice_remote = false;
+		log_line("voice", "voice server check disabled by config");
+		voice_build_local_engine();
+		say_local(VOICE_FALLBACK_LINE, true);
+		return;
+	}
+
+	/* The list first, then the two older keys, so an existing config.ini keeps
+	   working and a new one can hold as many servers as it likes. */
+	array<string> candidates;
+	string list = cfg_raw("voice_endpoints", "");
+	if (list.length() > 0) {
+		string[]@ parts = list.split(";");
+		for (uint i = 0; i < parts.length(); i++) {
+			string p = parts[i].trim_whitespace();
+			if (p.length() > 0) candidates.insert_last(p);
+		}
+	} else {
+		string first = cfg_raw("voice_endpoint", "");
+		if (first.length() > 0) candidates.insert_last(first);
+		string second = cfg_raw("voice_endpoint_fallback", "");
+		if (second.length() > 0) candidates.insert_last(second);
+	}
+
+	string probe = cfg_raw("voice_probe_text", "Store Express voice check.");
+	int timeout_ms = cfg_int("voice_probe_timeout_ms", 6000);
+	bool probe_all = cfg_bool("voice_probe_all", true);
+	g_voice_remote = false;
+
+	for (uint i = 0; i < candidates.length(); i++) {
+		if (candidates[i].length() == 0) continue;
+		int code = 0;
+		bool ok = voice_probe_endpoint(candidates[i], probe, timeout_ms, code);
+		log_line("voice", "probe " + i + " http=" + code + " ok=" + (ok ? "yes" : "no") + " " + candidates[i]);
+		if (!ok) continue;
+		voice_add_family(candidates[i]);
+		if (g_voice_endpoint.length() == 0) g_voice_endpoint = candidates[i];
+		g_voice_remote = true;
+		if (!probe_all) break;
+	}
+
+	int remote_voices = voice_pool_count();
+
+	/* The computer's own voices join the pool whether or not a server answered,
+	   when the player has asked for them. They are built on a worker thread: the
+	   shop opens and keeps talking while it runs, and the voices join the pool
+	   the moment they are ready. */
+	if (cfg_bool("local_voices", true)) voice_local_start();
+
+	if (g_voice_remote and remote_voices > 0) {
+		/* Queue the confirmation through the first real voice. The clip is fetched
+		   over the next few frames, so this call cannot prove the audio itself; if
+		   the fetch then fails, speech_update() drops that voice and says why. */
+		int first = voice_pool_first_live();
+		if (first >= 0) {
+			/* The player's own channel, not the first server voice: this line is
+			   information for the player, and it belongs in the voice they are
+			   listening with. Whether the server really works is proven by the
+			   fetch machinery below, not by who reads this sentence out. */
+			say("Store Express voice server online. " + voice_pool_count()
+				+ " voices are in the shop for the people in it.", true);
+			log_line("voice", "remote voices confirmed, " + voice_pool_count() + " in the pool via " + g_voice_endpoint);
+			return;
+		}
+		log_line("voice", "a server answered but left no usable voice");
+		remote_voices = 0;
+	}
+
+	/* No server at all: the shop needs the computer's own voices. They are asked
+	   for in the background rather than built here, because this is the same 52
+	   second enumeration; the fallback line is held back and spoken with the
+	   voices when they land, so the player hears it once and hears it properly. */
+	if (!g_voice_local_ready) {
+		log_line("voice", "no voice server answered, asking this computer for its voices in the background");
+		g_pending_fallback_line = true;
+		voice_local_start();
+	}
+	/* The screen reader reads this now; if there is no screen reader, the worker
+	   speaks it when the local voices arrive (g_pending_fallback_line above). */
+	say_local(VOICE_FALLBACK_LINE, true);
+}
+
+/* ==========================================================================
+   4.  FIRST-RUN ASSET BOOTSTRAP
+   --------------------------------------------------------------------------
+   A frame-driven state machine, deliberately not a blocking download loop, so
+   the window keeps responding and the player can press Escape to skip.
+
+   upload.wikimedia.org answers bursts of requests with HTTP 429, so requests
+   are spaced out by download_delay_ms and failures retry with exponential
+   backoff before the bundled placeholder tone is accepted instead.
+   ========================================================================= */
+
+enum boot_state { BOOT_IDLE, BOOT_RUNNING, BOOT_DONE };
+
+class asset_rec {
+	string logical;
+	string file;
+	bool   loopable;
+	string url;
+	/* Verified byte count of the recording behind url, as text so no numeric
+	   parsing is needed. Empty when unknown. It exists to catch a download that
+	   stopped early: a damaged file on disk is skipped forever otherwise, and a
+	   truncated Ogg or WAV still decodes into a clipped noise, so nothing else
+	   in the game would ever notice. */
+	string expected;
+	asset_rec(const string&in l, const string&in f, bool lp, const string&in u, const string&in e) {
+		logical = l; file = f; loopable = lp; url = u; expected = e;
+	}
+}
+
+array<asset_rec@> g_assets;
+
+boot_state g_boot_state   = BOOT_IDLE;
+uint  g_boot_index        = 0;
+uint  g_boot_next_ms      = 0;
+uint  g_boot_req_start    = 0;
+int   g_boot_attempts     = 0;
+int   g_boot_downloaded   = 0;
+int   g_boot_placeholder  = 0;
+int   g_boot_failed       = 0;
+int   g_boot_status       = 0;
+bool  g_boot_req_active   = false;
+http  g_boot_http;
+string g_boot_buffer      = "";
+int64  g_boot_expect      = -1;   // Content-Length the server declared, or -1
+int    g_boot_drains      = 0;    // extra post-completion drains done for this request
+string g_boot_part        = "";   // in-flight .part file, renamed into place when whole
+
+bool copy_file(const string&in src, const string&in dst) {
+	file a;
+	if (!a.open(src, "rb")) return false;
+	string data = a.read();
+	a.close();
+	file b;
+	if (!b.open(dst, "wb")) return false;
+	b.write(data);
+	b.close();
+	return true;
+}
+
+void assets_load_manifest() {
+	g_assets.resize(0);
+	file f;
+	if (!f.open(MANIFEST, "rb")) {
+		log_line("assets", "manifest not found at " + MANIFEST);
+		return;
+	}
+	string all = f.read();
+	f.close();
+	string[]@ lines = all.split("\n");
+	for (uint i = 0; i < lines.length(); i++) {
+		string ln = lines[i].trim_whitespace();
+		if (ln.length() == 0) continue;
+		if (ln.substr(0, 1) == "#") continue;
+		string[]@ cols = ln.split("|");
+		/* NOTE: string::split() drops a trailing empty token, so a line written as
+		   "car_idle|car_idle.mp3|1|" (no source URL) parses as only 3 columns, and
+		   an entry that depends purely on its bundled placeholder would be
+		   silently dropped. Three columns is a valid entry with no source URL. */
+		if (cols.length() < 3) continue;
+		string src = (cols.length() >= 4) ? cols[3].trim_whitespace() : "";
+		string want = (cols.length() >= 5) ? cols[4].trim_whitespace() : "";
+		asset_rec@ r = asset_rec(
+			cols[0].trim_whitespace(),
+			cols[1].trim_whitespace(),
+			cols[2].trim_whitespace() == "1",
+			src,
+			want
+		);
+		g_assets.insert_last(r);
+	}
+	log_line("assets", "manifest loaded, " + g_assets.length() + " entries");
+}
+
+string asset_path(const string&in filename) { return ASSET_DIR + "/" + filename; }
+
+/* Accept the bundled tone for this asset so the game always has something. */
+void assets_use_placeholder(asset_rec@ a) {
+	string live = asset_path(a.file);
+	if (copy_file(PLACE_DIR + "/" + a.file, live)) {
+		g_boot_placeholder++;
+		diag("assets", "placeholder staged for " + a.logical);
+	} else {
+		g_boot_failed++;
+		log_line("assets", "no placeholder available for " + a.logical);
+	}
+}
+
+int asset_count_downloadable() {
+	int n = 0;
+	for (uint i = 0; i < g_assets.length(); i++) if (g_assets[i].url.length() > 0) n++;
+	return n;
+}
+
+/* How many recordings genuinely need work: missing files, plus files on disk at
+   the wrong size. This is the number that decides whether the bootstrap runs at
+   all, so a launch where everything is present does no fetching, says nothing,
+   and never holds up the menu. Counting every cue with a URL instead is how the
+   game came to announce "22 recordings to fetch" on every single start. */
+int asset_count_needed() {
+	int n = 0;
+	for (uint i = 0; i < g_assets.length(); i++) {
+		asset_rec@ a = g_assets[i];
+		string live = asset_path(a.file);
+		if (!file_exists(live)) { n++; continue; }
+		if (a.expected.length() > 0 and ("" + int(file_get_size(live))) != a.expected) n++;
+	}
+	return n;
+}
+
+void assets_bootstrap_start() {
+	ensure_dir(ASSET_DIR);
+	/* The music tracks download into assets/music, and a fresh checkout does not
+	   have that folder: writing to a path whose parent does not exist fails
+	   silently on Windows and would have shipped an empty playlist. */
+	ensure_dir(ASSET_DIR + "/music");
+	assets_load_manifest();
+	if (!cfg_bool("download_assets", true)) {
+		g_boot_state = BOOT_DONE;
+		log_line("assets", "downloads disabled by config, using bundled tones");
+		return;
+	}
+	if (g_assets.length() == 0) { g_boot_state = BOOT_DONE; return; }
+	int needed = asset_count_needed();
+	if (needed == 0) {
+		g_boot_state = BOOT_DONE;
+		log_line("assets", "all recordings already present, nothing to fetch");
+		return;
+	}
+	g_boot_state = BOOT_RUNNING;
+	g_boot_index = 0;
+	g_boot_attempts = 0;
+	g_boot_next_ms = ticks() + 300;
+	g_boot_status = 0;
+	g_boot_req_active = false;
+	/* Said without interrupting, because the menu greeting is the more useful
+	   thing to hear and the shop is playable while this runs. */
+	say("Fetching shop audio, " + needed + " of " + asset_count_downloadable()
+		+ " recordings. Carry on, this happens in the background.", false);
+}
+
+void assets_bootstrap_finish() {
+	g_boot_state = BOOT_DONE;
+	if (g_boot_req_active) { g_boot_http.reset(); g_boot_req_active = false; }
+	log_line("assets", "bootstrap finished: downloaded=" + g_boot_downloaded
+		+ " placeholders=" + g_boot_placeholder + " failed=" + g_boot_failed);
+	if (g_boot_downloaded > 0) {
+		say("Shop audio ready. " + g_boot_downloaded + " recordings downloaded.", true);
+	} else {
+		say("Shop audio ready, using the bundled tones.", true);
+	}
+}
+
+void assets_bootstrap_step() {
+	if (g_boot_state != BOOT_RUNNING) return;
+	if (ticks() < g_boot_next_ms) return;
+
+	if (g_boot_index >= g_assets.length()) { assets_bootstrap_finish(); return; }
+	asset_rec@ a = g_assets[g_boot_index];
+	string live = asset_path(a.file);
+
+	/* Already staged (a previous run, or the download already landed). */
+	if (file_exists(live)) {
+		/* ...unless it is not the size the manifest says it should be, which means
+		   an earlier run wrote a truncated file. Refetch rather than trust it. */
+		if (a.expected.length() > 0 and ("" + int(file_get_size(live))) != a.expected) {
+			log_line("assets", a.logical + " is " + int(file_get_size(live)) + " bytes, expected "
+				+ a.expected + "; refetching");
+			file_delete(live);
+		} else {
+			g_boot_index++;
+			g_boot_attempts = 0;
+			return;
+		}
+	}
+
+	if (!g_boot_req_active) {
+		if (a.url.length() == 0) { assets_use_placeholder(a); g_boot_index++; g_boot_attempts = 0; return; }
+		int retries = cfg_int("download_retries", 3);
+		if (g_boot_attempts >= retries) {
+			log_line("assets", "giving up on " + a.logical + " after " + g_boot_attempts + " attempts");
+			assets_use_placeholder(a);
+			g_boot_index++; g_boot_attempts = 0; return;
+		}
+		g_boot_http.reset();
+		g_boot_buffer = "";
+		g_boot_status = 0;
+		g_boot_expect = -1;
+		g_boot_drains = 0;
+		if (!g_boot_http.get(a.url, null)) {
+			g_boot_attempts++;
+			g_boot_next_ms = ticks() + 2000 * g_boot_attempts;
+			log_line("assets", "request could not start for " + a.logical + ", retrying");
+			return;
+		}
+		g_boot_req_active = true;
+		g_boot_req_start = ticks();
+		diag("assets", "GET " + a.url);
+		return;
+	}
+
+	/* A request is in flight. */
+	if (g_boot_http.status_code != 0) g_boot_status = g_boot_http.status_code;
+
+	if (g_boot_status != 0 and g_boot_status != 200) {
+		/* Almost always HTTP 429 rate limiting from the asset host. Back off. */
+		g_boot_http.reset();
+		g_boot_req_active = false;
+		g_boot_attempts++;
+		int wait_ms = (g_boot_status == 429 ? 6000 : 2500) * g_boot_attempts;
+		g_boot_next_ms = ticks() + uint(wait_ms);
+		log_line("assets", "HTTP " + g_boot_status + " for " + a.logical + ", backing off " + wait_ms + "ms");
+		return;
+	}
+
+	/* http::response_body drains on read, so each call hands back only the bytes
+	   that arrived since the last one. */
+	string chunk = g_boot_http.response_body;
+	if (chunk.length() > 0) g_boot_buffer += chunk;
+
+	/* Learn what the server says the whole file weighs, so a body that stops
+	   short can be told apart from a complete one. */
+	if (g_boot_expect < 0) {
+		http_response@ rh = g_boot_http.response_headers;
+		if (@rh !is null and rh.has_content_length) g_boot_expect = rh.content_length;
+	}
+
+	uint elapsed = ticks() - g_boot_req_start;
+	if (g_boot_http.complete) {
+		/* The final chunk of a body can land in the instant AFTER complete flips
+		   true, and response_body drains on read, so the read that happens in the
+		   same frame as completion can be short by that last chunk. Measured on
+		   Wikimedia Commons: a 356,430 byte file came back as 327,680 - exactly
+		   five 64 KiB chunks - with the transfer reported complete. Draining again
+		   over the next couple of frames recovers it. This is why the length check
+		   below is a safety net and not the whole fix: on its own it would retry a
+		   file that the very next drain would have completed. */
+		string tail = g_boot_http.response_body;
+		if (tail.length() > 0) g_boot_buffer += tail;
+		if (g_boot_drains < 2) { g_boot_drains++; return; }
+		g_boot_http.reset();
+		g_boot_req_active = false;
+		/* A body still shorter than the declared Content-Length is a truncated
+		   download, not a small file. Writing it would leave a file that merely
+		   sounds wrong, and once it is on disk the exists() check above would
+		   skip it forever, so it is thrown away and refetched instead. */
+		bool short_body = false;
+		if (g_boot_expect > 0) short_body = (int64(g_boot_buffer.length()) != g_boot_expect);
+		else short_body = (g_boot_buffer.length() < 512);
+		if (short_body) {
+			g_boot_attempts++;
+			g_boot_next_ms = ticks() + 2000 * g_boot_attempts;
+			log_line("assets", "incomplete download of " + a.logical + ": got "
+				+ g_boot_buffer.length() + " of " + int(g_boot_expect) + " bytes, retrying");
+			return;
+		}
+		/* Stage it, then rename, so a half-written file never wears the real name. */
+		g_boot_part = live + ".part";
+		file outf;                       // "out" is a reserved keyword in AngelScript
+		bool wrote = outf.open(g_boot_part, "wb");
+		if (wrote) {
+			outf.write(g_boot_buffer);
+			outf.close();
+			wrote = file_move(g_boot_part, live);
+		}
+		if (!wrote) {
+			log_line("assets", "could not write " + live);
+			file_delete(g_boot_part);
+			g_boot_failed++;
+		} else {
+			g_boot_downloaded++;
+			diag("assets", "saved " + live + " (" + g_boot_buffer.length() + " bytes)");
+		}
+		g_boot_index++;
+		g_boot_attempts = 0;
+		g_boot_buffer = "";
+		g_boot_expect = -1;
+		g_boot_next_ms = ticks() + uint(cfg_int("download_delay_ms", 1500));
+		if ((g_boot_downloaded % 4) == 0) say("Audio " + g_boot_index + " of " + g_assets.length() + ".", false);
+		return;
+	}
+
+	if (elapsed > uint(cfg_int("download_timeout_ms", 45000))) {
+		g_boot_http.reset();
+		g_boot_req_active = false;
+		g_boot_attempts++;
+		g_boot_next_ms = ticks() + 2000 * g_boot_attempts;
+		log_line("assets", "timeout on " + a.logical);
+	}
+}
+
+void assets_bootstrap_skip() {
+	if (g_boot_state != BOOT_RUNNING) return;
+	log_line("assets", "bootstrap skipped by player at entry " + g_boot_index);
+	say("Skipping the audio download. Bundled tones will be used for anything still missing.", true);
+	/* Stage every remaining entry from the bundled tones so nothing is absent. */
+	for (uint i = g_boot_index; i < g_assets.length(); i++) {
+		if (!file_exists(asset_path(g_assets[i].file))) assets_use_placeholder(g_assets[i]);
+	}
+	assets_bootstrap_finish();
+}
+
+/* ==========================================================================
+   5.  SPATIAL AUDIO FIELD AND MULTI-ROOM ISOLATION
+   ========================================================================= */
+
+sound_pool@ g_pool = null;
+
+float  g_lis_x = 0.0, g_lis_y = 0.0, g_lis_z = 0.0;
+double g_lis_rot = 0.0;
+int    g_lis_room = -1;
+
+bool   g_power_on = true;                 // false during a total grid blackout
+float  g_muffle_gain = -22.0;             // dB bleed through a shared wall
+float  g_silent_gain = -96.0;             // treated as inaudible
+float  g_default_gain = -2.0;
+
+/* Per-room gain for the listener's current room, pushed in by rooms.nvgt. */
+array<float> g_room_gain;
+
+class beacon {
+	string id;
+	int    room;
+	float  x, y, z;
+	string file;
+	bool   loopable;
+	float  gain;
+	int    slot;
+	bool   silenced;
+
+	beacon(const string&in i, int r, float bx, float by, float bz,
+	       const string&in f, bool lp, float g) {
+		id = i; room = r;
+		x = bx; y = by; z = bz;
+		file = f; loopable = lp; gain = g;
+		slot = -1;
+		silenced = true;
+	}
+}
+
+array<beacon@> g_beacons;
+int g_sfx_counter = 0;
+
+/* Called by rooms.nvgt whenever the player changes room. index = room id,
+   value = dB gain applied to beacons in that room. */
+void audio_set_room_gains(float[]@ gains) {
+	g_room_gain.resize(MAX_ROOMS);
+	for (uint i = 0; i < uint(MAX_ROOMS); i++) {
+		if (i < gains.length()) g_room_gain[i] = gains[i];
+		else g_room_gain[i] = g_silent_gain;
+	}
+}
+
+float audio_gain_for_room(int room) {
+	if (!g_power_on) return g_silent_gain;
+	if (room < 0) return g_silent_gain;
+	if (uint(room) >= g_room_gain.length()) return g_silent_gain;
+	return g_room_gain[room];
+}
+
+/* ==========================================================================
+   5b.  THE SOUND OUTPUT DEVICE
+   --------------------------------------------------------------------------
+   Which speakers or headphones the game plays through is a choice about the
+   machine, not about a store, so it does not live in a save. It lives in
+   config.ini under sound_output_device: -1 follows whatever the system is set
+   to (what a player who never opens the menu gets), and 0 and up pick a device
+   by the number the Options menu shows.
+
+   The list of devices belongs to the engine (get_sound_output_devices), and its
+   indices are the very numbers its own sound_output_device property takes, so
+   the game keeps a copy of the list and hands the player those same numbers.
+   Nothing here is per save: the same machine plays through the same device
+   whatever store is loaded.
+
+   Switching device re-opens the engine's output. The room ambience, the music
+   and any chip line already playing are nodes inside that engine and come back
+   with it, so a player who changes device mid-shift does not lose the shop.
+   ========================================================================== */
+
+const string OUT_DEVICE_CONFIG_KEY = "sound_output_device";
+
+array<string> g_out_devices;    /* index aligned with the engine's own list */
+int g_out_device = -1;          /* -1 follows the system default */
+
+void audio_devices_refresh() {
+	const string[]@ devices = get_sound_output_devices();
+	g_out_devices.resize(0);
+	for (uint i = 0; i < devices.length(); i++) g_out_devices.insert_last(devices[i]);
+}
+
+int audio_device_count() { return int(g_out_devices.length()); }
+
+string audio_device_name(int index) {
+	if (index < 0 or uint(index) >= g_out_devices.length()) return "";
+	return g_out_devices[uint(index)];
+}
+
+/* How a device is named to the player, including the one choice that has no
+   name of its own. */
+string audio_device_label(int index) {
+	if (index < 0) return "the system default output device";
+	string n = audio_device_name(index);
+	if (n.length() == 0) return "output device " + (index + 1);
+	return n;
+}
+
+/* Which device is really playing, as the engine sees it. -1 means the engine
+   has no device at all, which is what a machine with no speakers reports. */
+int audio_device_effective() { return sound_output_device; }
+
+/* The name the machine would pick by itself, so the menu can say what the
+   default choice currently means. Empty when the engine has no device. */
+string audio_device_effective_label() {
+	string n = audio_device_name(audio_device_effective());
+	if (n.length() == 0) return "";
+	return n;
+}
+
+/* The device choice as a menu: the system default first, then every device the
+   engine can see, then the way back. main.nvgt draws exactly these lines under
+   Options, sound output. */
+int audio_device_menu_items() { return audio_device_count() + 2; }
+
+string audio_device_summary() {
+	if (g_out_device < 0) {
+		string eff = audio_device_effective_label();
+		return (eff.length() > 0) ? ("the system default, " + eff) : "the system default";
+	}
+	return audio_device_label(g_out_device);
+}
+
+string audio_device_menu_label(int index) {
+	int n = audio_device_count();
+	if (index == 0) {
+		string line = "Follow the system default output";
+		string eff = audio_device_effective_label();
+		if (eff.length() > 0) line += ", which is " + eff;
+		if (g_out_device < 0) line += ", selected";
+		return line;
+	}
+	if (index >= 1 and index <= n) {
+		string line = audio_device_label(index - 1);
+		if (index - 1 == g_out_device) line += ", selected";
+		return line;
+	}
+	return "Back";
+}
+
+/* Which device a line of that menu means: OUT_DEVICE_DEFAULT_PICK for the
+   default, 0 and up for a device, OUT_DEVICE_BACK for the way back. The menu in
+   main.nvgt asks this instead of counting indices itself, so the page and the
+   list cannot drift apart. */
+const int OUT_DEVICE_BACK = -2;
+const int OUT_DEVICE_DEFAULT_PICK = -1;
+
+int audio_device_menu_choice(int index) {
+	int n = audio_device_count();
+	if (index == 0) return OUT_DEVICE_DEFAULT_PICK;
+	if (index >= 1 and index <= n) return index - 1;
+	return OUT_DEVICE_BACK;
+}
+
+/* Move the sound onto a device. Returns false when the machine has no such
+   device, or when the engine could not open it and fell back to the default,
+   which is the caller's cue to say so rather than to claim success. */
+/* Asking the engine to move the output really does move it, on the machine the
+   player is sitting at: a run killed mid switch left this machine pointing at
+   the wrong box, which is a worse bug than any check could find. Nothing in the
+   game ever turns this off, so the switch the player picks is always the one
+   that happens. */
+bool g_audio_switch_allowed = true;
+
+bool audio_device_use(int index) {
+	if (index < -1 or index >= audio_device_count()) return false;
+	if (index >= 0 and audio_device_name(index).length() == 0) return false;
+	if (!g_audio_switch_allowed) { g_out_device = index; return true; }
+	sound_output_device = index;
+	g_out_device = index;
+	if (index < 0) return true;
+	return audio_device_effective() == index;
+}
+
+/* The config file's own text with one line's value set, and nothing else
+   touched. Pure, so a writer can be checked without touching the real file:
+   the key is replaced in place wherever it already is, and appended once,
+   under the caller's own note, when it is not there at all. The file's own
+   line endings survive the round trip, which matters because the shipped
+   config.ini is CRLF and rewriting it as LF would churn the whole file the
+   first time a player changed anything in it.
+
+   This is the one writer for every setting the game can rewrite in place: the
+   sound output device here, and a machine's speech speed and pitch, which
+   mechanics.nvgt writes into the save's own slot. A second copy of this loop
+   would be a second place for the blank lines and the line endings of a file
+   the player owns to be lost. */
+string config_text_with_value(const string&in existing, const string&in key,
+                              const string&in value, const string&in note) {
+	string nl = (existing.find_first("\r\n") >= 0) ? "\r\n" : "\n";
+	string result = "";
+	bool replaced = false;
+	/* Walk the text line by line rather than splitting it. split() drops empty
+	   lines, and this file is mostly empty lines: it is the separators between
+	   one documented block and the next, and they are the player's file. The
+	   loop below keeps every byte it is not asked to change, including the
+	   blank lines and whether the file ends with a newline at all. */
+	uint pos = 0;
+	while (pos <= existing.length()) {
+		int at = existing.find_first(nl, pos);
+		string line = (at < 0) ? existing.substr(pos) : existing.substr(pos, at - int(pos));
+		string probe = line.trim_whitespace();
+		int eq = probe.find_first("=");
+		if (eq > 0 and probe.substr(0, eq).trim_whitespace() == key) {
+			/* Only the value changes, so the comment above it stays as it was. */
+			line = key + "=" + value;
+			replaced = true;
+		}
+		result += line;
+		if (at < 0) break;
+		result += nl;
+		pos = uint(at) + nl.length();
+	}
+	if (!replaced) {
+		if (result.length() > 0 and result.substr(result.length() - 1, 1) != "\n") result += nl;
+		if (note.length() > 0) result += "# " + note + nl;
+		result += key + "=" + value + nl;
+	}
+	return result;
+}
+
+/* The same writer for the sound output device, which is the key this file
+   owns. */
+string audio_device_config_text(const string&in existing, int index) {
+	return config_text_with_value(existing, OUT_DEVICE_CONFIG_KEY, "" + index,
+		"Which sound device the game plays through. -1 follows the system default; 0 and up"
+		+ " pick a device by the number in Options, sound output. The game rewrites this line,"
+		+ " so it is here even in a config.ini that never had it.");
+}
+
+/* Rewrite one line of the player's own config.ini. False means the file could
+   not be written, which is not the same as the setting not having changed: the
+   caller has already applied it to this run. */
+bool config_value_save(const string&in key, const string&in value) {
+	string all = file_get_contents(CONFIG_FILE);
+	if (all.length() == 0) return false;
+	if (!file_put_contents(CONFIG_FILE, config_text_with_value(all, key, value, key + ", written by Options in the main menu."))) {
+		log_line("config", "config.ini could not be rewritten, so " + key + " is this run only");
+		return false;
+	}
+	return true;
+}
+
+/* Remember the choice for the next run by rewriting the one line. Failing to
+   write is not failing to switch: the sound has already moved. */
+void audio_device_save(int index) {
+	string all = file_get_contents(CONFIG_FILE);
+	if (all.length() == 0) return;
+	if (!file_put_contents(CONFIG_FILE, audio_device_config_text(all, index)))
+		log_line("audio", "config.ini could not be rewritten, so the device choice is this run only");
+}
+
+/* ==========================================================================
+   5c.  A DEVICE ON TRIAL
+   --------------------------------------------------------------------------
+   Picking a sound device is not like picking a radio station: the wrong one is
+   silent, and a player who is left on it has lost the sound of their game with
+   no way of knowing which box to blame. So a device is never written down when
+   it is picked. It goes on trial: the engine moves onto it, the menu plays a
+   blip out of one side and then the other so the player can hear where the
+   sound just went, and the choice is only kept — only written to config.ini —
+   when the player says they heard it. Anything else, and the game goes back to
+   the device it came in on and the file is left alone.
+   ========================================================================== */
+
+const int OUT_DEVICE_NONE = -999;
+
+int g_out_device_trial = OUT_DEVICE_NONE;   /* the device being tried, if any */
+int g_out_device_home  = -1;                /* where the trial began */
+
+/* Called when the device page opens: this is where a trial returns to. */
+void out_device_trial_begin() {
+	g_out_device_trial = OUT_DEVICE_NONE;
+	g_out_device_home = g_out_device;
+}
+
+bool out_device_on_trial() { return g_out_device_trial != OUT_DEVICE_NONE; }
+int out_device_trial_index() { return g_out_device_trial; }
+
+/* The player did not confirm it (or browsed away): put the sound back where it
+   was and write nothing. Returns the device the game is now on, or
+   OUT_DEVICE_NONE when nothing was on trial. */
+int out_device_trial_abandon() {
+	if (g_out_device_trial == OUT_DEVICE_NONE) return OUT_DEVICE_NONE;
+	g_out_device_trial = OUT_DEVICE_NONE;
+	audio_device_use(g_out_device_home);
+	log_line("audio", "output device not kept, back on " + audio_device_label(g_out_device_home));
+	return g_out_device_home;
+}
+
+/* Move the sound onto a device to hear it. The engine really switches, but the
+   choice is not written down and not kept until it is confirmed. */
+bool audio_device_try(int index) {
+	out_device_trial_abandon();     /* one device on trial at a time */
+	if (!audio_device_use(index)) {
+		audio_device_use(g_out_device_home);
+		return false;
+	}
+	g_out_device_trial = index;
+	log_line("audio", "trying output device " + index + ": " + audio_device_label(index));
+	return true;
+}
+
+/* The player heard it, so it stays. This is the only path that writes the
+   device line, and so the only way the game can come up on a device the player
+   has not heard working. */
+bool audio_device_confirm() {
+	if (!out_device_on_trial()) return false;
+	int index = g_out_device_trial;
+	g_out_device_trial = OUT_DEVICE_NONE;
+	audio_device_save(index);
+	log_line("audio", "output device kept: " + index + " " + audio_device_label(index));
+	return true;
+}
+
+/* The saved choice, applied once at startup. -1 needs no switch at all. */
+void audio_device_apply_configured() {
+	audio_devices_refresh();
+	g_out_device = cfg_int(OUT_DEVICE_CONFIG_KEY, -1);
+	if (g_out_device < 0) {
+		log_line("audio", "output device: the system default, " + audio_device_count() + " to choose from");
+		return;
+	}
+	bool ok = audio_device_use(g_out_device);
+	log_line("audio", "output device " + g_out_device + ": " + audio_device_label(g_out_device)
+		+ (ok ? "" : " (the machine would not open it)"));
+}
+
+/* Physical audio field setup. Called once, before any beacon is registered. */
+void audio_field_init() {
+	@g_pool = sound_pool(128);
+	g_pool.hrtf = true;
+	g_pool.occlude = true;
+	g_pool.max_distance = 0;      // room isolation is handled by hand, not by distance
+	g_pool.pan_step = 1.0;
+	g_pool.volume_step = 1.0;
+	g_pool.behind_pitch_decrease = 0.25;
+	g_default_gain = float(cfg_double("default_beacon_gain_db", -2.0));
+	g_muffle_gain  = float(cfg_double("muffle_gain_db", -22.0));
+	g_silent_gain  = -96.0;
+	g_room_gain.resize(MAX_ROOMS);
+	for (uint i = 0; i < uint(MAX_ROOMS); i++) g_room_gain[i] = g_silent_gain;
+}
+
+/* Register a looping or one-shot point source of sound in a room. */
+void audio_beacon_add(const string&in id, int room, float x, float y, float z,
+                      const string&in soundfile, bool loopable, float gain) {
+	if (@g_pool is null) return;
+	beacon@ b = beacon(id, room, x, y, z, soundfile, loopable, gain);
+	if (loopable) {
+		/* Start beneath the floor and let the first audio_update bring it up. */
+		b.slot = g_pool.play_extended_3d(soundfile, g_lis_x, g_lis_y, g_lis_z,
+			x, y, z, g_lis_rot,
+			0, 0, 0, 0, 0, 0,
+			true, 0.0, 0.0, g_silent_gain, 100.0,
+			true);
+		if (b.slot >= 0) {
+			g_pool.set_sound_owner(b.slot, id, 1);
+			b.silenced = true;
+		}
+	}
+	g_beacons.insert_last(b);
+}
+
+/* ---- the shop's speakers --------------------------------------------------
+   Music does not come out of the machine: it comes out of the ceiling speakers,
+   as a sound source in room space, and the same room isolation table that
+   muffles the coolers decides what reaches you. Stand on the shop floor and it
+   is at the shop's own volume; step through the office door and it is muffled
+   through the wall; two rooms away it is gone, exactly like every other beacon
+   in this table. Walking into another area therefore takes the music with it,
+   the way walking away from a shop's speakers does.
+
+   Two things a beacon cannot do, and both live here: the music DUCKS while an
+   announcement is playing over it, and the subwoofer gain fades in rather than
+   slamming on, so a track or a room change does not punch you in the chest. */
+int    g_music_room    = -1;      // the room the speakers are in, or -1 for none
+float  g_music_x = 0.0, g_music_y = 0.0, g_music_z = 3.0;
+int    g_music_slot    = -1;      // the pooled 3D source, or -1
+float  g_music_gain_db = -6.0;    // the shop's own volume setting, in dB
+float  g_music_sub_gain_db = -60.0; // the subwoofer setting, faded in below
+float  g_music_duck_db = 0.0;     // negative while an announcement talks over it
+bool   g_music_looped = true;     // a playlist track is one-shot, a chase loops
+uint   g_music_duck_until = 0;
+bool   g_music_paused  = false;
+uint   g_music_sub_at  = 0;       // when the subwoofer gain last changed
+float  g_music_sub_now = 0.0;     // the subwoofer gain, faded towards its target
+
+/* Where the speakers are. rooms.nvgt calls this while it builds the world, and
+   passes -1 when there are no speakers in this world at all. */
+void music_speakers(int room, float x, float y, float z) {
+	g_music_room = room;
+	g_music_x = x; g_music_y = y; g_music_z = z;
+}
+
+/* The subwoofers fade in over about a second and a half, so a track starting or
+   a room change is heard rather than felt. */
+void music_sub_fade_begin() { g_music_sub_at = ticks(); g_music_sub_now = 0.0; }
+
+void music_sub_fade_update() {
+	if (g_music_sub_now >= 1.0) return;
+	uint dt = ticks() - g_music_sub_at;
+	g_music_sub_now = (dt >= 1500) ? 1.0 : (float(dt) / 1500.0);
+}
+
+void music_stop() {
+	if (@g_pool !is null and g_music_slot >= 0) g_pool.destroy_sound(g_music_slot);
+	g_music_slot = -1;
+	g_music_paused = false;
+}
+
+/* Start a track through the speakers. A playlist track is one-shot, so the game
+   knows when to move on (see music_finished below); a chase or a fight loops
+   until the game says it is over. Returns false when the recording cannot be
+   played, which is the caller's cue to try the next one rather than to sit in
+   silence. */
+bool music_start(const string&in soundfile, bool looped = true) {
+	if (@g_pool is null or g_music_room < 0) return false;
+	music_stop();
+	g_music_looped = looped;
+	int slot = g_pool.play_extended_3d(soundfile, g_lis_x, g_lis_y, g_lis_z,
+		g_music_x, g_music_y, g_music_z, g_lis_rot,
+		0, 0, 0, 0, 0, 0,
+		looped, 0.0, 0.0, g_silent_gain, 100.0);
+	if (slot < 0) return false;
+	g_pool.set_sound_owner(slot, "shop-music", 1);
+	g_music_slot = slot;
+	g_music_paused = true;         // the first audio_update brings it up
+	music_sub_fade_begin();
+	return true;
+}
+
+/* True once a one-shot track has played itself out, which is the playlist's cue
+   to move on. A looping track is never finished; it is only out of earshot. */
+bool music_finished() {
+	if (g_music_slot < 0 or @g_pool is null or g_music_looped) return false;
+	return !g_pool.sound_is_active(g_music_slot);
+}
+
+bool music_playing() {
+	if (g_music_slot < 0) return false;
+	if (g_music_looped) return true;
+	return !music_finished();
+}
+
+/* The shop's volume, in decibels. 0 dB is the recording's own level. */
+void music_gain_db(float db) { g_music_gain_db = db; }
+
+/* The subwoofers, in decibels on top of the shop's volume. They fade in over
+   about a second and a half rather than arriving all at once. */
+void music_sub_gain_db(float db) { g_music_sub_gain_db = db; }
+
+/* An announcement talks over the music. Called with the length of the line. */
+void music_duck(uint ms) {
+	g_music_duck_db = -12.0;
+	g_music_duck_until = ticks() + ms;
+}
+
+/* Once per frame, after the listener has moved: bring the music's gain into line
+   with the room it is heard from, the shop's volume and the duck. */
+void music_update() {
+	if (g_music_duck_db < 0.0 and ticks() >= g_music_duck_until) g_music_duck_db = 0.0;
+	if (g_music_slot < 0 or @g_pool is null) return;
+	music_sub_fade_update();
+	float rg = audio_gain_for_room(g_music_room);
+	if (rg <= (g_silent_gain + 1.0)) {
+		/* Out of earshot of the speakers: pause rather than destroy, so walking
+		   back in resumes the same track where it was. */
+		if (!g_music_paused) { g_pool.pause_sound(g_music_slot); g_music_paused = true; }
+		return;
+	}
+	if (g_music_paused) { g_pool.resume_sound(g_music_slot); g_music_paused = false; }
+	/* Interpolate from silence, not from zero decibels: a subwoofer setting of
+	   -60 dB means no sub bass at all, and multiplying that by a fade would have
+	   made the quietest setting the loudest one. */
+	float sub = (g_music_sub_now >= 1.0) ? g_music_sub_gain_db
+		: (-60.0 + ((g_music_sub_gain_db + 60.0) * g_music_sub_now));
+	g_pool.update_sound_start_values(g_music_slot, 0.0,
+		rg + g_music_gain_db + sub + g_music_duck_db, 100.0);
+}
+
+/* Recalculate pan/attenuation for every beacon loop. Runs once per frame. */
+void audio_update(float lx, float ly, float lz, double rot, int room) {
+	g_lis_x = lx; g_lis_y = ly; g_lis_z = lz;
+	g_lis_rot = rot; g_lis_room = room;
+	sfx_cut_tick();      /* take any cut-short cue off the mixer */
+	if (@g_pool is null) return;
+
+	g_pool.update_listener_3d(lx, ly, lz, rot);
+
+	for (uint i = 0; i < g_beacons.length(); i++) {
+		beacon@ b = g_beacons[i];
+		if (b.slot < 0) continue;
+		float g = audio_gain_for_room(b.room);
+		bool should_silence = (g <= (g_silent_gain + 1.0));
+		if (should_silence) {
+			if (!b.silenced) {
+				g_pool.pause_sound(b.slot);
+				b.silenced = true;
+			}
+			continue;
+		}
+		if (b.silenced) {
+			g_pool.resume_sound(b.slot);
+			b.silenced = false;
+		}
+		/* set_pan/set_volume equivalent for a pooled 3D source: the start values
+		   are the base the spatial maths is applied on top of. */
+		g_pool.update_sound_start_values(b.slot, 0.0, g + b.gain, 100.0);
+	}
+	music_update();
+}
+
+/* ---- one-shots that are cut short ----------------------------------------
+   Several of the recordings in this game are far longer than the cue they are
+   used for: the door bell is a twenty two second bell, the menu tick is a
+   twenty nine second scanner sweep. Playing them whole is what makes the shop
+   sound intrusive, so a one-shot can ask to be stopped after a moment. Nothing
+   here is a fade: the file is simply taken off the mixer, which is what a door
+   bell does when the door has finished closing. */
+array<int> g_sfx_cut_slot;
+array<uint> g_sfx_cut_at;
+
+void sfx_cut_after(int slot, int ms) {
+	if (slot < 0 or ms <= 0) return;
+	g_sfx_cut_slot.insert_last(slot);
+	g_sfx_cut_at.insert_last(ticks() + uint(ms));
+}
+
+void sfx_cut_tick() {
+	for (int i = int(g_sfx_cut_slot.length()) - 1; i >= 0; i--) {
+		if (ticks() < g_sfx_cut_at[uint(i)]) continue;
+		if (@g_pool !is null) g_pool.destroy_sound(g_sfx_cut_slot[uint(i)]);
+		g_sfx_cut_slot.remove_at(uint(i));
+		g_sfx_cut_at.remove_at(uint(i));
+	}
+}
+
+/* Fire a one-shot sound positioned in a room. Muffled if it comes from an
+   adjacent room, dropped entirely if it comes from anywhere else.
+
+   The offset matters more than it looks. Several of the recordings the shop
+   now uses are whole sessions rather than single cues: Cough 1.ogg is twenty
+   seconds of somebody coughing with long gaps, and its first half second
+   measures -63 dB, which is silence. A caller that wants one cough says where
+   to start, and this plays that instead of the file's own beginning. */
+void sfx_at(int room, float x, float y, float z, const string&in soundfile, float gain = 0.0,
+            int stop_after_ms = 0, double offset = 0.0) {
+	if (@g_pool is null) return;
+	if (!g_power_on) return;
+	float rg = audio_gain_for_room(room);
+	if (rg <= (g_silent_gain + 1.0)) return;
+	uint n = uint(g_sfx_counter++);
+	string owner = "sfx" + n;
+	int slot = g_pool.play_extended_3d(soundfile, g_lis_x, g_lis_y, g_lis_z,
+		x, y, z, g_lis_rot,
+		0, 0, 0, 0, 0, 0,
+		false, offset, 0.0, gain + rg, 100.0);
+	if (slot >= 0) {
+		g_pool.set_sound_owner(slot, owner, 0);
+		sfx_cut_after(slot, stop_after_ms);
+	}
+}
+
+/* A non-positional interface sound: footsteps of the announcement, the register
+   bell, that sort of thing. Always at full volume regardless of rooms. */
+void sfx_ui(const string&in soundfile, float gain = 0.0, int stop_after_ms = 0) {
+	if (@g_pool is null) return;
+	if (!g_power_on) return;
+	uint n = uint(g_sfx_counter++);
+	string owner = "ui" + n;
+	int slot = g_pool.play_stationary_extended(soundfile, false, 0.0, 0.0, gain, 100.0);
+	if (slot >= 0) {
+		g_pool.set_sound_owner(slot, owner, 0);
+		sfx_cut_after(slot, stop_after_ms);
+	}
+}
+
+/* One menu line's worth of movement: the tick a cursor makes as it goes past a
+   line. scanner.ogg is a twenty nine second recording of a whole supermarket
+   checkout, and every menu in the game was playing it from the top on every
+   arrow key, on top of itself, over the line the player was trying to hear. One
+   place decides how much of it a tick is, so no menu can drown its own voice
+   again. */
+const int SFX_MENU_TICK_MS = 140;
+
+void sfx_tick(float gain = -24.0) {
+	sfx_ui(A("scanner.ogg"), gain, SFX_MENU_TICK_MS);
+}
+
+/* Stop and forget every ambient loop. rooms_init() calls this before it
+   registers a fresh world, so rebuilding the map never leaves two copies of the
+   same hum playing on top of each other. */
+void audio_beacons_clear() {
+	if (@g_pool !is null) g_pool.destroy_all();
+	g_beacons.resize(0);
+	/* destroy_all() takes the shop's music with it, so forget that slot too. */
+	g_music_slot = -1;
+	g_music_paused = false;
+}
+
+void audio_shutdown() {
+	if (@g_pool != null) {
+		g_pool.destroy_all();
+		@g_pool = null;
+	}
+	g_beacons.resize(0);
+}
+
+/* Convenience: the live asset path for a manifest filename. */
+string A(const string&in filename) { return ASSET_DIR + "/" + filename; }

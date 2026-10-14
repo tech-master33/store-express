@@ -1,0 +1,576 @@
+/* ============================================================================
+   Store Express  -  hardware.nvgt
+   ----------------------------------------------------------------------------
+   THE HARDWARE SPEECH DEVICES.
+
+   The player's own screen reader reads the world, the menus and the narration.
+   The machines in the building do not use it. Each one has a speech chip of its
+   own, made by chip.nvgt, and this file is what those chips are attached to:
+   which device is where, what each one has to do before it is any use, and what
+   happens the first time the player stands in front of it.
+
+   THE FIRST RUN OF A DEVICE IS NOT A MENU. When the player uses the back office
+   terminal in a save where it has never been set up, the terminal does not open
+   its usual pages. It runs its hardware setup, and the shop does not stop for
+   it:
+
+     * THE CLOCK KEEPS RUNNING. Nothing about this routine pauses the store.
+       Customers still walk in, the queue still forms, the day still ends, and
+       the environmental audio of the room the player is standing in keeps
+       playing through the ordinary sound pool, because the routine is a state
+       machine ticked from the frame loop rather than a loop of its own.
+     * THE SETUP CANNOT BE SKIPPED. Escape does nothing here. The chip is
+       installed when the routine finishes and not before. The one thing that
+       can interrupt it is the game itself, at the end of the day; the step
+       reached is remembered in memory, so the next visit to the terminal picks
+       up where it stopped.
+
+   The two devices are described in one table, because the phone is the same
+   kind of thing as the terminal: a box with a chip in it that has never been
+   configured. Only the terminal's routine exists in this build.
+
+   INCLUDE ORDER
+     audio <- core <- chip <- rooms <- ... <- trouble <- hardware <- mechanics
+   This file needs the chip (to speak), the rooms (to know how far away the
+   device is) and the clock state, and mechanics.nvgt needs it in turn, so it
+   sits directly above mechanics.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  THE DEVICES
+   ========================================================================== */
+
+const int HW_DEVICE_TERMINAL = 0;   /* the back office computer */
+const int HW_DEVICE_PHONE    = 1;   /* the handheld, routine to come later */
+
+class hardware_device {
+	string name;            /* how the game refers to it */
+	string chip;            /* the chip's own name, from chip.nvgt */
+	int    room;            /* where it lives; -1 means the player carries it */
+	int    device;          /* which chip profile it speaks through */
+	int    placeholder_pct; /* how much of its vocabulary is missing */
+	hardware_device(const string&in n, const string&in c, int r, int d, int p) {
+		name = n; chip = c; room = r; device = d; placeholder_pct = p;
+	}
+}
+
+array<hardware_device@> g_hardware;
+
+hardware_device@ hardware_get(int which) {
+	if (which < 0 or uint(which) >= g_hardware.length()) return null;
+	return g_hardware[uint(which)];
+}
+
+bool hardware_in_room(int which) {
+	hardware_device@ d = hardware_get(which);
+	if (@d is null) return false;
+	if (d.room < 0) return true;         /* carried, so always to hand */
+	return g_player_room == d.room;
+}
+
+/* How loud the device is from where the player is standing. A device in the
+   next room is muffled by the same table that muffles everything else. */
+float hardware_gain(int which) {
+	hardware_device@ d = hardware_get(which);
+	if (@d is null or d.room < 0) return 0.0;
+	return audio_gain_for_room(d.room);
+}
+
+/* ==========================================================================
+   2.  WHAT A SAVE REMEMBERS
+   --------------------------------------------------------------------------
+   The save slot profile holds one flag per device: has this machine been set up
+   in this store or not. A new store has never set one up, and a save written
+   before these machines existed reads back as false too, which means an old
+   save gets its hardware installed the same way a new one does.
+
+   is_computer_initialized is the flag the design names, and it is the one
+   save_game() writes and load_game_from() reads.
+   ========================================================================== */
+
+bool is_computer_initialized = false;   /* the back office terminal */
+bool is_phone_initialized    = false;   /* the handheld, for later */
+
+/* What save_game() writes. The reading side is mechanics.nvgt's, because the
+   slot file and the key reader belong to it; these two names are here so the
+   key that is written and the key that is read cannot drift apart. */
+const string HW_SAVE_KEY_COMPUTER = "computer_init";
+const string HW_SAVE_KEY_PHONE    = "phone_init";
+
+string hardware_save_lines() {
+	return HW_SAVE_KEY_COMPUTER + "=" + (is_computer_initialized ? 1 : 0) + "\r\n"
+		+ HW_SAVE_KEY_PHONE + "=" + (is_phone_initialized ? 1 : 0) + "\r\n";
+}
+
+/* A new store: no machine in it has ever been configured. */
+void hardware_reset_for_new_game() {
+	is_computer_initialized = false;
+	is_phone_initialized = false;
+}
+
+/* ==========================================================================
+   3.  THE BACK OFFICE ROUTINE
+   --------------------------------------------------------------------------
+   Four steps, driven by the frame pump and by nothing else:
+
+     1  calibration   the chip counts one to five, hard left then hard right,
+                      with a blip on each side, and waits for the player to say
+                      they heard both. This is the step that is only possible
+                      because the chip's samples are ours: a screen reader and a
+                      SAPI voice cannot be panned.
+     2  diagnostic    the chip reads its own status out in its own voice, which
+                      is what proves the chip is the thing doing the talking.
+     3  write         the flag becomes true and the save is written.
+     4  hand over     the terminal opens its ordinary pages.
+
+   Every wait is a pair of times compared in hardware_tick(), so the store keeps
+   trading throughout and the routine costs nothing but a comparison per frame.
+   ========================================================================== */
+
+const int HW_STEP_IDLE      = 0;
+const int HW_STEP_CALIBRATE = 1;
+const int HW_STEP_DIAGNOSTIC = 2;
+const int HW_STEP_WRITE     = 3;
+const int HW_STEP_HANDOVER  = 4;
+
+int  g_hw_step = HW_STEP_IDLE;
+int  g_hw_count = 0;              /* how far through the count the chip is */
+int  g_hw_last_pan = 0;           /* which side the last number came out of */
+uint g_hw_due = 0;                /* when the next count is owed */
+bool g_hw_prompted = false;       /* the calibration prompt has been given */
+uint g_hw_diag_until = 0;         /* when the diagnostic has finished */
+uint g_hw_handover_at = 0;
+string g_hw_mirror_line = "";     /* the chip's line, for the UI voice to repeat */
+uint g_hw_mirror_at = 0;
+string g_hw_last_chip_line = "";
+int  g_hw_confirmations = 0;
+
+/* The two hand-offs back to mechanics.nvgt, which owns the save file and the
+   terminal's pages: set here, acted on there, because this file is included
+   before mechanics and so cannot call into it. */
+bool g_hw_need_save = false;
+bool g_hw_need_open = false;
+
+/* The phone is a machine too, and it has never been set up in a new store
+   either, so it has its own routine of three steps rather than the terminal's
+   four. Its steps, its clock and its own hand-off live here beside the
+   terminal's; which of the two routines is in progress is g_hw_device, because
+   both of them take the same screen and read the same keys. */
+const int PH_STEP_IDLE     = 0;
+const int PH_STEP_TEST     = 1;
+const int PH_STEP_WRITE    = 2;
+const int PH_STEP_HANDOVER = 3;
+
+int  g_ph_step = PH_STEP_IDLE;
+bool g_ph_prompted = false;
+uint g_ph_test_until = 0;
+uint g_ph_handover_at = 0;
+int  g_hw_device = HW_DEVICE_TERMINAL;   /* which machine is installing itself */
+bool g_hw_need_open_phone = false;
+
+bool hardware_setup_active() {
+	if (g_ph_step != PH_STEP_IDLE) return true;
+	return g_hw_step == HW_STEP_CALIBRATE or g_hw_step == HW_STEP_DIAGNOSTIC
+		or g_hw_step == HW_STEP_WRITE or g_hw_step == HW_STEP_HANDOVER;
+}
+
+bool hardware_phone_setup_active() {
+	return g_ph_step == PH_STEP_TEST or g_ph_step == PH_STEP_WRITE or g_ph_step == PH_STEP_HANDOVER;
+}
+
+/* The moment between two counts, and the pauses in the diagnostic. Long enough
+   for the chip to say a word, short enough not to feel like a hang. */
+const int HW_COUNT_GAP_MS    = 1550;
+const int HW_DIAG_TAIL_MS    = 700;
+const int HW_HANDOVER_MS     = 1400;
+
+string hw_digit_word(int n) {
+	switch (n) {
+		case 1: return "ONE";
+		case 2: return "TWO";
+		case 3: return "THREE";
+		case 4: return "FOUR";
+		case 5: return "FIVE";
+	}
+	return "OH";
+}
+
+/* The chip says a line, out of the device the player is standing in front of.
+   mirror asks the game to read the same sentence out in the player's own voice
+   half a second after the chip has finished, which is how a player whose chip
+   voice they cannot parse still knows what was said. */
+void hardware_chip_line(const string&in text, int pan = 0, bool mirror = false) {
+	g_hw_last_chip_line = text;
+	chip_say(text, CHIP_DEVICE_COMPUTER, pan, hardware_gain(HW_DEVICE_TERMINAL));
+	if (mirror and g_chip_mirror != 0) {
+		g_hw_mirror_line = text;
+		g_hw_mirror_at = ticks() + uint(chip_line_ms(text, CHIP_DEVICE_COMPUTER)) + 500;
+	}
+}
+
+/* ==========================================================================
+   3b.  THE MACHINES' OWN VOICES
+   --------------------------------------------------------------------------
+   Once a machine is installed, its screens are the machine talking, not the
+   player's screen reader: every page it opens is announced by its chip, and the
+   result of anything the player does on it - an order placed, a price changed,
+   a readout asked for - is read out by the chip as well.
+
+   Every line one of them says goes through machine_chip_line() below: one entry
+   point per voice, the same way the people's lines all go through say_as() on a
+   slot of the voice pool in audio.nvgt. A device is named by its chip and its
+   distance, never by a call site, so adding a machine means adding a device to
+   the table above rather than hunting for places that speak.
+
+   Nothing here is mirrored into the player's voice. A machine that speaks
+   through the screen reader is not a machine with a chip in it, which is the
+   whole point of the exercise: the chip lines are pannable, they cannot fail,
+   and they sound like a thing rather than a person.
+   ========================================================================== */
+
+void machine_chip_line(int device, const string&in text, int pan = 0) {
+	if (text.length() == 0) return;
+	g_hw_last_chip_line = text;
+	/* hardware_gain() reads the device table: a machine in another room is muffled
+	   through the same wall table as everything else, and the phone, which the
+	   player carries, is always at full strength. */
+	chip_say(text, device, pan, hardware_gain(device));
+}
+
+/* The terminal, by name, for the callers that only ever mean the terminal. */
+void terminal_chip_line(const string&in text) { machine_chip_line(HW_DEVICE_TERMINAL, text); }
+
+/* Whatever the action the player just took wanted to say, said by the machine
+   that produced it. Capturing starts and stops in mechanics.nvgt, around the
+   action itself, so nothing outside that moment is taken from the player. */
+void machine_action_spoken(int device) {
+	string line = terminal_capture_take();
+	if (line.length() == 0) return;
+	machine_chip_line(device, line);
+}
+
+/* Kept for the callers that only ever mean the terminal. */
+void terminal_action_spoken() { machine_action_spoken(HW_DEVICE_TERMINAL); }
+
+/* ---- the device test -----------------------------------------------------
+   Picking a sound device in Options puts it on trial, and the test for it is two
+   blips, one hard to each side, because the chip is the only voice in the game
+   that can be panned. It runs from the frame like everything else, so the blips
+   land while the store clock keeps moving. */
+uint g_dev_test_at = 0;
+int  g_dev_test_side = -1;      /* -1 nothing owed, 0 left, 1 right */
+
+void device_test_sweep_begin() {
+	g_dev_test_side = 0;
+	g_dev_test_at = ticks() + 320;
+}
+
+void device_test_sweep_stop() { g_dev_test_side = -1; }
+
+bool device_test_sweeping() { return g_dev_test_side >= 0; }
+
+void device_test_sweep_tick() {
+	if (g_dev_test_side < 0 or ticks() < g_dev_test_at) return;
+	chip_beep(CHIP_DEVICE_COMPUTER, (g_dev_test_side == 0) ? -100 : 100, 150, -6.0);
+	if (g_dev_test_side == 0) {
+		g_dev_test_side = 1;
+		g_dev_test_at = ticks() + 460;
+	} else {
+		g_dev_test_side = -1;
+	}
+}
+
+void hardware_setup_begin() {
+	if (g_game_over) { say("The terminal is dead.", true); return; }
+	g_modal = MODAL_HARDWARE;
+	g_menu.resize(0);
+	g_hw_prompted = false;
+	g_hw_mirror_at = 0;
+	g_hw_mirror_line = "";
+	g_hw_count = 0;
+	chip_silence();
+	if (g_hw_step != HW_STEP_DIAGNOSTIC and g_hw_step != HW_STEP_WRITE and g_hw_step != HW_STEP_HANDOVER) {
+		g_hw_step = HW_STEP_CALIBRATE;
+	}
+	/* The count is a test, so it always runs from one, even when the routine is
+	   being picked up again after the shop closed under it. */
+	g_hw_due = ticks() + 400;
+	log_line("hardware", "the back office chip is being installed, step " + g_hw_step);
+	say("The terminal has never been set up in this store. Its speech chip starts its hardware routine. "
+		+ "The store clock keeps running while you work on it.", true);
+}
+
+/* The player says they heard both sides. */
+void hardware_confirm_calibration() {
+	g_hw_confirmations++;
+	g_hw_step = HW_STEP_DIAGNOSTIC;
+	string line = "BACK OFFICE TERMINAL. VOICE CHIP ONLINE. TEXT TO SPEECH SUBSYSTEM NOMINAL. DIAGNOSTIC COMPLETE.";
+	hardware_chip_line(line, 0, g_chip_mirror != 0);
+	g_hw_diag_until = ticks() + uint(chip_line_ms(line, CHIP_DEVICE_COMPUTER)) + uint(HW_DIAG_TAIL_MS);
+	log_line("hardware", "calibration confirmed, running the voice chip diagnostic");
+}
+
+/* The count is spoken on the left, then the right, then the left: odd numbers
+   hard left, even numbers hard right. One function, so the rule is in one place
+   and can be checked without waiting for five lines to be spoken. */
+int hw_pan_for_count(int n) {
+	if ((n % 2) == 1) return -100;
+	return 100;
+}
+
+/* Can the player confirm the calibration yet? Only once the whole sweep has
+   been spoken: the point of the step is to hear BOTH sides, so a player who
+   presses space halfway through has confirmed nothing. */
+bool hardware_can_confirm() {
+	return g_hw_step == HW_STEP_CALIBRATE and g_hw_count >= 5;
+}
+
+/* What the player can press while the routine has the screen. */
+void hardware_keys() {
+	if (g_hw_device == HW_DEVICE_PHONE) { hardware_phone_keys(); return; }
+	if (key_pressed(KEY_SPACE)) {
+		if (g_hw_step == HW_STEP_CALIBRATE) {
+			if (!hardware_can_confirm()) {
+				say("The test is still counting. Listen for the blip on the left, then on the right.", true);
+				return;
+			}
+			hardware_confirm_calibration();
+			return;
+		}
+		if (g_hw_step == HW_STEP_DIAGNOSTIC or g_hw_step == HW_STEP_WRITE) {
+			say("Nothing to confirm yet. The chip is still working.", true);
+			return;
+		}
+		return;
+	}
+	if (key_pressed(KEY_ESCAPE)) {
+		/* Not an escape hatch, by design: the machine is half installed and the
+		   routine has to finish. */
+		say("You cannot leave the terminal half installed. Finish the hardware setup first.", true);
+		return;
+	}
+	if (key_pressed(KEY_H)) {
+		hardware_instruction();
+		return;
+	}
+}
+
+/* The instruction for whatever step is in flight, in the player's own voice. */
+void hardware_instruction() {
+	if (g_hw_device == HW_DEVICE_PHONE) {
+		if (g_ph_step == PH_STEP_TEST) {
+			if (g_ph_prompted) say("Press space if you heard the phone speak.", true);
+			else say("The handset is running its own check. Listen for it.", true);
+			return;
+		}
+		if (g_ph_step == PH_STEP_WRITE or g_ph_step == PH_STEP_HANDOVER) { say("The handset is saving its configuration.", true); return; }
+		say("Nothing is being installed.", true);
+		return;
+	}
+	if (g_hw_step == HW_STEP_CALIBRATE) {
+		if (g_hw_count < 5) say("The chip is testing the channels. Listen for a blip and a number on the left, then on the right.", true);
+		else say("Press space if you heard every number on both sides.", true);
+		return;
+	}
+	if (g_hw_step == HW_STEP_DIAGNOSTIC) { say("The chip is reading out its own diagnostic. Listen for its voice.", true); return; }
+	if (g_hw_step == HW_STEP_WRITE or g_hw_step == HW_STEP_HANDOVER) { say("The chip is saving its configuration.", true); return; }
+	say("Nothing is being installed.", true);
+}
+
+/* One frame of the routine. Called from mechanics_update(), which runs whether
+   or not a screen is open, so the chip keeps rendering and the routine keeps
+   its own time while the rest of the shop carries on. */
+void hardware_tick() {
+	chip_tick();     /* the chips always render, whatever the game is doing */
+	device_test_sweep_tick();   /* the two blips that test a device on trial */
+
+	/* The repeat in the player's voice, timed to land after the chip stops. */
+	if (g_hw_mirror_at > 0 and ticks() >= g_hw_mirror_at) {
+		g_hw_mirror_at = 0;
+		if (g_hw_mirror_line.length() > 0) say(g_hw_mirror_line, true);
+	}
+
+	if (!hardware_setup_active()) return;
+	if (g_hw_device == HW_DEVICE_PHONE) { hardware_phone_tick(); return; }
+
+	if (g_hw_step == HW_STEP_CALIBRATE) {
+		if (g_hw_count < 5) {
+			if (ticks() >= g_hw_due) {
+				g_hw_count++;
+				int pan = hw_pan_for_count(g_hw_count);
+				g_hw_last_pan = pan;
+				string side = (pan < 0) ? "LEFT" : "RIGHT";
+				/* The blip first, then the word, both hard to one side: the blip
+				   is what the ear catches, the word is what confirms it. */
+				chip_beep(CHIP_DEVICE_COMPUTER, pan, 120, hardware_gain(HW_DEVICE_TERMINAL) - 3.0);
+				hardware_chip_line(side + " " + hw_digit_word(g_hw_count), pan);
+				g_hw_due = ticks() + uint(HW_COUNT_GAP_MS);
+			}
+			return;
+		}
+		if (!g_hw_prompted and ticks() >= g_hw_due) {
+			g_hw_prompted = true;
+			say("The chip has counted to five, left and right. Press space if you heard every number on both sides.", true);
+			hardware_chip_line("PRESS SPACE IF YOU HEARD BOTH SIDES", 0);
+		}
+		return;
+	}
+
+	if (g_hw_step == HW_STEP_DIAGNOSTIC) {
+		if (ticks() >= g_hw_diag_until) g_hw_step = HW_STEP_WRITE;
+		return;
+	}
+
+	if (g_hw_step == HW_STEP_WRITE) {
+		/* The flag is the save's, so it is written the moment it is true. The
+		   save itself is mechanics.nvgt's job: it owns the slot file, and this
+		   file is not allowed to know how a save is written. */
+		is_computer_initialized = true;
+		g_hw_need_save = true;
+		hardware_chip_line("CONFIGURATION SAVED. SPEECH CHIP READY.", 0, g_chip_mirror != 0);
+		g_hw_step = HW_STEP_HANDOVER;
+		g_hw_handover_at = ticks() + uint(chip_line_ms("CONFIGURATION SAVED. SPEECH CHIP READY.", CHIP_DEVICE_COMPUTER))
+			+ uint(HW_HANDOVER_MS);
+		log_line("hardware", "the back office chip is installed");
+		return;
+	}
+
+	if (g_hw_step == HW_STEP_HANDOVER) {
+		if (ticks() >= g_hw_handover_at) {
+			g_hw_step = HW_STEP_IDLE;
+			g_hw_need_open = true;   /* mechanics opens the terminal properly */
+		}
+		return;
+	}
+}
+
+/* ==========================================================================
+   4b.  THE PHONE ROUTINE
+   --------------------------------------------------------------------------
+   Three steps, driven by the same frame as the terminal's:
+
+     1  check      the handset runs its own test out in its own voice, which is
+                   the compressed, glitchy little chip it was built with, and
+                   waits for the player to say they heard it. Nothing is claimed
+                   about stereo here: a phone has one speaker.
+     2  write      is_phone_initialized becomes true and the save is written.
+     3  hand over  the phone opens its ordinary pages.
+
+   The store does not stop for it either. A phone is carried rather than stood
+   in front of, so its own lines come out at full strength whatever room the
+   player is in: hardware_gain() reads that from the device table, where the
+   phone's room is -1.
+   ========================================================================== */
+
+const string PHONE_TEST_LINE = "HANDSET. NO PAIRING FOUND IN THIS STORE. AUDIO COMPRESSED.";
+const string PHONE_READY_LINE = "PAIRED. SIGNAL WEAK. READY.";
+
+void hardware_phone_setup_begin() {
+	if (g_game_over) { say("The phone is dead.", true); return; }
+	g_modal = MODAL_HARDWARE;
+	g_menu.resize(0);
+	g_hw_device = HW_DEVICE_PHONE;
+	g_ph_prompted = false;
+	chip_silence();
+	if (g_ph_step != PH_STEP_WRITE and g_ph_step != PH_STEP_HANDOVER) g_ph_step = PH_STEP_TEST;
+	if (g_ph_step == PH_STEP_TEST) {
+		machine_chip_line(HW_DEVICE_PHONE, PHONE_TEST_LINE);
+		g_ph_test_until = ticks() + uint(chip_line_ms(PHONE_TEST_LINE, CHIP_DEVICE_PHONE)) + 600;
+	}
+	log_line("hardware", "the phone chip is being installed, step " + g_ph_step);
+	say("This phone has never been set up. It runs its own check first; listen to it and then press space. "
+		+ "The store clock keeps running while you do.", true);
+}
+
+/* The player says they heard the handset. */
+void hardware_phone_confirm() {
+	g_ph_step = PH_STEP_WRITE;
+	log_line("hardware", "the handset check was heard");
+}
+
+bool hardware_phone_can_confirm() {
+	return g_ph_step == PH_STEP_TEST and ticks() >= g_ph_test_until;
+}
+
+void hardware_phone_keys() {
+	if (key_pressed(KEY_SPACE)) {
+		if (g_ph_step == PH_STEP_TEST) {
+			if (!hardware_phone_can_confirm()) {
+				say("The phone is still checking itself. Listen for its voice first.", true);
+				return;
+			}
+			hardware_phone_confirm();
+			return;
+		}
+		say("Nothing to confirm yet. The phone is still working.", true);
+		return;
+	}
+	if (key_pressed(KEY_ESCAPE)) {
+		say("You cannot leave the phone half set up. Finish its check first.", true);
+		return;
+	}
+	if (key_pressed(KEY_H)) { hardware_instruction(); return; }
+}
+
+void hardware_phone_tick() {
+	if (g_ph_step == PH_STEP_TEST) {
+		if (!g_ph_prompted and ticks() >= g_ph_test_until) {
+			g_ph_prompted = true;
+			say("Press space if you heard the phone speak.", true);
+			machine_chip_line(HW_DEVICE_PHONE, "PRESS SPACE IF YOU HEARD THAT");
+		}
+		return;
+	}
+	if (g_ph_step == PH_STEP_WRITE) {
+		/* The flag is the save's, and the save is mechanics.nvgt's job. */
+		is_phone_initialized = true;
+		g_hw_need_save = true;
+		machine_chip_line(HW_DEVICE_PHONE, PHONE_READY_LINE);
+		g_ph_step = PH_STEP_HANDOVER;
+		g_ph_handover_at = ticks() + uint(chip_line_ms(PHONE_READY_LINE, CHIP_DEVICE_PHONE)) + uint(HW_HANDOVER_MS);
+		log_line("hardware", "the phone chip is installed");
+		return;
+	}
+	if (g_ph_step == PH_STEP_HANDOVER) {
+		if (ticks() >= g_ph_handover_at) {
+			g_ph_step = PH_STEP_IDLE;
+			g_hw_need_open_phone = true;   /* mechanics opens the phone properly */
+		}
+		return;
+	}
+}
+
+/* Reset for the next run of the game. The flags are the save's, not ours, so
+   they are left alone: hardware_reset_for_new_game() is what clears them. */
+void hardware_init() {
+	g_hardware.resize(0);
+	g_hardware.insert_last(hardware_device("the back office terminal", "the back office chip",
+		ROOM_OFFICE, CHIP_DEVICE_COMPUTER, 0));
+	g_hardware.insert_last(hardware_device("the phone", "the phone chip", -1, CHIP_DEVICE_PHONE, 0));
+	g_hw_step = HW_STEP_IDLE;
+	g_hw_count = 0;
+	g_hw_prompted = false;
+	g_hw_diag_until = 0;
+	g_hw_handover_at = 0;
+	g_hw_mirror_at = 0;
+	g_hw_mirror_line = "";
+	g_hw_need_save = false;
+	g_hw_need_open = false;
+	g_hw_need_open_phone = false;
+	g_hw_device = HW_DEVICE_TERMINAL;
+	g_ph_step = PH_STEP_IDLE;
+	g_ph_prompted = false;
+	g_ph_test_until = 0;
+	g_ph_handover_at = 0;
+	g_dev_test_side = -1;
+	chip_init();
+	log_line("hardware", g_hardware.length() + " speech devices registered, terminal "
+		+ (is_computer_initialized ? "installed" : "not yet installed"));
+}
+
+/* For the terminal's own page title and for the tests. */
+string hardware_status_text() {
+	string s = "The back office terminal is " + (is_computer_initialized ? "installed" : "not installed") + ". ";
+	s += "The phone is " + (is_phone_initialized ? "configured" : "not configured") + ". ";
+	return s;
+}

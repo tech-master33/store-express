@@ -1,0 +1,214 @@
+/* ============================================================================
+   Store Express  -  core.nvgt
+   ----------------------------------------------------------------------------
+   The bottom of the dependency stack. Everything here is a leaf: it calls into
+   nothing but audio.nvgt (which is included above it and provides pad() and
+   num1()). Every other module may use what is in this file.
+
+   It holds two things:
+
+     1. Small text helpers that the whole game needs, above all money(). Every
+        amount in Store Express is an integer number of cents, so no floating
+        point value ever touches a dollar figure.
+
+     2. The game clock state. The clock lives here rather than in mechanics.nvgt
+        because nearly every system asks it the time: the Monday truck, Friday
+        bill day, opening and closing hours, how long a spill has been drying.
+        The clock does not tick itself, though; mechanics.nvgt owns clock_tick(),
+        because rolling a day over has to fire events in five other modules and
+        only mechanics.nvgt is allowed to know about all of them.
+
+   INCLUDE ORDER
+     audio.nvgt <- core.nvgt <- rooms.nvgt <- money.nvgt <- shop.nvgt
+                <- staff.nvgt <- people.nvgt <- trouble.nvgt
+                <- mechanics.nvgt <- main.nvgt
+   One way only. Nothing in this file calls upward.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS
+   ========================================================================= */
+
+/* The working week. Day 0 is Monday, which is the day the truck comes. */
+const int MONDAY    = 0;
+const int TUESDAY   = 1;
+const int WEDNESDAY = 2;
+const int THURSDAY  = 3;
+const int FRIDAY    = 4;      // bill day
+const int SATURDAY  = 5;      // last day to open a position for Monday applicants
+const int SUNDAY    = 6;      // order today and it waits a whole extra week
+
+/* Opening hours, as minutes past midnight. */
+const int OPEN_MINUTE  = 7 * 60;    // 7:00 am
+const int CLOSE_MINUTE = 22 * 60;   // 10:00 pm
+const int WAKE_MINUTE  = 6 * 60;    // you always wake at 6:00 am
+
+/* The clock the design calls for: one full shop day, 7 am to 10 pm, per real
+   hour. That is 900 game minutes over 3600 real seconds, so a quarter of a game
+   minute passes per real second. config.ini can override it. */
+const double MINUTES_PER_REAL_SECOND = 0.25;
+
+const int ROLLING_WINDOW_DAYS = 28;   // reputation is worked out over four weeks
+
+/* ==========================================================================
+   2.  TEXT HELPERS
+   ========================================================================= */
+
+/* < 1 -> "nothing", 1 -> "one thing", 5 -> "5 things". */
+string plural(int n, const string&in one, const string&in many) {
+	if (n == 0) return "no " + many;
+	if (n == 1) return "one " + one;
+	return "" + n + " " + many;
+}
+
+string yes_no(bool b) { return b ? "yes" : "no"; }
+
+/* A signed percentage for the market and for satisfaction changes. */
+string signed_pct(int pct) {
+	if (pct > 0) return "+" + pct + " percent";
+	if (pct < 0) return "" + pct + " percent";
+	return "no change";
+}
+
+/* 1430 -> "$14.30". Negative amounts keep their minus sign outside the dollar. */
+string money(int cents) {
+	bool neg = cents < 0;
+	int c = neg ? -cents : cents;
+	string s = "$" + (c / 100) + "." + pad(c % 100, 2);
+	return neg ? ("-" + s) : s;
+}
+
+/* Money with the cents dropped, for spoken summaries where "$14" reads better. */
+string money_round(int cents) {
+	bool neg = cents < 0;
+	int c = neg ? -cents : cents;
+	int whole = (c + 50) / 100;
+	return (neg ? "-$" : "$") + whole;
+}
+
+string day_name(int d) {
+	switch (d) {
+		case MONDAY:    return "Monday";
+		case TUESDAY:   return "Tuesday";
+		case WEDNESDAY: return "Wednesday";
+		case THURSDAY:  return "Thursday";
+		case FRIDAY:    return "Friday";
+		case SATURDAY:  return "Saturday";
+		case SUNDAY:    return "Sunday";
+	}
+	return "an unknown day";
+}
+
+string day_short(int d) {
+	return day_name(d).substr(0, 3);
+}
+
+/* "two hours and ten minutes" from a count of minutes. Used for jail terms,
+   delivery waits, spill drying and the closing countdown. */
+string duration_text(int mins) {
+	if (mins <= 0) return "no time at all";
+	int days = mins / (24 * 60);
+	mins = mins % (24 * 60);
+	int hours = mins / 60;
+	int m = mins % 60;
+	string parts = "";
+	if (days > 0)   parts += plural(days, "day", "days");
+	if (hours > 0) {
+		if (parts.length() > 0) parts += (m > 0) ? ", " : " and ";
+		parts += plural(hours, "hour", "hours");
+	}
+	if (m > 0) {
+		if (parts.length() > 0) parts += " and ";
+		parts += plural(m, "minute", "minutes");
+	}
+	if (parts.length() == 0) return "less than a minute";
+	return parts;
+}
+
+/* A rough time of day, for atmosphere. */
+string time_of_day_word() {
+	if (g_current_hour < 5)  return "the middle of the night";
+	if (g_current_hour < 9)  return "the early morning";
+	if (g_current_hour < 12) return "the morning";
+	if (g_current_hour < 14) return "the middle of the day";
+	if (g_current_hour < 17) return "the afternoon";
+	if (g_current_hour < 20) return "the evening";
+	if (g_current_hour < 23) return "the late evening";
+	return "the small hours";
+}
+
+/* ==========================================================================
+   3.  THE CLOCK
+   --------------------------------------------------------------------------
+   An internal game clock that is NOT tied to real-world time. It stops
+   completely while the pause menu, the phone or the issue reporter is open, and
+   only runs while the player is on a live room grid.
+
+   The office computer is deliberately not on that list: the store keeps trading
+   while the player reads a report or watches a machine install itself, which is
+   what clock_is_paused() in mechanics.nvgt spells out.
+   ========================================================================= */
+
+uint   g_current_minute      = 0;      // 0 to 59
+uint   g_current_hour        = 7;      // the shop opens at seven in the morning
+uint   g_current_day_of_week = MONDAY;
+uint   g_current_week        = 1;      // drives the audit cycle and the calendar
+uint   g_current_day         = 1;      // absolute day count since the shop opened
+double g_minutes_per_second  = MINUTES_PER_REAL_SECOND;
+double g_clock_accum         = 0.0;
+bool   g_clock_fast_forward  = false;  // the jail fast-forward toggle
+
+/* Open around the clock needs at least one member of staff, because you cannot
+   stay awake forever. money.nvgt and staff.nvgt enforce that. */
+bool g_hours_24h = false;
+
+int clock_minute_of_day() { return int(g_current_hour) * 60 + int(g_current_minute); }
+
+string clock_time_text() {
+	uint h = g_current_hour % 12;
+	if (h == 0) h = 12;
+	string ampm = (g_current_hour < 12) ? "am" : "pm";
+	return "" + h + ":" + pad(int(g_current_minute), 2) + " " + ampm;
+}
+
+string clock_full_text() {
+	return clock_time_text() + " on " + day_name(int(g_current_day_of_week))
+		+ ", week " + g_current_week;
+}
+
+/* The shop is open to customers between these two minutes. */
+bool clock_shop_open() {
+	if (g_hours_24h) return true;
+	int m = clock_minute_of_day();
+	return m >= OPEN_MINUTE and m < CLOSE_MINUTE;
+}
+
+/* Minutes until the shop closes, or -1 when it is already shut. */
+int clock_minutes_to_close() {
+	if (g_hours_24h) return -1;
+	int m = clock_minute_of_day();
+	if (m >= CLOSE_MINUTE) return -1;
+	return CLOSE_MINUTE - m;
+}
+
+/* ==========================================================================
+   4.  INTERACTION STATE
+   --------------------------------------------------------------------------
+   Which screen, if any, is in front of the player. These live down here rather
+   than in mechanics.nvgt, where they used to, because the hardware layer has to
+   be able to take the screen for itself: a machine that has never been set up
+   runs its own routine instead of its ordinary pages, and hardware.nvgt is
+   included above mechanics.nvgt and so cannot borrow its names. One state, one
+   set of names, in the file everybody can see.
+   ========================================================================== */
+
+const int MODAL_NONE     = 0;
+const int MODAL_PAUSE    = 1;
+const int MODAL_REGISTER = 2;
+const int MODAL_COMPUTER = 3;
+const int MODAL_PHONE    = 4;
+const int MODAL_ISSUES   = 5;
+const int MODAL_SLEEP    = 6;
+const int MODAL_HARDWARE = 8;   /* a device installing itself, screen taken */
+
+int g_modal = MODAL_NONE;

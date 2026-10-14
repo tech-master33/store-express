@@ -1,0 +1,1674 @@
+/* ============================================================================
+   Store Express  -  people.nvgt
+   ----------------------------------------------------------------------------
+   Everybody who is not you or your staff: the customers.
+
+     * Arrivals. How many people come through the door is driven by your
+       reputation and by the time of day, so a well run shop gets busier, which
+       means a longer queue, which is where staff come in.
+     * Walking. Every customer is a real body on the tile grid. They come in
+       through the front door, walk to a shelf, pick a basket, walk to the till,
+       queue, get served and leave. You can hear all of it, in the right place.
+     * Baskets. What they take is drawn from the face they are standing at, and
+       price matters: up to about fifteen percent over the fair price nobody
+       notices, further over and people buy fewer, and eventually stop.
+     * Patience. People in a queue run out of it, and leave, and say so.
+     * Reviews and reputation. After a visit some customers write one. Your
+       reputation is worked out daily from the last four weeks, and it decides
+       how many people come through the door tomorrow.
+
+   INCLUDE ORDER
+     Included after staff.nvgt. It never calls into trouble, mechanics or main.
+     It does ask staff.nvgt who is on duty. trouble.nvgt and mechanics.nvgt ask
+     this file who is in the shop, and pick the queue head for the till.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS AND ARCHETYPES
+   ========================================================================= */
+
+const int CUST_ARRIVING = 0;    // heading for a shelf
+const int CUST_SHOPPING = 1;    // standing at a face, filling a basket
+const int CUST_TO_TILL  = 2;    // walking to the queue
+const int CUST_QUEUEING = 3;
+const int CUST_SERVING  = 4;    // at the counter, being served
+const int CUST_LEAVING  = 5;
+const int CUST_GONE     = 6;
+
+const int ARCH_REGULAR   = 0;
+const int ARCH_TRUCKER   = 1;
+const int ARCH_TEENAGER  = 2;
+const int ARCH_POLICE    = 3;
+const int ARCH_FARMER    = 4;
+const int ARCH_NIGHTSHIFT= 5;
+const int ARCH_BIGSPENDER= 6;
+const int ARCH_KAREN     = 7;
+const int ARCH_DRUNK     = 8;
+const int ARCH_INSPECTOR = 9;
+const int ARCH_COUNT     = 10;
+
+string people_arch_name(int a) {
+	switch (a) {
+		case ARCH_REGULAR:    return "a regular";
+		case ARCH_TRUCKER:    return "a trucker";
+		case ARCH_TEENAGER:   return "a teenager";
+		case ARCH_POLICE:     return "a police officer";
+		case ARCH_FARMER:     return "a farmer";
+		case ARCH_NIGHTSHIFT: return "a night shift worker";
+		case ARCH_BIGSPENDER: return "a big spender";
+		case ARCH_KAREN:      return "a complainer";
+		case ARCH_DRUNK:      return "somebody well on their way";
+		case ARCH_INSPECTOR:  return "an inspector";
+	}
+	return "a customer";
+}
+
+/* How they talk. Regulars remember how you treated them, truckers sound
+   road weary, teenagers sound young, officials sound official. */
+string people_arch_voice(int a) {
+	switch (a) {
+		case ARCH_TRUCKER:    return "road weary, and in no hurry";
+		case ARCH_TEENAGER:   return "young, fast, and easily bored";
+		case ARCH_POLICE:     return "level and official";
+		case ARCH_FARMER:     return "homespun and unhurried";
+		case ARCH_NIGHTSHIFT: return "quiet, the way the night shift is";
+		case ARCH_BIGSPENDER: return "grand, and used to being served";
+		case ARCH_KAREN:      return "louder than everybody else, on purpose";
+		case ARCH_DRUNK:      return "slurred, and wobbling";
+	}
+	return "ordinary";
+}
+
+/* Who shoplifts. Teenagers are the worst for it, adults less so, and nobody's
+   gran ever. */
+int people_shoplift_chance(int a) {
+	switch (a) {
+		case ARCH_TEENAGER: return 22;
+		case ARCH_DRUNK:    return 14;
+		case ARCH_REGULAR:  return 7;
+		case ARCH_TRUCKER:  return 5;
+		case ARCH_KAREN:    return 6;
+		case ARCH_BIGSPENDER: return 1;
+		case ARCH_POLICE:   return 0;
+		case ARCH_INSPECTOR:return 0;
+	}
+	return 5;
+}
+
+int people_basket_lines(int a) {
+	switch (a) {
+		case ARCH_BIGSPENDER: return random(6, 14);
+		case ARCH_REGULAR:    return random(2, 5);
+		case ARCH_TRUCKER:    return random(3, 7);
+		case ARCH_TEENAGER:   return random(1, 3);
+		case ARCH_FARMER:     return random(3, 8);
+		case ARCH_NIGHTSHIFT: return random(2, 4);
+		case ARCH_KAREN:      return random(2, 6);
+		case ARCH_DRUNK:      return random(1, 3);
+	}
+	return random(2, 5);
+}
+
+/* How much of a hurry people are in. Lower patience means a shorter queue is
+   enough to send them out. */
+int people_patience_base(int a) {
+	switch (a) {
+		case ARCH_BIGSPENDER: return 180;
+		case ARCH_TRUCKER:    return 150;
+		case ARCH_TEENAGER:   return 60;
+		case ARCH_KAREN:      return 90;
+		case ARCH_DRUNK:      return 200;
+		case ARCH_FARMER:     return 160;
+	}
+	return 120;
+}
+
+/* ==========================================================================
+   2.  THE PEOPLE IN THE SHOP
+   ========================================================================= */
+
+class customer {
+	string name;
+	int    arch;
+	int    state;
+	int    room;
+	float  x, y;
+	int    face_target;        // the shelf face they are heading for
+	/* the basket */
+	array<int> basket;         // catalogue indices
+	array<int> basket_qty;
+	bool   wants_drink;        // a coffee or a fountain drink as well
+	int    drink_kind;         // 0 coffee, 1 fountain, -1 none
+	/* the visit */
+	int    patience;           // in ticks, not minutes
+	int    waited;
+	bool   served;
+	bool   bought;             // whether they paid at all
+	int    spent;
+	bool   id_checked;
+	bool   id_refused;
+	bool   came_back_for_change;
+	/* The wallet. Everybody walks in with one, and some wallets are thinner than
+	   the basket: see people_wallet_for. */
+	int    wallet;
+	bool   wallet_known;       // their wallet has been counted (see sale_open)
+	bool   could_not_pay;      // the money in their hand did not cover it
+	int    short_paid;         // cents the shop let them off, if it did
+	/* What a regular remembers about last time, and says so at the counter. */
+	int    memory;             // -3 to +3
+	bool   waved_receipt;
+	/* opinions, collected as they go, used to write the review */
+	int    mood;               // starts at 0, up for good things, down for bad
+	int    price_complaints;
+	int    bare_shelf_hits;
+	bool   stepped_in_mess;
+	/* shoplifting */
+	bool   shoplifter;
+	bool   rustled;
+	bool   swatted;
+	int    swats;
+	bool   ran;
+	uint   next_step_at;
+	int    voice;        // their slot in the voice pool, so they sound like somebody
+	/* --- the body layer -------------------------------------------------
+	   A customer is a body before they are a basket. These are the things a
+	   body does while it shops, and none of them change what the shop sells. */
+	uint   next_emote_at;      // the next cough, sigh, jingle or laugh
+	uint   next_bump_at;       // nobody walks into the same person twice in a row
+	uint   next_phone_at;      // when the phone in their pocket goes off again
+	int    phone_lines_left;   // how much of their side of the call is left
+	bool   on_phone;           // mid-call, and not for much longer
+	int    drink_count;        // how many they have had while they were in here
+	uint   next_stumble_at;    // the next time their legs let them down
+	int    events_seen;        // review events recorded, so the last three are known
+	/* --- what the visit has done to them ----------------------------------
+	   The review is written from this, in the order the things happened. Each
+	   entry is an EV_ code rather than a sentence, because the sentence depends
+	   on who is writing it: see people_event_line(). */
+	array<int> events;
+	/* --- the big spenders and the complainers -----------------------------
+	   A big spender may arrive with a crew, and a crew pays for nobody. A
+	   complainer escalates until somebody deals with her. */
+	string entourage_host;     // the big spender they came in with, if anybody
+	bool   pays_for_queue;     // this one is paying for the people in front of them
+	bool   cleared_shelf;      // they have already taken most of a shelf face
+	int    karen_level;        // 0 quiet, 3 demanding to speak to somebody
+	customer(const string&in n, int a) {
+		name = n; arch = a; state = CUST_ARRIVING; room = ROOM_SHOP;
+		face_target = -1; wants_drink = false; drink_kind = -1;
+		patience = people_patience_base(a);
+		waited = 0; served = false; bought = false; spent = 0;
+		id_checked = false; id_refused = false; came_back_for_change = false;
+		wallet = 0; wallet_known = false; could_not_pay = false; short_paid = 0;
+		memory = 0; waved_receipt = false;
+		mood = 0; price_complaints = 0; bare_shelf_hits = 0; stepped_in_mess = false;
+		shoplifter = false; rustled = false; swatted = false; swats = 0; ran = false;
+		next_step_at = 0;
+		voice = -1;     // replaced by voice_pool_assign() as they come in the door
+		next_emote_at = 0;
+		next_bump_at = 0;
+		next_stumble_at = 0;
+		next_phone_at = 0;
+		phone_lines_left = 0;
+		on_phone = false;
+		drink_count = 0;
+		events_seen = 0;
+		entourage_host = "";
+		pays_for_queue = false;
+		cleared_shelf = false;
+		karen_level = 0;
+	}
+}
+
+array<customer@> g_customers;
+/* The queue holds handles rather than indices, because customers are removed
+   from g_customers as they leave and every index after them would shift. */
+array<customer@> g_queue;
+
+/* ==========================================================================
+   2b.  WALLETS, RECEIPTS AND WHAT A REGULAR REMEMBERS
+   ========================================================================= */
+
+/* Everybody walks in with a wallet, and some wallets are thinner than the
+   basket. Teenagers and drunks are the worst for it, truckers and big spenders
+   the least, and a regular who knows what things cost usually brings enough. */
+int people_wallet_for(customer@ c) {
+	int total = people_basket_total(c);
+	if (total <= 0) return random(200, 2000);
+	int thin_chance = 20;
+	switch (c.arch) {
+		case ARCH_TEENAGER:   thin_chance = 45; break;
+		case ARCH_DRUNK:      thin_chance = 35; break;
+		case ARCH_NIGHTSHIFT: thin_chance = 30; break;
+		case ARCH_TRUCKER:    thin_chance = 10; break;
+		case ARCH_BIGSPENDER: thin_chance = 5;  break;
+		case ARCH_FARMER:     thin_chance = 15; break;
+	}
+	if (random(1, 100) <= thin_chance) return (total * random(45, 95)) / 100;
+	/* Enough, and then some: a note in the wallet rather than exact change. */
+	return total + random(1, 40) * 100;
+}
+
+/* What they remember about their last visit here, if they are a regular at all.
+   A shop this small has the same faces in it every week, and they hold a
+   grudge exactly as long as they hold a good word. */
+class regular_memory {
+	string name;
+	int    score;      // -3 through +3
+	int    day;
+	regular_memory(const string&in n, int s, int d) { name = n; score = s; day = d; }
+}
+
+array<regular_memory@> g_regulars;
+
+int people_regular_lookup(const string&in name) {
+	for (uint i = 0; i < g_regulars.length(); i++) {
+		if (g_regulars[i].name == name) return g_regulars[i].score;
+	}
+	return 0;
+}
+
+void people_regular_forget(int day) {
+	for (int i = int(g_regulars.length()) - 1; i >= 0; i--) {
+		if (day - g_regulars[i].day > 28) g_regulars.remove_at(uint(i));
+	}
+	while (g_regulars.length() > 40) g_regulars.remove_at(0);
+}
+
+/* How the visit went, as a single number a customer carries to their next one. */
+int people_visit_score(customer@ c) {
+	if (@c is null) return 0;
+	if (!c.served and c.basket.length() > 0) return -3;
+	if (c.could_not_pay) return -2;
+	if (c.mood >= 6) return 3;
+	if (c.mood >= 3) return 2;
+	if (c.mood >= 1) return 1;
+	if (c.mood <= -6) return -3;
+	if (c.mood <= -3) return -2;
+	if (c.mood <= -1) return -1;
+	return 0;
+}
+
+/* Written down when they leave, and read out at the till when they come back. */
+void people_regular_remember(customer@ c) {
+	if (@c is null) return;
+	int score = people_visit_score(c);
+	for (uint i = 0; i < g_regulars.length(); i++) {
+		if (g_regulars[i].name == c.name) {
+			g_regulars[i].score = score;
+			g_regulars[i].day = int(g_current_day);
+			return;
+		}
+	}
+	g_regulars.insert_last(regular_memory(c.name, score, int(g_current_day)));
+}
+
+/* What they say, at the counter, about last time. Empty for a first visit. */
+string people_regular_line(customer@ c) {
+	if (@c is null or c.memory == 0) return "";
+	if (c.memory >= 3) return "They are a regular, and they remember being looked after here.";
+	if (c.memory == 2) return "They shop here often, and they remember it going well enough.";
+	if (c.memory == 1) return "They have been in before, and they remember it being fine.";
+	if (c.memory == -1) return "They are a regular, and they remember last time being slow.";
+	if (c.memory == -2) return "They are a regular, and they remember a long wait last time.";
+	return "They are a regular, and they remember going home with nothing last time. They mention it, at length.";
+}
+
+/* Short changed customers, which the law page reports and the police collect. */
+class shortchange {
+	string name;
+	int    amount;
+	int    day;
+	bool   settled;
+	shortchange(const string&in n, int a, int d) { name = n; amount = a; day = d; settled = false; }
+}
+
+array<shortchange@> g_shortchangers;
+
+/* ==========================================================================
+   3.  REVIEWS AND REPUTATION
+   ========================================================================= */
+
+class review {
+	string author;
+	string text;
+	int    stars;
+	int    day;
+	review(const string&in a, const string&in t, int s, int d) { author = a; text = t; stars = s; day = d; }
+}
+
+array<review@> g_reviews;
+double g_reputation = 3.0;
+int    g_visits_today = 0;
+int    g_visits_window = 0;
+
+/* How many stars the visit deserves. */
+int people_stars_for(customer@ c) {
+	int stars = 3;
+	if (c.mood >= 6) stars = 5;
+	else if (c.mood >= 3) stars = 4;
+	else if (c.mood <= -6) stars = 1;
+	else if (c.mood <= -3) stars = 2;
+	if (c.price_complaints > 0) stars--;
+	if (c.bare_shelf_hits > 0) stars--;
+	if (c.stepped_in_mess) stars--;
+	if (c.id_refused) stars--;
+	if (c.karen_level >= 3) stars--;
+	if (c.drink_count > 0) stars--;      // a drunk is not a reliable witness
+	if (!c.served and c.basket.length() > 0) stars = 1;
+	if (stars < 1) stars = 1;
+	if (stars > 5) stars = 5;
+	return stars;
+}
+
+/* ---- writing the review ----------------------------------------------------
+   Up to three things that happened, in the order they happened, in the words of
+   whoever is writing it, with a "that said" when one of them cuts against the
+   star rating. The order matters: a review that says the shelf was empty and
+   then that somebody paid for the shopping is a different review from one that
+   says it the other way round. */
+
+bool people_event_is_good(int code) {
+	return (code == EV_SERVED or code == EV_ID_ASKED or code == EV_PAID_FOR
+		or code == EV_CLEARED or code == EV_CHATTED);
+}
+
+/* How this reviewer opens. The whole cast writes English; they do not write the
+   same English, and a shop's reviews are the best place to hear that. */
+string people_review_open(customer@ c) {
+	switch (c.arch) {
+		case ARCH_TRUCKER:    return "I stop here most weeks, so I'll say my piece.";
+		case ARCH_TEENAGER:   return "ok so.";
+		case ARCH_POLICE:     return "For the record.";
+		case ARCH_INSPECTOR:  return "I keep my notes to myself in the shop and write them up afterwards.";
+		case ARCH_FARMER:     return "I don't like to complain, but.";
+		case ARCH_NIGHTSHIFT: return "Coming off a shift, this was the first place I stopped.";
+		case ARCH_BIGSPENDER: return "I am not a difficult customer.";
+		case ARCH_KAREN:      return "I have never been treated like this in my life.";
+		case ARCH_DRUNK:      return "I love this shop. I love it. But.";
+	}
+	return "In and out for a few things.";
+}
+
+string people_review_close(customer@ c, int stars) {
+	if (stars >= 5) return "I will be back.";
+	if (stars == 4) return "I'll be back, most likely.";
+	if (stars == 3) return "It's a shop. It does the job.";
+	if (stars == 2) return "I'll think about it next time.";
+	return "I won't be back.";
+}
+
+string people_event_line(customer@ c, int code) {
+	switch (code) {
+		case EV_SERVED:        return "They served me quickly enough.";
+		case EV_ID_ASKED:      return "They asked for my card without making a fuss about it.";
+		case EV_PAID_FOR:
+			return (c.arch == ARCH_BIGSPENDER) ? "Somebody in front of me paid for the whole queue, which nobody expects."
+				: "Somebody in the queue paid for my shopping. I have never had that happen before.";
+		case EV_CLEARED:
+			return (c.arch == ARCH_BIGSPENDER) ? "They had a third of a shelf face, and I took it. That is what a shop is for."
+				: "They had most of what I wanted, so I took most of what they had.";
+		case EV_PRICE:
+			switch (c.arch) {
+				case ARCH_TRUCKER:  return "The prices have gone up again, and nobody told the road.";
+				case ARCH_FARMER:   return "Nothing in here is priced for the people who live here.";
+				case ARCH_KAREN:    return "And the price of it. I could not believe the price of it.";
+				case ARCH_TEENAGER: return "everything in here costs, like, double.";
+			}
+			return "Nothing in here is priced for the people who live here.";
+		case EV_BARE:          return "Two things I came in for were not on the shelf.";
+		case EV_MESS:          return "Something sticky on the floor by the drinks, and nobody had dealt with it.";
+		case EV_QUEUE_GAVE_UP: return "I stood in that queue and gave up.";
+		case EV_ID_REFUSED:    return "They would not sell me what I came for.";
+		case EV_SHORT_CHANGE:  return "I had to come back for my own change.";
+		case EV_COULD_NOT_PAY: return "It came to more than the money in my hand, which was embarrassing.";
+		case EV_BUMPED:        return "Somebody walked straight into me in the aisle.";
+		case EV_KAREN:         return "And I was the one who had to make a fuss about it.";
+		case EV_DRUNK_FALL:    return "Somebody went over in the aisle, and stayed there for a while.";
+		case EV_DRINK_REFUSED: return "They would not serve me a drink, which I thought was rude.";
+		case EV_CHATTED:       return "Somebody behind the counter actually talked to me, which nobody has to do.";
+	}
+	return "It was a visit.";
+}
+
+string people_review_body(customer@ c, int stars) {
+	/* Up to three things, in the order they happened. The first one that cuts
+	   against the star rating is where the "that said" goes, rather than the
+	   whole review being sorted into good news and bad news, because a review
+	   that lists things out of order does not read like a person wrote it. */
+	array<int> taken;
+	for (uint i = 0; i < c.events.length() and taken.length() < 3; i++) {
+		bool twice = false;
+		for (uint j = 0; j < i; j++) if (c.events[j] == c.events[i]) twice = true;
+		if (!twice) taken.insert_last(c.events[i]);
+	}
+	if (taken.length() == 0) {
+		return people_review_open(c) + " It is a shop. It sold me things. " + people_review_close(c, stars);
+	}
+	string body = people_review_open(c) + " ";
+	bool said = false;
+	for (uint i = 0; i < taken.length(); i++) {
+		int code = taken[i];
+		/* A good thing cuts against a bad rating, and a bad thing against a
+		   good one, and the first of either is what the reviewer flags. */
+		bool cuts = people_event_is_good(code) ? (stars <= 2) : (stars >= 4);
+		if (cuts and !said) { body += "That said. "; said = true; }
+		body += people_event_line(c, code) + " ";
+	}
+	body += people_review_close(c, stars);
+	return body;
+}
+
+void people_review_maybe(customer@ c, bool left_happy) {
+	if (@c is null) return;
+	/* The better or worse the visit, the more likely they are to write one. */
+	int stars = people_stars_for(c);
+	int chance = 8;
+	if (stars >= 5 or stars <= 1) chance = 40;
+	else if (stars == 4 or stars == 2) chance = 18;
+	/* Some visitors always write one: a big spender has the time, and a
+	   complainer has the appetite. */
+	if (c.arch == ARCH_BIGSPENDER) chance = 80;
+	if (c.karen_level >= 3) chance = 100;
+	if (random(1, 100) > chance) return;
+	string body = people_review_body(c, stars);
+	g_reviews.insert_last(review(c.name, body, stars, int(g_current_day)));
+	if (g_reviews.length() > 60) g_reviews.remove_at(0);
+	log_line("people", "review from " + c.name + ": " + stars + " stars");
+}
+
+/* Worked out once a day from the last four weeks of reviews. */
+void people_reputation_update() {
+	int from = int(g_current_day) - ROLLING_WINDOW_DAYS;
+	int total = 0, n = 0;
+	for (uint i = 0; i < g_reviews.length(); i++) {
+		if (g_reviews[i].day < from) continue;
+		total += g_reviews[i].stars;
+		n++;
+	}
+	if (n == 0) {
+		/* With nothing written recently, word of mouth drifts back to neutral. */
+		g_reputation += (3.0 - g_reputation) * 0.15;
+	} else {
+		double avg = double(total) / double(n);
+		/* Reviews are loud, so the shop's reputation moves towards them rather
+		   than snapping to them. */
+		g_reputation += (avg - g_reputation) * 0.4;
+	}
+	if (g_reputation < 1.0) g_reputation = 1.0;
+	if (g_reputation > 5.0) g_reputation = 5.0;
+	string stars = "" + int(g_reputation + 0.5);
+	say("Your reputation is " + stars + " stars out of five, from " + plural(n, "review", "reviews")
+		+ " in the last four weeks and " + plural(g_visits_window, "visit", "visits") + ". "
+		+ ((g_reputation >= 4.0) ? "Word is good. Expect a busier shop."
+			: ((g_reputation <= 2.5) ? "Word is poor, so fewer people are coming in." : "It is steady enough.")), true);
+	g_visits_window = 0;
+	diag("people", "reputation now " + num1(g_reputation));
+}
+
+string people_reviews_text() {
+	if (g_reviews.length() == 0) return "Nobody has written a review yet.";
+	string s = "Your rating is " + int(g_reputation + 0.5) + " stars out of five. Newest first. ";
+	int shown = 0;
+	for (int i = int(g_reviews.length()) - 1; i >= 0 and shown < 6; i--) {
+		review@ r = g_reviews[i];
+		s += r.author + ", " + r.stars + " stars, day " + r.day + ". " + r.text + " ";
+		shown++;
+	}
+	return s;
+}
+
+/* ==========================================================================
+   4.  HOW BUSY IT IS
+   ========================================================================= */
+
+/* People per game hour, before the patience of the queue is taken into account. */
+double people_arrivals_per_hour() {
+	double base = 4.0 + (g_reputation - 3.0) * 2.6;   // reputation is the main lever
+	if (base < 0.5) base = 0.5;
+	int h = int(g_current_hour);
+	/* A morning rush, a lunch bump and an evening peak, the way a real forecourt
+	   shop trades. */
+	if (h >= 7 and h < 9)   base *= 1.5;
+	else if (h >= 12 and h < 14) base *= 1.4;
+	else if (h >= 17 and h < 20) base *= 1.6;
+	else if (h >= 21)       base *= 0.9;
+	else if (h < 7)         base *= 0.4;
+	if (g_hours_24h and (h >= 23 or h < 6)) base *= 0.5;
+	return base;
+}
+
+int people_in_shop() {
+	int n = 0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		if (g_customers[i].state == CUST_GONE) continue;
+		n++;
+	}
+	return n;
+}
+
+int people_queue_length() { return int(g_queue.length()); }
+
+customer@ people_customer(int index) {
+	if (index < 0 or uint(index) >= g_customers.length()) return null;
+	return g_customers[index];
+}
+
+customer@ people_queue_head() {
+	if (g_queue.length() == 0) return null;
+	return g_queue[0];
+}
+
+/* ==========================================================================
+   5.  THE SHOP FLOOR, IN TILES
+   ========================================================================= */
+
+/* Where you stand to browse a face: in the corridor beside it. */
+void people_shop_spot(int face, float &out x, float &out y) {
+	int aisle = face / 2;
+	int which = face % 2;
+	float face_x = 4.5 + aisle * 3 + which;
+	x = (which == 0) ? (face_x - 1.0) : (face_x + 1.0);
+	y = 14.5;
+}
+
+/* Where a person stands in the queue, by their place in it. */
+void people_queue_spot(int place, float &out x, float &out y) {
+	if (place == 0) { x = 7.5; y = 2.5; return; }
+	if (place == 1) { x = 6.5; y = 2.5; return; }
+	if (place == 2) { x = 5.5; y = 2.5; return; }
+	if (place == 3) { x = 4.5; y = 2.5; return; }
+	if (place == 4) { x = 8.5; y = 2.5; return; }
+	if (place == 5) { x = 9.5; y = 2.5; return; }
+	float fx, fy;
+	fx = 1.5; fy = 2.5 + (place - 6) * 1.0;
+	x = fx; y = fy;
+}
+
+/* ==========================================================================
+   6.  BASKETS
+   ========================================================================= */
+
+int people_basket_total(customer@ c) {
+	int total = 0;
+	for (uint i = 0; i < c.basket.length(); i++) {
+		product@ p = product_at(c.basket[i]);
+		if (@p is null) continue;
+		total += p.price * c.basket_qty[i];
+	}
+	return total;
+}
+
+bool people_basket_has_restricted(customer@ c) {
+	for (uint i = 0; i < c.basket.length(); i++) {
+		product@ p = product_at(c.basket[i]);
+		if (@p !is null and p.restricted) return true;
+	}
+	return false;
+}
+
+int people_basket_lines(customer@ c) { return int(c.basket.length()); }
+
+/* What somebody actually takes off a face. Price matters: over about fifteen
+   percent above fair they buy fewer, and eventually nothing at all. */
+void people_fill_basket(customer@ c, int face) {
+	/* A big spender takes a third of the face before they take anything else,
+	   and does not stand there choosing. */
+	if (c.arch == ARCH_BIGSPENDER and !c.cleared_shelf) {
+		people_clear_shelf(c, face);
+		c.wallet = people_wallet_for(c);
+		c.wallet_known = true;
+		return;
+	}
+	int wanted = people_basket_lines(c.arch);
+	int picked = 0;
+	int tries = 0;
+	while (picked < wanted and tries < wanted * 6) {
+		tries++;
+		/* Choose a line on this face. */
+		int start = random(0, int(g_catalog.length()) - 1);
+		int found = -1;
+		for (uint o = 0; o < g_catalog.length(); o++) {
+			int idx = (start + int(o)) % int(g_catalog.length());
+			if (g_catalog[idx].face == face) { found = idx; break; }
+		}
+		if (found < 0) break;
+		product@ p = g_catalog[found];
+		if (p.stock <= 0) { c.bare_shelf_hits++; people_karen_note(c, 1); continue; }
+		int over = shop_price_over_fair(found);
+		if (over > PRICE_TOLERANCE_PCT) {
+			/* Further over, people buy fewer, and then stop buying that line. */
+			int refuse_chance = (over - PRICE_TOLERANCE_PCT) * 3;
+			if (refuse_chance > 90) refuse_chance = 90;
+			if (random(1, 100) <= refuse_chance) { c.price_complaints++; people_karen_note(c, 1); continue; }
+		}
+		int qty = 1;
+		if (c.arch == ARCH_BIGSPENDER) qty = random(1, 4);
+		else if (random(1, 100) <= 20) qty = 2;
+		if (qty > p.stock) qty = p.stock;
+		if (qty <= 0) continue;
+		c.basket.insert_last(found);
+		c.basket_qty.insert_last(qty);
+		picked++;
+	}
+	/* Whatever is in their hand, which may not be enough for the basket they just
+	   filled. */
+	c.wallet = people_wallet_for(c);
+	c.wallet_known = true;
+	if (c.price_complaints > 0 and random(1, 100) <= 40) {
+		people_event(c, EV_PRICE);
+		people_character_say(c, c.name + " mutters about the prices. " + people_arch_name(c.arch)
+			+ " does not think much of what you are charging.");
+	}
+}
+
+/* ==========================================================================
+   7.  WALKING
+   ========================================================================= */
+
+/* One greedy step towards a target tile, in the same grid the player uses. */
+bool people_step_towards(customer@ c, float tx, float ty) {
+	float dx = tx - c.x;
+	float dy = ty - c.y;
+	if (dist2(c.x, c.y, tx, ty) < 0.3) return true;
+	float nx = c.x, ny = c.y;
+	if (fabs2(dx) >= fabs2(dy)) {
+		nx += (dx > 0.0) ? 1.0 : -1.0;
+		if (fabs2(dy) > 0.2 and random(1, 100) <= 30) ny += (dy > 0.0) ? 1.0 : -1.0;
+	} else {
+		ny += (dy > 0.0) ? 1.0 : -1.0;
+		if (fabs2(dx) > 0.2 and random(1, 100) <= 30) nx += (dx > 0.0) ? 1.0 : -1.0;
+	}
+	if (nx < 0.5) nx = 0.5;
+	if (ny < 0.5) ny = 0.5;
+	if (nx > room_width(c.room) - 0.5) nx = room_width(c.room) - 0.5;
+	if (ny > room_height(c.room) - 0.5) ny = room_height(c.room) - 0.5;
+	c.x = nx; c.y = ny;
+	footstep_at(c.room, nx, ny);
+	mess@ m = mess_at(c.room, nx, ny);
+	if (@m !is null) c.stepped_in_mess = true;
+	return false;
+}
+
+/* ==========================================================================
+   7b.  THE BODY LAYER
+   --------------------------------------------------------------------------
+   A customer is a body before they are a basket. Before this, the only thing
+   in the shop that made a noise was a shoplifter's rustle: everybody else
+   walked to a shelf, filled a basket and stood in the queue in silence. What
+   follows is the rest of a person - the cough, the sigh, the keys, the phone,
+   and the moment two of them walk into each other in the same aisle.
+
+   None of it changes what the shop sells. All of it goes through sfx_at(), so
+   it is muffled through a wall and silent two rooms away like everything else,
+   and every sound in it is a real recording, downloaded on first run with the
+   rest of the shop's audio: see assets/manifest.txt and CREDITS.md.
+   ========================================================================= */
+
+/* ---- the noises a body makes ---------------------------------------------
+   Every one of these is a real recording, downloaded by the first-run asset
+   bootstrap the same way the shop's door bell and coins are, and every one is
+   public domain or CC0 (see assets/manifest.txt and CREDITS.md). Nothing here
+   is synthesised: the vocabulary is what has actually been recorded, which is
+   why there is no sniff, no gasp and no jingle of keys in it.
+
+   Three numbers travel with each file, and all three were measured rather than
+   guessed. A recording is one moment out of a session: Cough 1.ogg is twenty
+   seconds long and its first half second measures -63 dB, which is silence, so
+   people_emote_offset() is where the cough actually is. The cut is how much of
+   it a body sound is worth. The gain brings every file to roughly -16 dB at
+   its loudest, so a yawn (-21.6 dB on its own) and a throat clearing (-8.0 dB)
+   sit at the same distance in the shop. */
+const int EMO_COUGH   = 0;
+const int EMO_SNEEZE  = 1;
+const int EMO_SIGH    = 2;
+const int EMO_YAWN    = 3;
+const int EMO_LAUGH   = 4;
+const int EMO_AHEM    = 5;    // clearing the throat, and laughing, on one file
+const int EMO_HUFF    = 6;
+const int EMO_HICCUP  = 7;
+const int EMO_BURP    = 8;
+const int EMO_RING    = 9;
+const int EMO_COUNT   = 10;
+
+string people_emote_file(int e) {
+	switch (e) {
+		case EMO_COUGH:  return "cough.ogg";
+		case EMO_SNEEZE: return "sneeze.ogg";
+		case EMO_SIGH:   return "sigh.ogg";
+		case EMO_YAWN:   return "yawn.ogg";
+		case EMO_LAUGH:  return "laugh.ogg";
+		case EMO_AHEM:   return "ahem.ogg";
+		case EMO_HUFF:   return "huff.ogg";
+		case EMO_HICCUP: return "hiccup.ogg";
+		case EMO_BURP:   return "burp.ogg";
+		case EMO_RING:   return "ring.ogg";
+	}
+	return "cough.ogg";
+}
+
+/* Where in the recording the sound actually is, in seconds. */
+double people_emote_offset(int e) {
+	switch (e) {
+		case EMO_COUGH:  return 3.60;
+		case EMO_SNEEZE: return 2.10;
+		case EMO_SIGH:   return 10.40;
+		case EMO_YAWN:   return 2.35;
+		case EMO_LAUGH:  return 2.90;
+		case EMO_AHEM:   return 3.30;
+		case EMO_HUFF:   return 3.60;
+		case EMO_HICCUP: return 0.00;
+		case EMO_BURP:   return 0.00;
+		case EMO_RING:   return 0.00;
+	}
+	return 0.0;
+}
+
+/* How much of it a body sound is worth, in milliseconds. */
+int people_emote_cut_ms(int e) {
+	switch (e) {
+		case EMO_COUGH:  return 1600;
+		case EMO_SNEEZE: return 1200;
+		case EMO_SIGH:   return 1600;
+		case EMO_YAWN:   return 1500;
+		case EMO_LAUGH:  return 2000;
+		case EMO_AHEM:   return 1400;
+		case EMO_HUFF:   return 2000;
+		case EMO_HICCUP: return 800;
+		case EMO_BURP:   return 900;
+		case EMO_RING:   return 2500;
+	}
+	return 1500;
+}
+
+/* The gain that brings that recording level with the rest of them. */
+double people_emote_gain(int e) {
+	switch (e) {
+		case EMO_COUGH:  return -5.0;    // measured -11.4 dB at its loudest
+		case EMO_SNEEZE: return -6.0;    // -9.9
+		case EMO_SIGH:   return 3.0;     // -18.5
+		case EMO_YAWN:   return 6.0;     // -21.6
+		case EMO_LAUGH:  return 0.0;     // -16.0
+		case EMO_AHEM:   return -8.0;    // -8.0
+		case EMO_HUFF:   return 11.0;    // -26.9
+		case EMO_HICCUP: return 11.0;    // -27.3
+		case EMO_BURP:   return -4.0;    // measured with the same method
+		case EMO_RING:   return -4.0;    // -12.0
+	}
+	return 0.0;
+}
+
+/* What it was, for the times the player is told about it. */
+string people_emote_word(int e) {
+	switch (e) {
+		case EMO_COUGH:  return "coughs";
+		case EMO_SNEEZE: return "sneezes";
+		case EMO_SIGH:   return "sighs";
+		case EMO_YAWN:   return "yawns, at length";
+		case EMO_LAUGH:  return "laughs";
+		case EMO_AHEM:   return "clears their throat";
+		case EMO_HUFF:   return "huffs, loudly";
+		case EMO_HICCUP: return "hiccups";
+		case EMO_BURP:   return "belches";
+		case EMO_RING:   return "'s phone rings";
+	}
+	return "makes a noise";
+}
+
+/* Which noise a body makes, by who is in it. Nothing here is uniform: a trucker
+   coughs, a teenager giggles at her phone, an official jingles his keys, and a
+   drunk cannot get through a minute without one of three things. */
+int people_emote_pick(customer@ c) {
+	int r = random(1, 100);
+	if (c.drink_count > 0) {
+		if (r <= 25) return EMO_BURP;
+		if (r <= 45) return EMO_HICCUP;
+		if (r <= 65) return EMO_LAUGH;
+		if (r <= 85) return EMO_SIGH;
+		return EMO_COUGH;
+	}
+	switch (c.arch) {
+		case ARCH_TEENAGER:
+			if (r <= 40) return EMO_LAUGH;
+			if (r <= 60) return EMO_AHEM;
+			if (r <= 80) return EMO_SIGH;
+			return EMO_SNEEZE;
+		case ARCH_TRUCKER:
+			if (r <= 40) return EMO_COUGH;
+			if (r <= 60) return EMO_SIGH;
+			if (r <= 80) return EMO_AHEM;
+			return EMO_SNEEZE;
+		case ARCH_FARMER:
+			if (r <= 30) return EMO_COUGH;
+			if (r <= 55) return EMO_SIGH;
+			if (r <= 75) return EMO_SNEEZE;
+			return EMO_LAUGH;
+		case ARCH_NIGHTSHIFT:
+			if (r <= 45) return EMO_YAWN;
+			if (r <= 70) return EMO_SIGH;
+			if (r <= 85) return EMO_COUGH;
+			return EMO_AHEM;
+		case ARCH_POLICE:
+			if (r <= 40) return EMO_AHEM;
+			if (r <= 65) return EMO_COUGH;
+			if (r <= 85) return EMO_SIGH;
+			return EMO_SNEEZE;
+		case ARCH_INSPECTOR:
+			if (r <= 35) return EMO_AHEM;
+			if (r <= 65) return EMO_SIGH;
+			if (r <= 85) return EMO_COUGH;
+			return EMO_SNEEZE;
+		case ARCH_BIGSPENDER:
+			if (r <= 30) return EMO_SIGH;
+			if (r <= 55) return EMO_LAUGH;
+			if (r <= 80) return EMO_AHEM;
+			return EMO_SNEEZE;
+		case ARCH_KAREN:
+			if (r <= 45) return EMO_HUFF;
+			if (r <= 75) return EMO_SIGH;
+			if (r <= 90) return EMO_LAUGH;
+			return EMO_AHEM;
+		case ARCH_DRUNK:
+			if (r <= 30) return EMO_LAUGH;
+			if (r <= 55) return EMO_HICCUP;
+			if (r <= 75) return EMO_BURP;
+			if (r <= 90) return EMO_SIGH;
+			return EMO_COUGH;
+	}
+	/* a regular */
+	if (r <= 30) return EMO_COUGH;
+	if (r <= 55) return EMO_SIGH;
+	if (r <= 75) return EMO_SNEEZE;
+	if (r <= 90) return EMO_YAWN;
+	return EMO_AHEM;
+}
+
+/* One body noise, positioned where the body is, started where the recording's
+   own sound is rather than where the file begins, and cut off after a moment. */
+void people_emote_play(customer@ c, int e, double extra_gain = 0.0) {
+	if (@c is null) return;
+	sfx_at(c.room, c.x, c.y, 0.0, A(people_emote_file(e)),
+		float(people_emote_gain(e) + extra_gain),
+		people_emote_cut_ms(e), people_emote_offset(e));
+}
+
+/* Some noises carry information, and those are also said out loud, because the
+   player cannot see who it was. A cough two aisles over is texture and stays a
+   sound; a complainer huffing, or a queue sighing, is the shop telling you
+   something about the next two minutes. */
+bool people_emote_worth_saying(int e) {
+	return (e == EMO_HUFF or e == EMO_AHEM or e == EMO_SIGH or e == EMO_LAUGH
+		or e == EMO_BURP or e == EMO_YAWN);
+}
+
+void people_emote_say(customer@ c, int e) {
+	if (@c is null) return;
+	string where = (c.state == CUST_QUEUEING) ? "in the queue" : ("in " + room_name(c.room));
+	people_character_say(c, c.name + ", " + people_arch_name(c.arch) + " " + where + ", "
+		+ people_emote_word(e) + ".");
+}
+
+void people_emote_once(customer@ c, uint now) {
+	int e = people_emote_pick(c);
+	people_emote_play(c, e, (e == EMO_RING) ? -3.0 : 0.0);
+	if (people_emote_worth_saying(e) and random(1, 100) <= 45) people_emote_say(c, e);
+	c.next_emote_at = now + uint(random(3500, 14000));
+}
+
+/* ---- what the visit has done to them, in the order it did it --------------
+   A review is not a score, it is a small story with up to three things in it,
+   in the order they happened. This is where those things are written down, as
+   they happen, by whoever caused them. The eighth oldest is dropped, which is
+   far more than any review needs. */
+const int EV_SERVED       = 1;    // served, and quickly enough
+const int EV_ID_ASKED     = 2;    // carded, without a fuss
+const int EV_PAID_FOR     = 3;    // a stranger in the queue paid for it
+const int EV_CLEARED      = 4;    // they cleared a shelf themselves
+const int EV_PRICE        = 5;    // the price of the place
+const int EV_BARE         = 6;    // the shelf was empty
+const int EV_MESS         = 7;    // something on the floor
+const int EV_QUEUE_GAVE_UP= 8;    // stood in the queue and left
+const int EV_ID_REFUSED   = 9;    // not sold what they came for
+const int EV_SHORT_CHANGE = 10;   // had to come back for their own change
+const int EV_COULD_NOT_PAY= 11;   // the money in their hand did not cover it
+const int EV_BUMPED       = 12;   // walked into in an aisle
+const int EV_KAREN        = 13;   // made a fuss about it
+const int EV_DRUNK_FALL   = 14;   // went over in the aisle
+const int EV_DRINK_REFUSED= 15;   // refused the drink they asked for
+const int EV_CHATTED      = 16;   // somebody behind the counter talked to them
+
+void people_event(customer@ c, int code) {
+	if (@c is null) return;
+	c.events.insert_last(code);
+	c.events_seen++;
+	if (c.events.length() > 8) c.events.remove_at(0);
+}
+
+/* ---- complainers, and what complaining turns into -------------------------
+   A complainer is not just loud. She escalates: a tut, then the person in
+   charge, then the whole queue as an audience. Every step is heard by the shop
+   and written down for the review she is going to write. */
+
+string people_karen_line(int level) {
+	if (level <= 1) return "tuts, and says that this shop is getting worse.";
+	if (level == 2) return "says she would like to speak to whoever is in charge of this shop.";
+	return "announces, to the whole queue, that she is never shopping here again, "
+		+ "and that somebody is going to hear about it.";
+}
+
+/* A thing has happened to a complainer. She takes it personally, and once per
+   step of her own ladder she says so out loud, in her own voice. */
+void people_karen_note(customer@ c, int amount) {
+	if (@c is null or c.arch != ARCH_KAREN or amount <= 0) return;
+	int was = c.karen_level;
+	c.karen_level += amount;
+	if (c.karen_level > 3) c.karen_level = 3;
+	if (c.karen_level == was) return;
+	people_emote_play(c, EMO_HUFF, (c.karen_level >= 3) ? 2.0 : 0.0);
+	voice_use(c.voice);
+	say(c.name + " " + people_karen_line(c.karen_level), true);
+	voice_clear();
+	people_event(c, EV_KAREN);
+	/* At her worst she is not leaving until somebody hears her, which is what
+	   makes her worth dealing with rather than waiting out. */
+	if (c.karen_level >= 3) c.patience += 240;
+	log_line("people", c.name + " is a complainer at level " + c.karen_level);
+}
+
+/* ---- big spenders, and the small crowd that arrives with them -------------
+   A big spender clears a third of a shelf face, and somebody who came in with
+   a big spender shops the way their host does. The one thing the queue talks
+   about for a week is in people_bigspender_pay_queue(). */
+
+void people_bigspender_crew(customer@ host) {
+	if (@host is null) return;
+	int crew = random(1, 4);
+	for (int i = 0; i < crew; i++) {
+		customer@ m = people_spawn(ARCH_REGULAR);
+		if (@m is null) continue;
+		m.entourage_host = host.name;
+		m.mood += 2;
+		/* They shop like somebody else is paying, because somebody else is. */
+		m.wants_drink = true;
+		m.drink_kind = random(0, 1);
+	}
+	say(host.name + " comes in with " + plural(crew, "person", "people") + " in tow, "
+		+ "and they are not queueing behind anybody.", true);
+	log_line("people", host.name + " arrived with " + crew + " in tow");
+}
+
+/* A third of the face, off the shelf, into the basket. This is the whole point
+   of a big spender and it is why one of them can turn a quiet afternoon into
+   the week's best hour. */
+void people_clear_shelf(customer@ c, int face) {
+	if (@c is null or c.cleared_shelf) return;
+	c.cleared_shelf = true;
+	int lines = 0, units = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		if (g_catalog[i].face != face or g_catalog[i].stock <= 0) continue;
+		int qty = g_catalog[i].stock / 3;
+		if (qty < 1) qty = 1;
+		if (qty > g_catalog[i].stock) qty = g_catalog[i].stock;
+		c.basket.insert_last(int(i));
+		c.basket_qty.insert_last(qty);
+		lines++;
+		units += qty;
+	}
+	if (units <= 0) return;
+	say(c.name + " is clearing " + plural(units, "unit", "units") + " off the shelves, "
+		+ "in " + plural(lines, "line", "lines") + ", and is not looking at the prices. ", true);
+	people_event(c, EV_CLEARED);
+	log_line("people", c.name + " cleared a shelf face: " + units + " units");
+}
+
+/* Sometimes they pay for everybody in front of them. The queue loves this: it
+   is settled on the spot, at the big spender's expense, and every one of those
+   people leaves with their shopping and a story. */
+int people_bigspender_pay_queue(customer@ c) {
+	if (@c is null or !c.pays_for_queue) return 0;
+	c.pays_for_queue = false;
+	int paid = 0;
+	for (int i = int(g_queue.length()) - 1; i >= 0; i--) {
+		customer@ o = g_queue[uint(i)];
+		if (@o is null or o is c) continue;
+		if (@g_sale_customer is o) continue;      // the one actually being served stays
+		int total = people_basket_total(o);
+		for (uint b = 0; b < o.basket.length(); b++) shop_sell(o.basket[b], o.basket_qty[b]);
+		if (total > 0) money_earn(total);
+		o.served = true;
+		o.bought = true;
+		o.spent = total;
+		o.mood += 5;
+		o.waved_receipt = true;
+		people_event(o, EV_PAID_FOR);
+		people_customer_leave(o, true);
+		diag("people", c.name + " paid " + money(total) + " for " + o.name);
+		paid++;
+	}
+	if (paid > 0) {
+		say(c.name + " settles " + plural(paid, "basket", "baskets") + " in front of them. "
+			+ "The queue, for once, is delighted.", true);
+		log_line("people", c.name + " paid for " + paid + " in the queue");
+	}
+	return paid;
+}
+
+/* ---- walking into each other ----------------------------------------------
+   A shop floor is thirty tiles of people walking the same corridors. Two of them
+   meeting in an aisle is not a collision to be avoided: it is a sentence, and
+   an answer, which is what two people in a shop sound like. */
+
+string people_bump_line(customer@ c) {
+	switch (c.arch) {
+		case ARCH_KAREN:      return "says, loudly, that people should look where they are going.";
+		case ARCH_DRUNK:      return "says sorry, twice, to the shelf.";
+		case ARCH_TEENAGER:   return "says watch it, without looking up from the phone.";
+		case ARCH_TRUCKER:    return "says pardon me, and means it.";
+		case ARCH_BIGSPENDER: return "says something about the width of the aisles here.";
+		case ARCH_POLICE:     return "says excuse me, and steps aside.";
+		case ARCH_FARMER:     return "says no harm done, and carries on.";
+		case ARCH_NIGHTSHIFT: return "mumbles something and keeps moving.";
+	}
+	return "says sorry, and gets on with it.";
+}
+
+string people_bump_reply(customer@ c) {
+	switch (c.arch) {
+		case ARCH_KAREN:      return "is not having any of it.";
+		case ARCH_DRUNK:      return "thanks the shelf, warmly.";
+		case ARCH_TEENAGER:   return "says it was their own fault anyway.";
+		case ARCH_TRUCKER:    return "says it takes two, and laughs.";
+		case ARCH_FARMER:     return "says the aisle is narrow enough for anybody.";
+		case ARCH_BIGSPENDER: return "is already looking at something else.";
+		case ARCH_POLICE:     return "says they will not be making a report of it.";
+	}
+	return "says no harm done.";
+}
+
+void people_bump(customer@ a, customer@ b) {
+	/* No sound of its own: there is no recording of two people walking into each
+	   other in this shop's assets, and inventing a thud for it would be the one
+	   synthetic noise in a shop built out of real ones. What the player hears is
+	   the sentence and the answer, which is what two people in a shop actually
+	   say, and the sound of the two of them stopping is the footsteps that
+	   already happen. */
+	voice_use(a.voice);
+	say(a.name + ", " + people_arch_name(a.arch) + ", " + people_bump_line(a), true);
+	voice_clear();
+	/* The answer is queued rather than interrupting, so both halves are heard. */
+	voice_use(b.voice);
+	say(b.name + ", " + people_arch_name(b.arch) + ", " + people_bump_reply(b), false);
+	voice_clear();
+	/* Being walked into is worth a point of mood, and worth rather more than that
+	   to somebody who was already having a bad day. */
+	a.mood -= 1;
+	b.mood -= 1;
+	if (a.arch == ARCH_KAREN) a.karen_level++;
+	if (b.arch == ARCH_KAREN) b.karen_level++;
+	people_event(a, EV_BUMPED);
+	people_event(b, EV_BUMPED);
+	a.next_bump_at = ticks() + uint(random(8000, 20000));
+	b.next_bump_at = a.next_bump_at;
+	log_line("people", a.name + " walked into " + b.name);
+}
+
+uint g_next_bump_scan = 0;
+
+void people_collisions_tick(uint now) {
+	if (now < g_next_bump_scan) return;
+	g_next_bump_scan = now + 400;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ a = g_customers[i];
+		if (@a is null or a.room != ROOM_SHOP) continue;
+		if (a.state == CUST_GONE or a.state == CUST_LEAVING) continue;
+		if (now < a.next_bump_at) continue;
+		for (uint j = i + 1; j < g_customers.length(); j++) {
+			customer@ b = g_customers[j];
+			if (@b is null or b.room != a.room) continue;
+			if (b.state == CUST_GONE or b.state == CUST_LEAVING) continue;
+			if (now < b.next_bump_at) continue;
+			if (dist2(a.x, a.y, b.x, b.y) > 0.9 * 0.9) continue;
+			if (random(1, 100) > 30) { a.next_bump_at = now + uint(random(2000, 5000)); continue; }
+			people_bump(a, b);
+			break;
+		}
+	}
+}
+
+/* ---- the phone in the pocket ----------------------------------------------
+   Half a conversation, in their own voice, from wherever they are standing.
+   The player hears one side of it, which is what the next aisle over hears. */
+
+string people_phone_line(customer@ c, int which) {
+	switch (c.arch) {
+		case ARCH_TEENAGER:
+			if (which == 0) return "Yeah, I'm in the shop. No, the one on Main.";
+			if (which == 1) return "I said in a minute. I'm getting something first.";
+			return "Do you want anything? No? Fine.";
+		case ARCH_TRUCKER:
+			if (which == 0) return "Yeah, I'm parked up. Just getting something to eat.";
+			if (which == 1) return "Tell them Friday, and not before Friday.";
+			return "No. Not the Ohio run again. Ask somebody else.";
+		case ARCH_BIGSPENDER:
+			if (which == 0) return "Buy it. No, buy the other one as well.";
+			if (which == 1) return "Tell them I will be twenty minutes, and that is generous.";
+			return "Mm. Put it on the account.";
+		case ARCH_KAREN:
+			if (which == 0) return "You will not believe what they have done in here.";
+			if (which == 1) return "And the price of it. I know. I know.";
+			return "I am going to say something. I am. Watch me.";
+		case ARCH_NIGHTSHIFT:
+			if (which == 0) return "Just finished. I'm stopping in for something to eat first.";
+			if (which == 1) return "No, leave it. I'll do it when I get in.";
+			return "Mm. See you in a bit.";
+		case ARCH_FARMER:
+			if (which == 0) return "Yeah, I'm just in town. The fence can wait till tomorrow.";
+			if (which == 1) return "Get the small one, it does the same job.";
+			return "Right. Right you are.";
+		case ARCH_POLICE:
+			if (which == 0) return "I'm on my break. Something off the shelf, that's all.";
+			if (which == 1) return "Log it and I'll look at it in the morning.";
+			return "Copy that.";
+		case ARCH_INSPECTOR:
+			if (which == 0) return "Not yet. I will call you when I have it.";
+			if (which == 1) return "No, they do not know I am here. That is the point.";
+			return "Fine. Speak later.";
+		case ARCH_DRUNK:
+			if (which == 0) return "I'm fine. I'm fine. I'm, where am I?";
+			if (which == 1) return "No. No, I said I'm coming. I'm coming now.";
+			return "You're a good mate. You are. A good mate.";
+	}
+	if (which == 0) return "I'm at the shop. Do we need anything else?";
+	if (which == 1) return "Bread. I've got bread. Anything else? No. Right.";
+	return "Okay. See you in a few minutes.";
+}
+
+void people_phone_start(customer@ c, uint now) {
+	c.on_phone = true;
+	c.phone_lines_left = random(2, 3);
+	people_emote_play(c, EMO_RING, -3.0);
+	voice_use(c.voice);
+	say(c.name + "'s phone rings, and they answer it.", true);
+	voice_clear();
+	c.next_phone_at = now + uint(random(900, 1600));
+}
+
+void people_phone_tick(customer@ c, uint now) {
+	if (now < c.next_phone_at) return;
+	if (c.phone_lines_left <= 0) {
+		c.on_phone = false;
+		c.next_phone_at = now + uint(random(40000, 150000));
+		return;
+	}
+	int which = 3 - c.phone_lines_left;
+	if (which < 0) which = 0;
+	people_character_say(c, people_phone_line(c, which));
+	c.phone_lines_left--;
+	c.next_phone_at = now + uint(random(1800, 3400));
+}
+
+/* One pass a frame over everybody in the shop: phones, bodies, and the aisle
+   collisions. Cheap on purpose - a cough is not something that needs a timer
+   per person per frame, only a deadline per person. */
+void people_body_tick(uint now) {
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.state == CUST_GONE or c.state == CUST_LEAVING) continue;
+		if (c.on_phone) { people_phone_tick(c, now); continue; }
+		if (c.next_phone_at > 0 and now >= c.next_phone_at and random(1, 100) <= 35) {
+			people_phone_start(c, now);
+			continue;
+		}
+		if (now >= c.next_emote_at) people_emote_once(c, now);
+		if (c.arch == ARCH_DRUNK or c.drink_count > 0) people_drunk_tick(c, now);
+	}
+	people_collisions_tick(now);
+}
+
+/* ==========================================================================
+   7c.  DRUNKS
+   --------------------------------------------------------------------------
+   A drunk is not a customer with a personality tag. They are a customer who
+   gets worse while they are in the shop: they have a drink, and then another,
+   and every one of them costs them some of their walk and some of their
+   speech. The level runs 1, well on their way, to 4, legless, and it is what
+   the slur, the lurch and the wobble all read from.
+   ========================================================================== */
+
+int people_drunk_level(customer@ c) {
+	if (@c is null) return 0;
+	int level = c.drink_count;
+	if (c.arch == ARCH_DRUNK) level += 1;
+	return level;
+}
+
+/* Vowels stretch when the tongue stops keeping up with them. */
+string people_stretch_vowels(const string&in w) {
+	string drawn = "";
+	for (uint i = 0; i < w.length(); i++) {
+		string ch = w.substr(i, 1);
+		drawn += ch;
+		if (ch == "a" or ch == "e" or ch == "i" or ch == "o" or ch == "u") drawn += ch;
+	}
+	return drawn;
+}
+
+/* Their side of a sentence, slurred by how far into the evening they are: a
+   word repeated, then a word with its vowels pulled long, and at the far end a
+   hic in front of it and an assurance that they are fine, twice. */
+string people_slur(customer@ c, const string&in text) {
+	int level = people_drunk_level(c);
+	if (level <= 0 or text.length() == 0) return text;
+	array<string> words;
+	string cur = "";
+	for (uint i = 0; i < text.length(); i++) {
+		string ch = text.substr(i, 1);
+		if (ch == " ") { if (cur.length() > 0) words.insert_last(cur); cur = ""; }
+		else cur += ch;
+	}
+	if (cur.length() > 0) words.insert_last(cur);
+	if (words.length() == 0) return text;
+	uint longest = 0;
+	int long_at = -1;
+	for (uint i = 0; i < words.length(); i++) {
+		if (words[i].length() > longest) { longest = words[i].length(); long_at = int(i); }
+	}
+	string slurred = "";
+	for (uint i = 0; i < words.length(); i++) {
+		string w = words[i];
+		if (level >= 2 and int(i) == long_at and w.length() >= 4) w = people_stretch_vowels(w);
+		slurred += w;
+		if (level >= 1 and i > 0 and (i % 5) == 0) slurred += " " + w;
+		slurred += " ";
+	}
+	slurred = slurred.substr(0, slurred.length() - 1);
+	if (level >= 3) slurred = "Hic. " + slurred + " I'm fine. I'm fine.";
+	return slurred;
+}
+
+string people_drunk_mutter(customer@ c) {
+	int r = random(1, 100);
+	if (r <= 25) return c.name + " says, to nobody, that this is a good shop and always has been.";
+	if (r <= 45) return c.name + " asks the shelf whether it is still open.";
+	if (r <= 62) return c.name + " counts the money in their hand twice more, out loud.";
+	if (r <= 78) return c.name + " laughs at something that was not said.";
+	if (r <= 90) return c.name + " says they are only having the one.";
+	return c.name + " apologises to the aisle, sincerely.";
+}
+
+/* Their own voice, slurred, and a little flatter the further in they are. The
+   wobble is the whole line rather than a syllable, which is what a mix of
+   slurred words and a sinking pitch actually sounds like. */
+void people_drunk_say(customer@ c, const string&in text, bool interrupt = true) {
+	if (@c is null) return;
+	int level = people_drunk_level(c);
+	voice_use(c.voice);
+	if (level >= 2) voice_pitch_for_line(1.0 - 0.08 * double(level - 1));
+	say(people_slur(c, text), interrupt);
+	voice_clear();
+}
+
+/* Any customer's own line: a drunk gets the slur and the wobble, everybody
+   else gets their voice and nothing else. */
+void people_character_say(customer@ c, const string&in text, bool interrupt = true) {
+	if (@c is null) return;
+	if (people_drunk_level(c) > 0) { people_drunk_say(c, text, interrupt); return; }
+	voice_use(c.voice);
+	say(text, interrupt);
+	voice_clear();
+}
+
+/* They have had one, and it shows. */
+void people_drink_count_add(customer@ c) {
+	if (@c is null) return;
+	c.drink_count++;
+	int level = people_drunk_level(c);
+	if (level >= 3) people_drunk_say(c, c.name + " is not going to remember this visit in the morning.");
+	else if (level == 2) people_drunk_say(c, c.name + " is walking a little wider than the aisle now.");
+	log_line("people", c.name + " is now at drink level " + level);
+}
+
+/* Wailing about the drink they are not getting, all the way out of the shop. */
+void people_drunk_no_drink(customer@ c) {
+	if (@c is null or !c.wants_drink) return;
+	if (people_drunk_level(c) <= 0 or c.drink_count > 0) return;
+	c.mood -= 2;
+	people_event(c, EV_DRINK_REFUSED);
+	people_drunk_say(c, c.name + ((random(1, 100) <= 50)
+		? " asks, twice, why the drink they asked for is not coming, and asks a third time at the door."
+		: " wails about the drink they are not getting, all the way out of the shop."));
+}
+
+/* Going over in the aisle. They get up, eventually, and think about another. */
+void people_drunk_fall(customer@ c, uint now) {
+	if (@c is null) return;
+	people_event(c, EV_DRUNK_FALL);
+	c.mood -= 1;
+	people_drunk_say(c, c.name + " goes over in the aisle, and stays down long enough to think about it.");
+	c.next_step_at = now + uint(random(1500, 3500));
+	log_line("people", c.name + " went over in the aisle");
+}
+
+/* One more, because one was never going to be enough. They turn round at the
+   door and start again, which is how a visit turns into an evening. */
+void people_drunk_another(customer@ c, uint now) {
+	if (@c is null) return;
+	c.drink_count++;
+	c.wants_drink = true;
+	c.drink_kind = random(0, 1);
+	c.state = CUST_ARRIVING;
+	c.face_target = random(0, FACE_COUNT - 1);
+	c.next_step_at = now + 400;
+	people_drunk_say(c, c.name + " turns round at the door and goes back for another one, because one was never going to be enough.");
+	log_line("people", c.name + " went back for another drink, level " + people_drunk_level(c));
+}
+
+void people_drunk_tick(customer@ c, uint now) {
+	if (@c is null) return;
+	if (c.next_stumble_at == 0) { c.next_stumble_at = now + uint(random(3000, 9000)); return; }
+	if (now < c.next_stumble_at) return;
+	int level = people_drunk_level(c);
+	c.next_stumble_at = now + uint(random(4000, 12000));
+	if (c.state == CUST_GONE or c.state == CUST_LEAVING) return;
+	if (level >= 2 and random(1, 100) <= 10 * level) { people_drunk_fall(c, now); return; }
+	people_drunk_say(c, people_drunk_mutter(c));
+}
+
+/* ==========================================================================
+   8.  ARRIVAL AND LEAVING
+   ========================================================================= */
+
+int people_pick_archetype() {
+	int r = random(1, 100);
+	if (r <= 46) return ARCH_REGULAR;
+	if (r <= 58) return ARCH_TRUCKER;
+	if (r <= 70) return ARCH_TEENAGER;
+	if (r <= 74) return ARCH_POLICE;
+	if (r <= 80) return ARCH_FARMER;
+	if (r <= 86) return ARCH_NIGHTSHIFT;
+	if (r <= 89) return ARCH_BIGSPENDER;
+	if (r <= 94) return ARCH_KAREN;
+	return ARCH_DRUNK;
+}
+
+customer@ people_spawn(int arch = -1) {
+	if (arch < 0) arch = people_pick_archetype();
+	/* A shoplifter is not a kind of person, it is something a person does. Teenagers
+	   are the worst for it, nobody's gran ever. */
+	bool lift = (random(1, 100) <= people_shoplift_chance(arch));
+	customer@ c = customer(staff_pick_name(), arch);
+	c.shoplifter = lift;
+	c.room = ROOM_SHOP;
+	c.x = 4.5; c.y = 1.5;          // just inside the front door
+	c.face_target = random(0, FACE_COUNT - 1);
+	c.state = CUST_ARRIVING;
+	/* A familiar face walks in already thinking about last time. */
+	c.memory = people_regular_lookup(c.name);
+	c.mood += c.memory * 2;
+	c.voice = voice_pool_assign();
+	c.next_step_at = ticks() + uint(random(200, 700));
+	/* A body starts making its own noise a little while after it comes in, so
+	   the door is not immediately followed by a cough from somebody who has not
+	   walked anywhere yet. */
+	c.next_emote_at = ticks() + uint(random(2500, 9000));
+	c.next_phone_at = ticks() + uint(random(20000, 90000));
+	if (random(1, 100) <= 25) {
+		c.wants_drink = true;
+		c.drink_kind = random(0, 1);
+	}
+	g_customers.insert_last(c);
+	sfx_ui(A("register.ogg"), -14.0, 700);
+	g_visits_today++;
+	g_visits_window++;
+	/* A big spender is an event. One in four of them settles the whole queue,
+	   and two in five bring somebody with them. */
+	if (arch == ARCH_BIGSPENDER) {
+		c.pays_for_queue = (random(1, 100) <= 25);
+		if (random(1, 100) <= 40) people_bigspender_crew(c);
+	}
+	return c;
+}
+
+void people_customer_leave(customer@ c, bool through_front_door) {
+	if (@c is null) return;
+	c.state = CUST_LEAVING;
+	/* Take them out of the queue if they are in it. */
+	for (int i = int(g_queue.length()) - 1; i >= 0; i--) {
+		if (g_queue[i] is c) g_queue.remove_at(uint(i));
+	}
+}
+
+/* A voice server has been dropped and the people who were speaking with it need
+   new voices. They are given ones of their own rather than falling into
+   whoever is next to them, so the customer you have been talking to still
+   sounds like the same person afterwards. Called from the frame, which is the
+   first file that can see both the shop and the staff. */
+void people_reassign_lost_voice(int dead) {
+	if (dead < 0) return;
+	int moved = 0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.voice != dead) continue;
+		c.voice = voice_pool_assign();
+		moved++;
+	}
+	if (moved > 0) log_line("people", moved + " in the shop were given new voices");
+}
+
+void people_customer_finish(customer@ c) {
+	if (@c is null) return;
+	/* They remember, and they tell you so the next time they are in. */
+	people_regular_remember(c);
+	people_review_maybe(c, c.mood >= 0);
+	for (int i = int(g_customers.length()) - 1; i >= 0; i--) {
+		if (g_customers[i] is c) { g_customers.remove_at(uint(i)); break; }
+	}
+}
+
+/* The whole crowd moves. Called once per frame by mechanics.nvgt. */
+void people_tick(uint now) {
+	/* Bodies first: a phone call or a cough happens wherever the customer
+	   happens to be standing, including in the middle of a walk, and it is not
+	   gated by the step timer the way walking is. */
+	people_body_tick(now);
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.state == CUST_GONE) continue;
+		if (now < c.next_step_at) continue;
+
+		if (c.state == CUST_ARRIVING) {
+			c.next_step_at = now + uint(random(400, 800));
+			float sx, sy;
+			people_shop_spot(c.face_target, sx, sy);
+			if (people_step_towards(c, sx, sy)) {
+				people_fill_basket(c, c.face_target);
+				c.state = CUST_TO_TILL;
+			}
+			/* A rustle at the shelf is what a shoplifter sounds like. It has its own
+			   short cue: a one-shot plays its file to the end, so borrowing the shop
+			   ambience here meant a whole minute of room noise for one rustle. */
+			if (c.shoplifter and !c.rustled and random(1, 100) <= 25) {
+				c.rustled = true;
+				sfx_at(c.room, c.x, c.y, 0.0, A("rustle.mp3"), -18.0);
+			}
+		} else if (c.state == CUST_TO_TILL) {
+			c.next_step_at = now + uint(random(400, 800));
+			float qx, qy;
+			people_queue_spot(int(g_queue.length()), qx, qy);
+			if (people_step_towards(c, qx, qy)) {
+				bool already = false;
+				for (uint q = 0; q < g_queue.length(); q++) if (g_queue[q] is c) already = true;
+				if (!already) g_queue.insert_last(c);
+				c.state = CUST_QUEUEING;
+				/* Somebody who arrived planning to settle the queue does it as they
+				   reach it, before anybody behind them has to wait. */
+				if (c.pays_for_queue) people_bigspender_pay_queue(c);
+			}
+		} else if (c.state == CUST_QUEUEING) {
+			/* Hold position, and lose patience. Somebody you are actually serving
+			   right now is not waiting; anybody else is, including the head of
+			   the queue, or a customer you ignore would stand there all day. */
+			c.next_step_at = now + 500;
+			if (!(@g_sale_customer is c)) {
+				c.waited++;
+				c.patience -= 1;
+				/* Half way through her patience, and once only, a complainer makes
+				   the queue her business. */
+				if (c.waited == 40 and c.arch == ARCH_KAREN) people_karen_note(c, 1);
+			}
+			if (c.patience <= 0) {
+				people_character_say(c, c.name + " has had enough of the queue and walks out, leaving their basket where it is.");
+				people_event(c, EV_QUEUE_GAVE_UP);
+				c.mood -= 6;
+				people_customer_leave(c, true);
+			}
+		} else if (c.state == CUST_LEAVING) {
+			c.next_step_at = now + 300;
+			/* A drunk who has not had enough yet does not leave: they turn round
+			   at the door and start the whole visit again, one level further in. */
+			if (c.arch == ARCH_DRUNK and c.drink_count < 3 and random(1, 100) <= 25) {
+				people_drunk_another(c, now);
+				continue;
+			}
+			if (people_step_towards(c, 4.5, 0.5)) {
+				sfx_ui(A("register.ogg"), -16.0, 700);
+				people_customer_finish(c);
+				return;
+			}
+		}
+	}
+}
+
+/* ==========================================================================
+   9.  THE B KEY: WHO IS IN THE SHOP
+   ========================================================================= */
+
+/* What one person is doing, in the words the shop uses for it. */
+string people_state_word(customer@ c) {
+	if (@c is null) return "here";
+	switch (c.state) {
+		case CUST_ARRIVING: return "on the way to " + people_face_word(c.face_target);
+		case CUST_SHOPPING: return "filling a basket at " + people_face_word(c.face_target);
+		case CUST_TO_TILL:  return "walking to the till";
+		case CUST_QUEUEING:
+		{
+			int place = 0;
+			for (uint q = 0; q < g_queue.length(); q++) if (g_queue[q] is c) place = int(q) + 1;
+			return (place == 1) ? "next at the counter" : (plural(place, "place", "places") + " back in the queue");
+		}
+		case CUST_SERVING:  return "at the counter, being served";
+		case CUST_LEAVING:  return "on the way out";
+	}
+	return "here";
+}
+
+/* A shelf face, by the aisle it is in and the side it is on. */
+string people_face_word(int face) {
+	if (face < 0 or face >= FACE_COUNT) return "a shelf";
+	return "aisle " + (face / 2 + 1) + ", " + (((face % 2) == 0) ? "west" : "east") + " side";
+}
+
+/* Anything about a person that changes what happens next. Nothing here gives a
+   shoplifter away: what a thief sounds like is a rustle at a shelf, and that is
+   the only warning the shop ever gets. */
+string people_note_word(customer@ c) {
+	string s = "";
+	if (c.on_phone) s += "on the phone";
+	if (c.drink_count > 0) s += (s.length() > 0) ? ", and well on their way" : "well on their way";
+	if (c.karen_level >= 3) s += (s.length() > 0) ? ", and making a scene" : "making a scene";
+	if (c.entourage_host.length() > 0) s += (s.length() > 0) ? ", in with the big spender" : "in with the big spender";
+	if (c.pays_for_queue) s += (s.length() > 0) ? ", and about to pay for the queue" : "about to pay for the queue";
+	return s;
+}
+
+void people_scan_occupancy() {
+	int total = 0, shopping = 0, leaving = 0, queueing = 0, on_phone = 0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (c.state == CUST_GONE) continue;
+		total++;
+		if (c.state == CUST_ARRIVING or c.state == CUST_SHOPPING) shopping++;
+		if (c.state == CUST_LEAVING) leaving++;
+		if (c.state == CUST_QUEUEING or c.state == CUST_SERVING) queueing++;
+		if (c.on_phone) on_phone++;
+	}
+	string s = "";
+	if (total == 0) {
+		s = "The shop is empty. ";
+	} else {
+		s = plural(total, "person", "people") + " in the shop, " + shopping + " of them shopping";
+		if (queueing > 0) s += ", " + queueing + " at the till or waiting for it";
+		if (on_phone > 0) s += ", " + plural(on_phone, "of them on the phone", "of them on their phones");
+		s += ". ";
+		customer@ head = people_queue_head();
+		if (@head !is null) {
+			s += "At the counter, " + head.name + ", " + people_arch_name(head.arch) + ", "
+				+ people_arch_voice(head.arch) + ", with "
+				+ plural(people_basket_lines(head), "line", "lines") + " in their basket";
+			if (people_basket_has_restricted(head)) s += ", and needs identification";
+			string note = people_note_word(head);
+			if (note.length() > 0) s += ", " + note;
+			s += ". ";
+			int behind = int(g_queue.length()) - 1;
+			if (behind > 0) s += plural(behind, "person is", "people are") + " waiting behind them. ";
+		} else if (g_queue.length() == 0) {
+			s += "Nobody is at the counter. ";
+		}
+		if (leaving > 0) s += plural(leaving, "person is", "people are") + " on their way out. ";
+		/* Where everybody is, and what they are doing there. */
+		string where = "";
+		int shown = 0;
+		for (uint i = 0; i < g_customers.length() and shown < 8; i++) {
+			customer@ c = g_customers[i];
+			if (c.state == CUST_GONE or c.state == CUST_LEAVING) continue;
+			where += c.name + ", " + people_arch_name(c.arch) + ", " + people_state_word(c) + ", "
+				+ dir_word(c.x - g_px, c.y - g_py) + ", "
+				+ tiles_away(int(dist(c.x, c.y, g_px, g_py) + 0.5));
+			string note = people_note_word(c);
+			if (note.length() > 0) where += " (" + note + ")";
+			where += ". ";
+			shown++;
+		}
+		if (where.length() > 0) s += where;
+	}
+	int dirt = mess_count_in(g_player_room);
+	if (dirt > 0) s += "There " + ((dirt == 1) ? "is " : "are ") + plural(dirt, "mess", "messes") + " on the floor in here. ";
+	say(s, true);
+}
+
+/* ==========================================================================
+   10.  SHORT CHANGE
+   ========================================================================= */
+
+void people_note_short_change(customer@ c, int amount) {
+	if (@c is null or amount <= 0) return;
+	g_shortchangers.insert_last(shortchange(c.name, amount, int(g_current_day)));
+	c.mood -= 4;
+}
+
+int people_short_change_count_this_week() {
+	int n = 0;
+	int from = int(g_current_day) - 7;
+	for (uint i = 0; i < g_shortchangers.length(); i++) {
+		if (g_shortchangers[i].day >= from and !g_shortchangers[i].settled) n++;
+	}
+	return n;
+}
+
+int people_stars_display() { return int(g_reputation + 0.5); }
+
+/* ==========================================================================
+   11.  SETUP
+   ========================================================================= */
+
+void people_init() {
+	g_customers.resize(0);
+	g_queue.resize(0);
+	g_shortchangers.resize(0);
+	g_reviews.resize(0);
+	g_regulars.resize(0);
+	g_reputation = 3.0;
+	g_visits_today = 0;
+	g_visits_window = 0;
+	log_line("people", "people module ready, reputation 3 stars");
+}

@@ -1,0 +1,3307 @@
+/* ============================================================================
+   Store Express  -  mechanics.nvgt
+   ----------------------------------------------------------------------------
+   The simulation's morning, and every screen the player talks to.
+
+     * The clock and the day cycle: Monday's truck and job applicants, Friday's
+       bill day, the market moving, your reputation being worked out, and the
+       alcohol board's unpredictable inspection.
+     * The till. Serving a customer is one page that changes under your cursor as
+       you go: fetch what is behind the counter, scan each line, ask for
+       identification, take the money, count out the change, print a receipt.
+     * The manager terminal: restock orders, prices, reports, staff, policies,
+       hours, music, insurance, loans, the declaration, the police record, and
+       renaming the shop. A terminal that has never been set up in this store
+       runs the hardware routine in hardware.nvgt first, and the store clock no
+       longer stops for either: see clock_is_paused() below.
+     * The phone: email, news and reviews.
+     * Jail, and the fast forward that eats your business while you are inside.
+     * The identification scanner and the alcohol board's fines and suspensions.
+     * Saving into one of fifteen slots.
+
+   ORDERING
+     AngelScript has no function prototypes, so this file is written strictly
+     bottom up. Globals first, then leaf helpers, then composites. If you move a
+     function, keep it above everything that calls it.
+
+   INCLUDE ORDER
+     Included last, after every other module. This is the only file allowed to
+     know about all of them at once.
+   ========================================================================= */
+
+/* ==========================================================================
+   0.  CONSTANTS, MODALS AND EVERY GLOBAL
+   ========================================================================= */
+
+class menu_page {
+	string title;
+	array<string> labels;
+	array<int> actions;
+	int index;
+	menu_page(const string&in t) { title = t; index = 0; }
+	void add(const string&in label, int action) {
+		labels.insert_last(label);
+		actions.insert_last(action);
+	}
+	int count() { return int(labels.length()); }
+}
+
+/* The screen in front of the player (MODAL_NONE, MODAL_COMPUTER and the rest)
+   is declared in core.nvgt, because hardware.nvgt takes the screen for itself
+   and is included above this file. See section 4 of core.nvgt. */
+
+/* Menu actions. Anything above ACT_DYNAMIC_BASE carries an index in the low
+   bits, which is how prices, orders and staff lists are addressed. */
+const int ACT_CLOSE              = 1;
+const int ACT_PAUSE_RESUME       = 2;
+const int ACT_PAUSE_SAVE         = 3;
+const int ACT_PAUSE_OPTIONS      = 4;
+const int ACT_PAUSE_MENU         = 5;
+const int ACT_PAUSE_QUIT         = 6;
+const int ACT_PAUSE_TTS          = 7;
+const int ACT_PAUSE_DIAG         = 8;
+const int ACT_PAUSE_SOUND        = 9;
+const int ACT_BACK               = 10;   /* one page back, not out of the screen */
+/* The speech speed of each machine. It is set on the machine's own screen, not
+   in the main menu's Options: a player who cannot follow the terminal finds that
+   out while they are reading a screen off it, and the voice that answers when
+   the setting changes is the voice it is about. */
+const int ACT_SPEED_TERM         = 11;   /* the manager terminal's own screen */
+const int ACT_SPEED_PHONE        = 12;   /* the handset's own screen */
+const int ACT_PITCH_TERM         = 13;   /* the terminal's own pitch line */
+const int ACT_PITCH_PHONE        = 14;   /* the handset's own pitch line */
+/* The start of the speech speed and pitch lines on either machine's screen. The
+   value is in the rest of the line, so this is how a page being rebuilt finds
+   the line the cursor was on rather than counting lines that come and go above
+   it. */
+const string SPEECH_LINE_PREFIX  = "Speech speed: ";
+const string PITCH_LINE_PREFIX   = "Pitch: ";
+
+/* the machine's sound output, in the pause menu. Above every other dynamic
+   family, so it cannot collide with a price, an order or an employee. */
+const int ACT_SOUND_DEVICE_BASE  = 26000;   /* + line of the device list */
+
+/* One line of a machine's Speech speed or Pitch page: the setting at that
+   position in the list. The two families are kept apart so the page the player
+   is on decides which setting is being changed, and both sit above every other
+   dynamic family. */
+const int ACT_SPEECH_SPEED_CHOICE_BASE = 27000;   /* + choice index */
+const int ACT_SPEECH_PITCH_CHOICE_BASE = 27100;   /* + choice index */
+
+/* serving */
+const int ACT_SERVE_FETCH        = 20;
+const int ACT_SERVE_SCAN_ONE     = 21;
+const int ACT_SERVE_SCAN_REST    = 22;
+const int ACT_SERVE_ASK_ID       = 23;
+const int ACT_SERVE_REFUSE_REST  = 24;
+const int ACT_SERVE_CARD         = 25;
+const int ACT_SERVE_CASH_EXACT   = 26;
+const int ACT_SERVE_CASH_ROUND   = 27;
+const int ACT_SERVE_COUNT_CHANGE = 28;
+const int ACT_SERVE_FINISH       = 29;
+const int ACT_SERVE_WALK_AWAY    = 30;
+const int ACT_SERVE_SELL_COVERS  = 31;
+const int ACT_SERVE_REFUSE_SALE  = 32;
+const int ACT_SERVE_CASH_WALLET  = 33;
+const int ACT_SERVE_FREE_DRINK   = 34;
+
+/* computer: top level */
+const int ACT_COMP_RESTOCK       = 40;
+const int ACT_COMP_DAMAGE        = 41;
+const int ACT_COMP_BILLS         = 42;
+const int ACT_COMP_REPORTS       = 43;
+const int ACT_COMP_PRICES        = 44;
+const int ACT_COMP_STAFF         = 45;
+const int ACT_COMP_POLICIES      = 46;
+const int ACT_COMP_HOURS         = 47;
+const int ACT_COMP_MUSIC         = 48;
+const int ACT_COMP_RENAME        = 49;
+const int ACT_COMP_LAW           = 50;
+const int ACT_COMP_LOGOFF        = 51;
+
+/* computer: restock */
+const int ACT_ORDER_FILL_ALL     = 60;
+const int ACT_ORDER_REVIEW       = 61;
+const int ACT_ORDER_PLACE        = 62;
+const int ACT_ORDER_CLEAR        = 63;
+const int ACT_ORDER_PLACED       = 64;
+const int ACT_ORDER_FACE_BASE    = 2000;   /* + face */
+const int ACT_ORDER_CANCEL_BASE  = 3000;   /* + order index */
+
+/* computer: bills */
+const int ACT_BANK_PAY_ARREARS   = 70;
+const int ACT_BANK_PNL_WEEK      = 71;
+const int ACT_BANK_PNL_LAST      = 72;
+const int ACT_BANK_BILL_LIST     = 73;
+const int ACT_BANK_INSURANCE     = 74;
+const int ACT_BANK_LOANS         = 75;
+const int ACT_BANK_DECLARE       = 76;
+const int ACT_INS_NONE           = 80;
+const int ACT_INS_BASIC          = 81;
+const int ACT_INS_HALF           = 82;
+const int ACT_INS_ALL            = 83;
+const int ACT_LOAN_TAKE_BASE     = 4000;   /* + slot: 0,1,2 */
+const int ACT_LOAN_PAYOFF_BASE   = 5000;   /* + loan index */
+const int ACT_EMERGENCY_LOAN     = 77;
+const int ACT_DECLARE_BASE       = 6000;   /* + percentage */
+
+/* computer: reports */
+const int ACT_REP_TILL           = 90;
+const int ACT_REP_SALES          = 91;
+const int ACT_REP_LEVELS         = 92;
+const int ACT_REP_EMPTY          = 93;
+const int ACT_REP_SPEND          = 94;
+const int ACT_REP_BESTWORST      = 95;
+const int ACT_REP_MARKET         = 96;
+const int ACT_REP_AISLES         = 97;
+
+/* computer: prices */
+const int ACT_PRICE_FACE_BASE    = 7000;   /* + face */
+const int ACT_PRICE_PROD_BASE    = 10000;  /* + product index */
+const int ACT_PRICE_UP5          = 13000;
+const int ACT_PRICE_UP25         = 13001;
+const int ACT_PRICE_DOWN5        = 13002;
+const int ACT_PRICE_DOWN25       = 13003;
+const int ACT_PRICE_FAIR         = 13004;
+const int ACT_PRICE_FACE_UP5     = 13005;
+const int ACT_PRICE_FACE_UP10    = 13006;
+const int ACT_PRICE_FACE_DOWN5   = 13007;
+const int ACT_PRICE_FACE_DOWN10  = 13008;
+const int ACT_PRICE_FACE_FAIR    = 13009;
+const int ACT_PRICE_ALL_FAIR     = 13010;
+
+/* computer: staff */
+const int ACT_STAFF_POSITIONS    = 110;
+const int ACT_STAFF_LIST         = 111;
+const int ACT_STAFF_APPLICANTS   = 112;
+const int ACT_STAFF_OPEN_BASE    = 15000;  /* + role */
+const int ACT_STAFF_CLOSE_BASE   = 15500;  /* + role */
+const int ACT_STAFF_EMP_BASE     = 16000;  /* + employee index */
+const int ACT_STAFF_APPL_BASE    = 17000;  /* + applicant index */
+const int ACT_STAFF_HIRE_BASE    = 17500;  /* + applicant index */
+const int ACT_STAFF_FIRE_BASE    = 18000;  /* + employee index */
+const int ACT_STAFF_RAISE_BASE   = 18500;  /* + employee index */
+const int ACT_STAFF_CUT_BASE     = 19000;  /* + employee index */
+const int ACT_STAFF_ROTA_M_BASE  = 19500;  /* + employee index */
+const int ACT_STAFF_ROTA_E_BASE  = 20000;  /* + employee index */
+const int ACT_STAFF_ROTA_N_BASE  = 20500;  /* + employee index */
+const int ACT_STAFF_GRANT_BASE   = 21000;  /* + employee index */
+const int ACT_STAFF_REFUSE_BASE  = 21500;  /* + employee index */
+
+/* computer: policy, hours, music */
+const int ACT_POLICY_DRINKS      = 120;
+const int ACT_HOURS_TOGGLE       = 121;
+const int ACT_MUSIC_TOGGLE       = 122;
+const int ACT_MUSIC_SCAN         = 123;
+const int ACT_MUSIC_SHUFFLE      = 124;
+const int ACT_MUSIC_NEXT         = 125;
+const int ACT_MUSIC_PREV         = 132;   /* 130 and 131 are rename */
+const int ACT_MUSIC_UP           = 126;
+const int ACT_MUSIC_DOWN         = 127;
+const int ACT_MUSIC_SUB_UP       = 128;
+const int ACT_MUSIC_SUB_DOWN     = 129;
+const int ACT_RENAME             = 130;
+const int ACT_RENAME_CONFIRM     = 131;
+
+/* damage, insurance claims */
+const int ACT_REPAIR_ALL         = 140;
+const int ACT_CLAIM_STOCK        = 141;
+
+/* sleep, phone, issues */
+const int ACT_SLEEP              = 150;
+const int ACT_PHONE_EMAIL        = 151;
+const int ACT_PHONE_NEWS         = 152;
+const int ACT_PHONE_REVIEWS      = 153;
+const int ACT_ISSUE_AUDIO        = 160;
+const int ACT_ISSUE_CLOCK        = 161;
+const int ACT_ISSUE_MAP          = 162;
+const int ACT_ISSUE_OTHER        = 163;
+/* menu, load and new game */
+const int ACT_MENU_NEW           = 180;
+const int ACT_MENU_LOAD          = 181;
+const int ACT_MENU_EXIT          = 182;
+const int ACT_SLOT_BASE          = 22000;  /* + slot */
+
+array<menu_page@> g_menu;
+int  g_last_action = 0;
+bool g_game_mode = false;        /* false while the main menu is up */
+bool request_quit = false;
+
+/* ---- shop identity and policy ------------------------------------------ */
+string g_store_name = "Store Express";
+bool   g_renamed = false;
+int    g_drinks_self_serve = 1;  /* 1 self serve, 0 employee serve */
+bool   g_tv_on = true;
+
+/* ---- the till's paperwork ---------------------------------------------- */
+int   g_restricted_sales = 0;
+int   g_unscanned_sales = 0;
+int   g_id_scans_logged = 0;
+bool  g_licence_suspended = false;
+int   g_suspension_weeks_left = 0;
+int   g_bad_inspections = 0;
+int   g_inspection_day = 0;
+int   g_inspection_hour = 0;
+int   g_inspection_due_day = 0;
+int   g_fines_from_board = 0;
+
+/* ---- short change -------------------------------------------------------- */
+int g_short_change_events = 0;
+
+/* ---- jail ---------------------------------------------------------------- */
+bool   g_in_jail = false;
+int    g_jail_days_total = 0;
+int    g_jail_days_served = 0;
+bool   g_jail_blackout = false;
+int    g_jail_lost_staff = 0;
+int    g_jail_lost_cash = 0;
+uint   g_jail_next_step = 0;
+
+/* ---- music and the shop's speakers ---------------------------------------
+   The music is off when a shop starts and is switched on from the office
+   computer, which is how the reference game does it. The tracks are loose
+   files rather than being baked in:
+
+     sounds/music   the player's own tracks, scanned first
+     assets/music   what the shop ships: four public domain ragtime recordings
+                    from Wikimedia Commons and three instrumentals written for
+                    this project
+     music          anything dropped next to the exe
+
+   Playback goes through the ceiling speakers in audio.nvgt, so the music is a
+   sound source in room space and the room isolation table takes it away when
+   you walk out of earshot of the speakers. Walking into the cooler or the
+   office is therefore enough to stop hearing the shop's music. */
+bool   g_music_on = false;
+int    g_music_volume = 100;      /* percent; 100 is the recording as it came */
+int    g_sub_volume = 0;
+bool   g_music_shuffle = false;
+array<string> g_music_tracks;     /* full paths, so several folders can feed it */
+int    g_music_track = 0;
+string g_music_now = "";          /* what the speakers are playing */
+string g_music_special = "";      /* "chase" or "fight" while one of those plays */
+int    g_music_resume_track = -1; /* the track to go back to afterwards */
+bool   g_music_was_on = false;    /* whether the shop's music was on before it */
+
+/* ---- saving -------------------------------------------------------------- */
+int    g_slot = 1;
+uint   g_last_world_tick = 0;
+int    g_last_day_seen = 1;
+uint   g_day_ms_accum = 0;
+int    g_bank = 0;
+int    g_last_thief_loss = 0;
+uint   g_next_cashier_serve = 0;
+int    g_price_face = -1;
+int    g_price_product = -1;
+
+/* ==========================================================================
+   1.  LEAF HELPERS
+   ========================================================================== */
+
+/* Which screens stop the store clock.
+
+   The manager terminal is NOT one of them, and that is deliberate. The shop is
+   a real place with a real day: reading the reports, working out an order or
+   watching a device install itself does not stop customers walking in or the
+   afternoon passing. Only the screens that are the game talking rather than the
+   world turning, the pause menu and the sleep prompt, hold the clock still. */
+bool clock_is_paused() {
+	return g_modal == MODAL_PAUSE
+		or g_modal == MODAL_PHONE
+		or g_modal == MODAL_ISSUES;
+}
+
+bool till_usable() {
+	return !g_in_jail and !g_game_over and !g_licence_suspended;
+}
+
+array<string> g_emails;
+array<string> g_news;
+
+void email_add(const string&in from, const string&in subject) {
+	g_emails.insert_last(from + " | " + subject);
+	if (g_emails.length() > 40) g_emails.remove_at(0);
+	sfx_ui(A("register.ogg"), -14.0, 700);
+	diag("phone", "email from " + from + ": " + subject);
+}
+
+void news_add(const string&in headline) {
+	g_news.insert_last("Day " + g_current_day + " | " + headline);
+	if (g_news.length() > 40) g_news.remove_at(0);
+}
+
+/* Small readings that the menu pages ask for. They live up here because the
+   pages that use them are defined further down, and AngelScript has no
+   prototypes: a function must exist before the line that calls it. */
+bool g_products_delivered_today() { return false; }
+int trouble_short_changeable() { return people_short_change_count_this_week(); }
+
+int shop_draft_lines() {
+	int n = 0;
+	for (uint i = 0; i < g_draft_qty.length(); i++) if (g_draft_qty[i] > 0) n++;
+	return n;
+}
+
+int shop_draft_total_estimate_fill() {
+	int total = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		int want = p.capacity - p.stock;
+		if (want > 0) total += p.cost * want;
+	}
+	return total;
+}
+
+int staff_rota_shift_count_of(applicant@ a) {
+	if (@a is null) return 0;
+	int n = 0;
+	for (uint d = 0; d < a.rota.length(); d++) if (a.rota[d] != SHIFT_OFF) n++;
+	return n;
+}
+
+/* ==========================================================================
+   2.  MENU PRIMITIVES
+   ========================================================================== */
+
+/* Which machine, if any, owns the screen in front of the player. -1 means the
+   screen is the player's own: the register, the pause menu, the issue reporter
+   and everything on the shop floor. The terminal and the phone are the two
+   machines with a chip in them, and when one of them is what the player is
+   using, that chip is what speaks. */
+int machine_for_modal() {
+	if (g_modal == MODAL_COMPUTER) return HW_DEVICE_TERMINAL;
+	if (g_modal == MODAL_PHONE) return HW_DEVICE_PHONE;
+	return -1;
+}
+
+/* A machine's screen moves like the player's own voice does: the line the cursor
+   leaves stops before the line it lands on is read. The player's channel gets
+   this from say(), which interrupts; a chip line is queued, so without this the
+   machine would still be finishing the last line while the new one waited its
+   turn. Nothing is cut when the screen belongs to the player: their voice is
+   already interrupting itself. */
+void machine_chip_cut() {
+	int machine = machine_for_modal();
+	if (machine >= 0) chip_stop_device(machine);
+}
+
+/* The machine switching on or off: a short chime of its own, played in the room
+   the machine is in, or in the player's own head for the phone they carry. It is
+   not speech, so it does not go through the chip or the voice pool; it is here
+   because a screen that appears with no sound at all reads as a glitch rather
+   than as a machine. */
+void machine_power_sound(int device, bool on) {
+	if (device < 0 or !g_power_on) return;
+	string cue;
+	if (device == CHIP_DEVICE_PHONE) cue = on ? A("tech_phone_on.wav") : A("tech_phone_off.wav");
+	else cue = on ? A("tech_terminal_on.wav") : A("tech_terminal_off.wav");
+	sfx_ui(cue, -4.0);
+}
+
+/* One line of a menu, in the voice that owns the screen: a machine's own chip
+   when a machine is what the player is using, and the player's voice for
+   everything else. Every line a menu says goes through here, so a screen cannot
+   end up half read by the screen reader and half by the machine. */
+void menu_line_spoken(const string&in text) {
+	int machine = machine_for_modal();
+	if (machine >= 0) { machine_chip_line(machine, text); return; }
+	say(text, true);
+}
+
+void menu_speak_current(bool with_title) {
+	if (g_menu.length() == 0) return;
+	/* A machine's line is queued rather than interrupting, so the line the cursor
+	   has just left has to be dropped here or it plays on over the new one. */
+	machine_chip_cut();
+	menu_page@ p = g_menu[g_menu.length() - 1];
+	if (p.count() == 0) { menu_line_spoken(p.title + ". Nothing is available here."); return; }
+	string prefix = with_title ? (p.title + ". ") : "";
+	string tail = " " + (p.index + 1) + " of " + p.count() + ".";
+	if (p.count() == 1) tail = "";
+	menu_line_spoken(prefix + p.labels[p.index] + tail);
+}
+
+int current_action() {
+	if (g_menu.length() == 0) return ACT_CLOSE;
+	menu_page@ p = g_menu[g_menu.length() - 1];
+	if (p.count() == 0) return ACT_CLOSE;
+	return p.actions[p.index];
+}
+
+/* Leaving the sound output list without confirming: the game goes back onto the
+   device it came in on, and nothing is written. Cheap when nothing is on trial,
+   which is why it is the first line of every Back and every close. */
+void device_trial_release() {
+	if (!out_device_on_trial()) return;
+	device_test_sweep_stop();
+	out_device_trial_abandon();
+}
+
+void mechanics_close_modal() {
+	if (g_modal != MODAL_NONE) diag("modal", "closing modal " + g_modal);
+	device_trial_release();
+	g_menu.resize(0);
+	g_modal = MODAL_NONE;
+	/* Whoever was speaking is done speaking, so the next line is the player's own
+	   channel again. */
+	voice_clear();
+}
+
+void menu_back() {
+	if (g_menu.length() == 0) { mechanics_close_modal(); return; }
+	device_trial_release();
+	g_menu.remove_last();
+	if (g_menu.length() == 0) { mechanics_close_modal(); return; }
+	sfx_tick();   /* a tick, not the whole sweep */
+	menu_speak_current(true);
+}
+
+void menu_push(menu_page@ page) {
+	g_menu.insert_last(page);
+	menu_speak_current(true);
+}
+
+/* Swap the page the player is on for a freshly built one, leaving the cursor on
+   the line whose label starts with the prefix it was on before. A machine's own
+   screen changes under the player when they change one of its settings, and the
+   lines above the one they are on come and go with the shop (the terminal's own
+   home page gains a damage line when something is broken), so the cursor is
+   found by name rather than by counting. Nothing is spoken: whatever changed the
+   page has already answered, and the next move of the cursor reads the new
+   line. */
+void menu_replace_current(menu_page@ page, const string&in prefix) {
+	if (g_menu.length() == 0) { g_menu.insert_last(page); return; }
+	g_menu[g_menu.length() - 1] = page;
+	menu_page@ now = g_menu[g_menu.length() - 1];
+	for (int i = 0; i < now.count(); i++) {
+		if (now.labels[uint(i)].find_first(prefix) == 0) { now.index = i; return; }
+	}
+}
+
+/* ==========================================================================
+   3.  THE IDENTIFICATION SCANNER AND THE ALCOHOL BOARD
+   ========================================================================= */
+
+void log_id_scan(const string&in item) {
+	g_id_scans_logged++;
+	sfx_ui(A("id_card.ogg"), -3.0);
+	diag("board", "ID scanner read for " + item + ", scan " + g_id_scans_logged);
+}
+
+void board_note_sale(bool restricted, bool id_scanned) {
+	if (!restricted) return;
+	g_restricted_sales++;
+	if (!id_scanned) {
+		g_unscanned_sales++;
+		log_line("board", "restricted sale with no ID scan, " + g_unscanned_sales + " so far");
+	}
+}
+
+/* Once a month, on a day and at an hour nobody can predict, an inspector comes
+   to the till and reads the log. */
+void board_schedule_inspection() {
+	g_inspection_due_day = int(g_current_day) + random(14, 28);
+	g_inspection_hour = random(8, 21);
+	diag("board", "next inspection scheduled for day " + g_inspection_due_day);
+}
+
+void board_run_inspection() {
+	if (g_licence_suspended) {
+		say("The alcohol board's inspector comes to the till, and finds your licence is already suspended. "
+			+ "They write that down too.", true);
+		return;
+	}
+	if (g_unscanned_sales == 0) {
+		say("An inspector from the alcohol board comes to the till and reads the log. "
+			+ "Every restricted sale has a scan against it. They thank you, and leave. "
+			+ "Nothing to answer.", true);
+		sfx_ui(A("register.ogg"), -10.0, 700);
+		log_line("board", "clean inspection");
+	} else {
+		int fine = g_unscanned_sales * 50000;
+		int sales = g_unscanned_sales;
+		g_unscanned_sales = 0;
+		g_bad_inspections++;
+		g_fines_from_board += fine;
+		sfx_ui(A("siren.ogg"), -12.0);
+		say("An inspector from the alcohol board comes to the till and reads the log. "
+			+ plural(sales, "sale", "sales") + " of alcohol, tobacco or vapes went through with no "
+			+ "identification scan against it. That is " + money(fine) + " in fines, "
+			+ "and it is collected on bill day.", true);
+		if (g_bad_inspections >= 3) {
+			g_licence_suspended = true;
+			g_suspension_weeks_left = 12;
+			say("That is your third bad inspection, so your licence to sell alcohol, tobacco and vapes "
+				+ "is suspended for three months. The lines stay on the shelves, but nobody can buy them, "
+				+ "and you cannot order any more. Any bad inspection after this loses the licence for good.", true);
+			log_line("board", "licence suspended");
+		}
+		log_line("board", "bad inspection, fine " + money(fine));
+	}
+	g_restricted_sales = 0;
+}
+
+void board_check_inspection() {
+	if (g_inspection_due_day == 0) return;
+	if (int(g_current_day) < g_inspection_due_day) return;
+	if (int(g_current_hour) < g_inspection_hour) return;
+	if (int(g_current_hour) > g_inspection_hour + 1) return;
+	board_run_inspection();
+	board_schedule_inspection();
+}
+
+void board_run_inspection_forced() { board_run_inspection(); }
+
+/* ==========================================================================
+   4.  THE TILL: SERVING A CUSTOMER
+   ========================================================================= */
+
+customer@ g_sale_customer = null;
+array<int> g_sale_line;      /* catalogue indices, in basket order */
+array<int> g_sale_qty;
+array<int> g_sale_scanned;   /* 0 not scanned, 1 scanned, 2 refused */
+int  g_sale_total = 0;
+bool g_sale_id_needed = false;
+bool g_sale_id_checked = false;
+bool g_sale_card = false;
+int  g_sale_offered = 0;
+int  g_sale_drink_cost = 0;   /* a drink was poured and charged before the lines */
+int  g_sale_change_due = 0;
+bool g_sale_change_given = false;
+bool g_sale_active = false;
+
+void sale_reset() {
+	@g_sale_customer = null;
+	g_sale_line.resize(0);
+	g_sale_qty.resize(0);
+	g_sale_scanned.resize(0);
+	g_sale_total = 0;
+	g_sale_id_needed = false;
+	g_sale_id_checked = false;
+	g_sale_card = false;
+	g_sale_offered = 0;
+	g_sale_drink_cost = 0;
+	g_sale_change_due = 0;
+	g_sale_change_given = false;
+	g_sale_active = false;
+}
+
+int sale_restricted_remaining() {
+	int n = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		product@ p = product_at(g_sale_line[i]);
+		if (@p !is null and p.restricted and g_sale_scanned[i] != 2) n++;
+	}
+	return n;
+}
+
+int sale_behind_counter_remaining() {
+	int n = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		product@ p = product_at(g_sale_line[i]);
+		if (@p !is null and p.face == FACE_COUNTER and g_sale_scanned[i] == 0) n++;
+	}
+	return n;
+}
+
+bool sale_all_scanned() {
+	for (uint i = 0; i < g_sale_line.length(); i++) if (g_sale_scanned[i] == 0) return false;
+	return true;
+}
+
+int sale_unscanned_count() {
+	int n = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) if (g_sale_scanned[i] == 0) n++;
+	return n;
+}
+
+void sale_recompute_total() {
+	int total = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		if (g_sale_scanned[i] != 1) continue;
+		product@ p = product_at(g_sale_line[i]);
+		if (@p is null) continue;
+		total += p.price * g_sale_qty[i];
+	}
+	g_sale_total = total;
+}
+
+void sale_fetch_counter() {
+	/* Bring the restricted goods out of the cabinet. Stock comes off the cabinet
+	   shelf, not the aisle. */
+	int fetched = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		product@ p = product_at(g_sale_line[i]);
+		if (@p is null or p.face != FACE_COUNTER or g_sale_scanned[i] != 0) continue;
+		fetched++;
+	}
+	if (fetched == 0) { say("Nothing here comes from behind the counter.", true); return; }
+	sfx_ui(A("door_open.ogg"), -12.0);
+	say("You fetch " + plural(fetched, "line", "lines") + " from behind the counter and put them on the mat.", true);
+	/* Mark them as fetched by leaving them unscanned but recording the trip. */
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		product@ p = product_at(g_sale_line[i]);
+		if (@p is null or p.face != FACE_COUNTER or g_sale_scanned[i] != 0) continue;
+		g_sale_scanned[i] = 0;
+	}
+	/* A flag so the page stops offering it. */
+	g_sale_offered = 1;
+}
+
+void sale_scan_index(int i, bool quiet) {
+	if (i < 0 or uint(i) >= g_sale_line.length()) return;
+	if (g_sale_scanned[i] == 2) return;
+	product@ p = product_at(g_sale_line[i]);
+	if (@p is null) return;
+	if (p.stock <= 0) {
+		say(p.name + " is out of stock, so it comes off the basket.", true);
+		g_sale_scanned[i] = 2;
+		return;
+	}
+	int qty = g_sale_qty[i];
+	if (qty > p.stock) qty = p.stock;
+	int take = qty * p.price;
+	shop_sell(g_sale_line[i], qty);
+	g_sale_scanned[i] = 1;
+	g_sale_total += take;
+	sfx_ui(A("scanner.ogg"), -8.0);
+	if (!quiet) {
+		say(p.name + ", " + money(p.price) + " each, " + plural(qty, "unit", "units")
+			+ ". The running total is " + money(g_sale_total) + ".", false);
+	}
+}
+
+/* A receipt prints after every sale, and about half of the customers wave it
+   away. Kept as its own function so the two halves are visible apart. */
+bool sale_waves_receipt() { return random(1, 100) <= 50; }
+
+void sale_finish(bool paid) {
+	customer@ c = g_sale_customer;
+	if (@c !is null) {
+		c.served = true;
+		c.bought = paid;
+		c.spent = g_sale_total;
+		c.id_checked = g_sale_id_checked;
+		c.state = CUST_LEAVING;
+		/* Take them out of the queue and send them to the door. */
+		for (int i = int(g_queue.length()) - 1; i >= 0; i--) if (g_queue[i] is c) g_queue.remove_at(uint(i));
+		if (paid) {
+			people_event(c, EV_SERVED);
+			if (g_sale_id_checked) people_event(c, EV_ID_ASKED);
+			/* A drink that was charged for has been drunk, and a drunk who drinks
+			   is further in than they were when they came in. */
+			if (c.wants_drink and g_sale_drink_cost > 0) people_drink_count_add(c);
+			sfx_ui(A("register.ogg"), -8.0);
+			/* A receipt prints after the sale, and about half of them wave it
+			   away. It matters to the one in ten who comes back about their
+			   change, which is the whole point of a receipt. */
+			c.waved_receipt = sale_waves_receipt();
+			say("The drawer opens and the sale is rung up. A receipt prints, and " + c.name + " "
+				+ (c.waved_receipt ? "waves it away" : "folds it into a pocket")
+				+ ", takes their bag and heads for the door. That is " + money(g_sale_total) + ".", true);
+			email_add("The till", "Sale of " + money(g_sale_total));
+		} else {
+			say(c.name + " leaves with nothing.", true);
+		}
+	}
+	sale_reset();
+	mechanics_close_modal();
+}
+
+void sale_money_in(int cents, bool from_card) {
+	if (cents <= 0 and from_card) {
+		/* A card sale needs no change. */
+	}
+	money_earn(cents);
+	g_wk_customers++;
+	board_note_sale(false, g_sale_id_checked);
+}
+
+/* Take the money. A card never opens the drawer, and can be declined. */
+void sale_take_card() {
+	sfx_ui(A("id_card.ogg"), -6.0);
+	if (random(1, 100) <= 6) {
+		sfx_ui(A("knock.wav"), -10.0);
+		say("The card is declined.", true);
+		/* They either pay cash instead, or have nothing else. */
+		if (random(1, 100) <= 55) {
+			g_sale_offered = 1;      /* now offering cash */
+			say("They dig around and find cash instead. Take it.", true);
+			return;
+		}
+		say("They have nothing else on them. The sale is off, and the goods go back on the shelves.", true);
+		customer@ c = g_sale_customer;
+		for (uint i = 0; i < g_sale_line.length(); i++) {
+			if (g_sale_scanned[i] != 1) continue;
+			product@ p = product_at(g_sale_line[i]);
+			if (@p is null) continue;
+			p.stock += g_sale_qty[i];
+		}
+		if (@c !is null) c.mood -= 3;
+		sale_finish(false);
+		return;
+	}
+	g_sale_card = true;
+	sale_money_in(g_sale_total, true);
+	say("The card goes through for " + money(g_sale_total) + ". Nothing to count out, and the drawer stays shut.", true);
+	sale_finish(true);
+}
+
+void sale_take_cash(int offered) {
+	g_sale_card = false;
+	g_sale_offered = offered;
+	g_sale_change_due = offered - g_sale_total;
+	if (g_sale_change_due < 0) g_sale_change_due = 0;
+	sfx_ui(A("coins.ogg"), -6.0);
+	if (g_sale_change_due == 0) {
+		sale_money_in(offered, false);
+		say("The exact money, " + money(offered) + ". The drawer opens.", true);
+		sale_finish(true);
+		return;
+	}
+	say("You take " + money(offered) + ", and you owe " + money(g_sale_change_due) + " in change.", true);
+	/* The page now offers to count the change out. */
+	g_sale_change_given = false;
+}
+
+string sale_change_page_text() {
+	return "You owe " + money(g_sale_change_due) + " in change";
+}
+
+void sale_count_change() {
+	if (g_sale_change_due <= 0) return;
+	sfx_ui(A("coins.ogg"), -4.0);
+	say("You count " + money(g_sale_change_due) + " across the counter. The customer takes it and goes.", true);
+	g_sale_change_given = true;
+	/* Their note goes in the drawer and the change comes back out of it, so the
+	   drawer is up by the sale, not by what they handed over. */
+	sale_money_in(g_sale_total, false);
+	sale_finish(true);
+}
+
+/* ---- when the money in their hand does not cover the basket ---------------
+   Everybody walks in with a wallet and some wallets are thinner than the basket,
+   which is the reference game's arrangement. Nothing here stops the sale: the
+   till offers what is actually possible, and every one of them leaves a mark on
+   the customer to remember. */
+
+/* What they can actually put on the counter, and how far short that leaves
+   them. The drink was poured and charged when the sale opened, so it is part of
+   what they owe. */
+int sale_wallet_cash() {
+	customer@ c = g_sale_customer;
+	if (@c is null) return g_sale_total + g_sale_drink_cost;
+	return (c.wallet < (g_sale_total + g_sale_drink_cost)) ? c.wallet : (g_sale_total + g_sale_drink_cost);
+}
+
+bool sale_wallet_covers_all() {
+	customer@ c = g_sale_customer;
+	if (@c is null) return true;
+	return c.wallet >= (g_sale_total + g_sale_drink_cost);
+}
+
+int sale_wallet_short_by() {
+	int due = g_sale_total + g_sale_drink_cost;
+	int cash = sale_wallet_cash();
+	return (cash >= due) ? 0 : (due - cash);
+}
+
+/* Take everything they have and let the rest go, telling them how much short it
+   left and how much you are letting them off. */
+void sale_take_short_payment() {
+	customer@ c = g_sale_customer;
+	if (@c is null) return;
+	if (sale_wallet_covers_all()) { sale_take_cash(g_sale_total); return; }
+	int cash = sale_wallet_cash();
+	int short_by = sale_wallet_short_by();
+	c.could_not_pay = true;
+	c.short_paid += short_by;
+	c.mood -= 3;
+	people_event(c, EV_COULD_NOT_PAY);
+	people_drunk_no_drink(c);
+	money_earn(cash);
+	g_wk_customers++;
+	board_note_sale(false, g_sale_id_checked);
+	say("You take " + money(cash) + ", which is everything they have. That leaves "
+		+ money(short_by) + " short, and it is yours to write off. " + c.name
+		+ " knows it, and will remember it.", true);
+	sale_finish(true);
+}
+
+/* Sell only the lines their money covers: the dearest lines come off the bill
+   and go back on the shelf until the rest fits in the wallet. */
+void sale_sell_covers() {
+	customer@ c = g_sale_customer;
+	if (@c is null) return;
+	int budget = c.wallet;
+	int left_off = 0;
+	bool again = true;
+	while (again and (g_sale_total + g_sale_drink_cost) > budget) {
+		again = false;
+		int worst = -1, worst_line = 0;
+		for (uint i = 0; i < g_sale_line.length(); i++) {
+			if (g_sale_scanned[i] != 1) continue;
+			product@ p = product_at(g_sale_line[i]);
+			if (@p is null) continue;
+			int line_total = p.price * g_sale_qty[i];
+			if (line_total > worst_line) { worst_line = line_total; worst = int(i); }
+		}
+		if (worst < 0) break;
+		product@ p = product_at(g_sale_line[worst]);
+		if (@p !is null) {
+			/* One unit at a time, so three of something becomes two rather than
+			   nothing at all, and the figures follow the shelf. */
+			shop_unsell(g_sale_line[worst], 1);
+			g_sale_qty[worst] -= 1;
+			left_off += p.price;
+			if (g_sale_qty[worst] <= 0) g_sale_scanned[worst] = 2;   /* off the bill */
+			sale_recompute_total();
+			again = true;
+		}
+	}
+	c.mood -= 1;
+	if (left_off <= 0) {
+		say("Nothing has to come off: their money covers the basket after all.", true);
+		return;
+	}
+	say("You put " + money(left_off) + " of it back on the shelves and ring up "
+		+ money(g_sale_total) + ", which is what they can pay. That leaves them "
+		+ money(sale_wallet_short_by()) + " short of the whole basket.", true);
+}
+
+/* The drink has already been poured and cannot go back, so this gives it away
+   and takes it off the till. */
+void sale_free_drink() {
+	customer@ c = g_sale_customer;
+	if (@c is null or !c.wants_drink or g_sale_drink_cost <= 0) {
+		say("There is no drink in this sale.", true);
+		return;
+	}
+	g_cash -= g_sale_drink_cost;
+	if (g_cash < 0) g_cash = 0;
+	c.short_paid += g_sale_drink_cost;
+	c.mood += 1;
+	say("The " + ((c.drink_kind == 0) ? "coffee" : "fountain drink") + " has already been poured, "
+		+ "so it cannot go back on the shelf. You let them have it for nothing.", true);
+	g_sale_drink_cost = 0;
+}
+
+/* Refuse the whole sale: everything goes back and they leave with nothing. */
+void sale_refuse_sale() {
+	customer@ c = g_sale_customer;
+	if (@c is null) return;
+	int restocked = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		if (g_sale_scanned[i] != 1) continue;
+		product@ p = product_at(g_sale_line[i]);
+		if (@p is null) continue;
+		p.stock += g_sale_qty[i];
+		restocked += g_sale_qty[i];
+	}
+	c.could_not_pay = true;
+	c.mood -= 4;
+	people_event(c, EV_COULD_NOT_PAY);
+	people_drunk_no_drink(c);
+	say("You refuse the sale. " + plural(restocked, "item goes", "items go") + " back on the shelves, and "
+		+ c.name + " leaves with nothing.", true);
+	sale_finish(false);
+}
+
+/* Somebody walks away mid sale. That is how short change happens. */
+void sale_walk_away() {
+	customer@ c = g_sale_customer;
+	if (@c !is null) {
+		if (!g_sale_change_given and g_sale_change_due > 0 and !g_sale_card) {
+			people_note_short_change(c, g_sale_change_due);
+			g_short_change_events++;
+			g_sale_offered = 0;
+			say("You step away from the till without counting out " + money(g_sale_change_due)
+				+ ". You have short changed " + c.name + ", and they will remember.", true);
+			g_cash -= 0;
+			/* You keep money you should have given back. The till is not
+			   credited, because the sale is not settled. */
+			g_sale_change_due = 0;
+		} else {
+			say("You step away from the till. The sale is left where it is.", true);
+		}
+	}
+	sale_reset();
+	mechanics_close_modal();
+}
+
+void sale_open() {
+	customer@ c = people_queue_head();
+	if (@c is null) {
+		say("There is nobody at the counter. The till keeps itself up to date, so it will notice when somebody walks up.", true);
+		return;
+	}
+	sale_reset();
+	g_sale_active = true;
+	@ g_sale_customer = c;
+	c.state = CUST_SERVING;
+	/* Everything said over the counter from here until the sale closes belongs to
+	   the customer standing in front of you. */
+	voice_use(c.voice);
+	/* Copy their basket. */
+	for (uint i = 0; i < c.basket.length(); i++) {
+		g_sale_line.insert_last(c.basket[i]);
+		g_sale_qty.insert_last(c.basket_qty[i]);
+		g_sale_scanned.insert_last(0);
+	}
+	/* Everybody walks in with a wallet. If the basket was filled off a shelf this
+	   was counted then; a customer handed a basket another way gets counted here,
+	   so no sale can happen without knowing what the person in front of you can
+	   actually pay. */
+	if (!c.wallet_known) { c.wallet = people_wallet_for(c); c.wallet_known = true; }
+	g_sale_id_needed = people_basket_has_restricted(c);
+	if (c.wants_drink) {
+		/* A coffee or a fountain drink, served before the rest. */
+		int table_cost = (c.drink_kind == 0) ? 250 : 200;
+		g_sale_drink_cost = table_cost;
+		money_earn(table_cost);
+		sfx_at(ROOM_SHOP, 1.5, 8.5, 0.0, A("pump.mp3"), -14.0);
+		say("They also want a " + ((c.drink_kind == 0) ? "coffee" : "fountain drink") + ". "
+			+ ((g_drinks_self_serve == 1) ? "They pour it themselves." : "You pour it for them.") + " "
+			+ money(table_cost) + " has gone on the bill.", true);
+	}
+	sfx_ui(A("register.ogg"), -16.0, 700);
+	string s = c.name + ", " + people_arch_name(c.arch) + ", at the counter with "
+		+ plural(people_basket_lines(c), "line", "lines") + " in their basket.";
+	if (g_sale_id_needed) s += " Something in there is age restricted, so it needs an identification scan.";
+	if (c.wants_drink) s += " They want a drink as well.";
+	/* A regular says what they remember about last time before anything else. */
+	string memory = people_regular_line(c);
+	if (memory.length() > 0) s += " " + memory;
+	say(s, true);
+	/* The serving page itself is built by the caller, so that this file stays in
+	   strict bottom up order. */
+}
+
+/* ==========================================================================
+   5.  THE SERVING PAGE
+   ========================================================================== */
+
+void sale_page_build() {
+	if (!g_sale_active) return;
+	g_modal = MODAL_REGISTER;
+	menu_page@ p = menu_page("Serving " + ((@g_sale_customer !is null) ? g_sale_customer.name : "a customer")
+		+ ", total so far " + money(g_sale_total));
+
+	int behind = sale_behind_counter_remaining();
+	if (behind > 0 and g_sale_offered != 1) {
+		p.add("Get " + plural(behind, "line", "lines") + " from behind the counter first", ACT_SERVE_FETCH);
+		menu_push(p);
+		return;
+	}
+	if (!sale_all_scanned()) {
+		p.add("Scan the next line", ACT_SERVE_SCAN_ONE);
+		int rest = sale_unscanned_count();
+		if (rest > 1) p.add("Scan the rest of the basket, " + plural(rest, "line", "lines"), ACT_SERVE_SCAN_REST);
+	}
+	if (g_sale_id_needed and !g_sale_id_checked and sale_restricted_remaining() > 0) {
+		p.add("Ask for identification", ACT_SERVE_ASK_ID);
+		p.add("Refuse the age restricted lines", ACT_SERVE_REFUSE_REST);
+	}
+	if (sale_all_scanned() and (int(g_sale_total) > 0)) {
+		p.add("Run the card for " + money(g_sale_total), ACT_SERVE_CARD);
+		if (sale_wallet_covers_all()) {
+			p.add("Take " + money(g_sale_total) + ", the exact money", ACT_SERVE_CASH_EXACT);
+			int rounded = ((g_sale_total / 500) + 1) * 500;
+			if (rounded > g_sale_total) {
+				p.add("Take " + money(rounded) + ", " + money(rounded - g_sale_total) + " change", ACT_SERVE_CASH_ROUND);
+			}
+		} else {
+			/* The money in their hand does not cover the basket. Offer what is
+			   actually possible, and say exactly how short it is. */
+			p.add("Take " + money(sale_wallet_cash()) + ", all they have, "
+				+ money(sale_wallet_short_by()) + " short", ACT_SERVE_CASH_WALLET);
+			p.add("Sell what their money covers", ACT_SERVE_SELL_COVERS);
+			customer@ c = g_sale_customer;
+			if (@c !is null and c.wants_drink and c.short_paid == 0) {
+				p.add("Give them the drink for nothing", ACT_SERVE_FREE_DRINK);
+			}
+			p.add("Refuse the sale", ACT_SERVE_REFUSE_SALE);
+		}
+	}
+	if (g_sale_change_due > 0 and !g_sale_change_given) {
+		p.add("Count out the change, " + money(g_sale_change_due), ACT_SERVE_COUNT_CHANGE);
+	}
+	p.add("Step away from the till", ACT_SERVE_WALK_AWAY);
+	if (g_menu.length() == 0) menu_push(p);
+	else { g_menu[g_menu.length() - 1] = p; menu_speak_current(true); }
+}
+
+/* How often somebody actually has their licence on them. */
+const int ID_PRODUCED_CHANCE = 82;
+
+bool sale_id_will_be_produced() {
+	return (random(1, 100) <= ID_PRODUCED_CHANCE);
+}
+
+/* They have it, and it goes in the log. Kept apart from the roll above so the
+   behaviour can be driven without waiting for the 82 percent to come up. */
+void sale_id_produced() {
+	log_id_scan("the restricted lines");
+	g_sale_id_checked = true;
+	say("They slide a licence through the reader. It beeps, and the scan goes in the log.", true);
+	sale_page_build();
+}
+
+/* They have nothing to show you, so the restricted lines stay in the drawer. */
+void sale_id_missing() {
+	say("They pat their pockets and have nothing to show you. No identification, no sale of those lines.", true);
+	sale_refuse_restricted();
+}
+
+void sale_ask_id() {
+	if (sale_id_will_be_produced()) sale_id_produced();
+	else sale_id_missing();
+}
+
+void sale_refuse_restricted() {
+	int refused = 0;
+	int units = 0;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		product@ p = product_at(g_sale_line[i]);
+		if (@p is null or !p.restricted) continue;
+		if (g_sale_scanned[i] == 2) continue;
+		g_sale_scanned[i] = 2;
+		refused++;
+		units += g_sale_qty[i];
+	}
+	if (@g_sale_customer !is null) g_sale_customer.id_refused = true;
+	say("You put " + plural(refused, "line", "lines") + ", " + plural(units, "unit", "units")
+		+ ", back under the counter. Everything else stays on the bill.", true);
+	sale_recompute_total();
+	sale_page_build();
+}
+
+void sale_scan_one() {
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		if (g_sale_scanned[i] != 0) continue;
+		sale_scan_index(int(i), false);
+		break;
+	}
+	sale_page_build();
+}
+
+void sale_scan_rest() {
+	int first = 1;
+	for (uint i = 0; i < g_sale_line.length(); i++) {
+		if (g_sale_scanned[i] != 0) continue;
+		sale_scan_index(int(i), first == 1 ? false : true);
+		first++;
+	}
+	sfx_ui(A("scanner.ogg"), -10.0);
+	say("You scan the rest of the basket in one go. The total is " + money(g_sale_total) + ".", true);
+	sale_page_build();
+}
+
+/* ==========================================================================
+   6.  THE TILL MENU
+   ========================================================================= */
+
+void open_register() {
+	if (g_game_over) { say("The shop is closed.", true); return; }
+	if (g_in_jail) { say("Not from a cell.", true); return; }
+	if (g_licence_suspended) {
+		say("Your licence to sell alcohol, tobacco and vapes is suspended for another "
+			+ g_suspension_weeks_left + " weeks, but you can still sell everything else.", true);
+	}
+	g_modal = MODAL_REGISTER;
+	g_menu.resize(0);
+	menu_page@ p = menu_page("Cash register. The till holds " + money(g_cash)
+		+ ". " + plural(people_queue_length(), "customer is", "customers are") + " waiting");
+	p.add("Serve whoever is at the counter", ACT_SERVE_FETCH);
+	p.add("Open the drawer and count it", ACT_REP_TILL);
+	p.add("Count the till out", ACT_COMP_LOGOFF);
+	p.add("Close the register", ACT_CLOSE);
+	menu_push(p);
+}
+
+/* ==========================================================================
+   7.  THE MANAGER TERMINAL
+   ========================================================================== */
+
+menu_page@ computer_home_page() {
+	string title = "Manager terminal for " + g_store_name + ". The till holds " + money(g_cash);
+	if (g_arrears > 0) title += ". You owe " + money(g_arrears) + " in unpaid bills";
+	if (g_products_delivered_today()) title += ". The truck has already been";
+	menu_page@ p = menu_page(title);
+	p.add("Restock order", ACT_COMP_RESTOCK);
+	if (trouble_damaged_count() > 0 or g_pending_insurance_claim > 0 or trouble_short_changeable() > 0) {
+		p.add("Damage and theft", ACT_COMP_DAMAGE);
+	}
+	p.add("Bills and the bank", ACT_COMP_BILLS);
+	p.add("Reports", ACT_COMP_REPORTS);
+	p.add("Prices", ACT_COMP_PRICES);
+	p.add("Staff", ACT_COMP_STAFF);
+	p.add("Policies", ACT_COMP_POLICIES);
+	p.add("Hours", ACT_COMP_HOURS);
+	p.add("Music", ACT_COMP_MUSIC);
+	if (!g_renamed and int(g_current_week) <= 1) p.add("Rename the store", ACT_COMP_RENAME);
+	p.add("The law", ACT_COMP_LAW);
+	/* The terminal's own speech speed. It is here, on the machine itself, because
+	   that is where a player who cannot follow its voice finds out: they are
+	   reading a screen off it, and the chip that answers this line is the chip
+	   being slowed down. */
+	p.add(chip_speed_line(CHIP_DEVICE_COMPUTER), ACT_SPEED_TERM);
+	p.add(chip_pitch_line(CHIP_DEVICE_COMPUTER), ACT_PITCH_TERM);
+	p.add("Log off", ACT_COMP_LOGOFF);
+	return p;
+}
+
+/* The phone the player carries. A phone that has never been set up in this
+   store runs its own routine first, the same way the terminal does; after that
+   Shift+P brings up its pages, which speak through the handset's own chip. */
+void open_phone() {
+	if (g_game_over) { say("The phone is dead.", true); return; }
+	if (!is_phone_initialized) { hardware_phone_setup_begin(); return; }
+	/* The chime is the handset switching on, so it belongs to the moment its
+	   screens do: a machine still installing itself has not switched on yet, and
+	   the hand-off at the end of its routine comes back through here. */
+	machine_power_sound(CHIP_DEVICE_PHONE, true);
+	g_modal = MODAL_PHONE;
+	g_menu.resize(0);
+	menu_push(phone_page());
+}
+
+void open_computer() {
+	if (g_game_over) { say("The terminal is dead.", true); return; }
+	/* A terminal that has never been set up in this store does not show its
+	   pages yet. It runs its hardware routine, and while it runs the shop keeps
+	   trading: the clock is not paused for this and is no longer paused for the
+	   terminal either. */
+	if (!is_computer_initialized) { hardware_setup_begin(); return; }
+	/* The chime is the terminal switching on, so it belongs to the moment its
+	   screens do: a machine still installing itself has not switched on yet, and
+	   the hand-off at the end of its routine comes back through here. */
+	machine_power_sound(CHIP_DEVICE_COMPUTER, true);
+	g_modal = MODAL_COMPUTER;
+	g_menu.resize(0);
+	menu_push(computer_home_page());
+}
+
+/* ---- restock order ------------------------------------------------------ */
+
+menu_page@ order_page() {
+	string t = "Restock order. The draft comes to " + money(shop_draft_total());
+	if (g_account_hold) t += ". Your account is on hold, so orders will be refused";
+	menu_page@ p = menu_page(t);
+	p.add("Fill every shelf, " + money(shop_draft_total_estimate_fill()) + " approximately", ACT_ORDER_FILL_ALL);
+	p.add("Order one aisle", ACT_ORDER_FACE_BASE);
+	p.add("Review the order, " + plural(shop_draft_lines(), "line", "lines") + ", " + money(shop_draft_total()), ACT_ORDER_REVIEW);
+	p.add("Place the order", ACT_ORDER_PLACE);
+	p.add("Clear the order", ACT_ORDER_CLEAR);
+	p.add("Orders already placed, " + shop_order_count() + ", " + money(shop_orders_total()), ACT_ORDER_PLACED);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ order_aisle_page() {
+	menu_page@ p = menu_page("Order one aisle. Pick a shelf face to fill");
+	for (int f = 0; f < FACE_COUNT; f++) {
+		p.add(shop_face_name(f) + ", " + shop_face_theme(f) + ", " + shop_face_stock_pct(f) + " percent full",
+			ACT_ORDER_FACE_BASE + f);
+	}
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ order_review_page() {
+	menu_page@ p = menu_page("Your order, line by line. Enter on a line takes it off");
+	int shown = 0;
+	for (uint i = 0; i < g_draft_qty.length() and shown < 40; i++) {
+		if (g_draft_qty[i] <= 0) continue;
+		product@ q = product_at(int(i));
+		if (@q is null) continue;
+		p.add(q.name + ", " + plural(g_draft_qty[i], "unit", "units") + ", " + money(q.cost * g_draft_qty[i]),
+			22000 + int(i));
+		shown++;
+	}
+	if (shown == 0) p.add("The order is empty", ACT_CLOSE);
+	p.add("Place the order, " + money(shop_draft_total()), ACT_ORDER_PLACE);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ order_placed_page() {
+	menu_page@ p = menu_page("Orders already placed");
+	if (g_orders.length() == 0) p.add("Nothing is on its way", ACT_CLOSE);
+	for (uint i = 0; i < g_orders.length(); i++) {
+		p.add(money(g_orders[i].total) + ", arriving day " + g_orders[i].arrive_day
+			+ ", press Enter to cancel and refund", ACT_ORDER_CANCEL_BASE + int(i));
+	}
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- damage and theft --------------------------------------------------- */
+
+menu_page@ damage_page() {
+	menu_page@ p = menu_page("Damage and theft");
+	if (trouble_damaged_count() > 0) {
+		p.add("Repair everything, " + plural(trouble_damaged_count(), "display", "displays") + ", "
+			+ money(trouble_repair_bill()), ACT_REPAIR_ALL);
+	}
+	if (trouble_short_changeable() > 0) {
+		p.add("You short changed " + plural(trouble_short_changeable(), "customer", "customers")
+			+ " this week. More than ten and the police come", ACT_CLOSE);
+	}
+	p.add("Claim for the stock a shoplifter got away with", ACT_CLAIM_STOCK);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- bills and the bank -------------------------------------------------- */
+
+menu_page@ bills_page() {
+	menu_page@ p = menu_page("Bills and the bank. Bill day is Friday at six in the morning");
+	p.add("Next bill day, about " + money(money_bill_total_estimate()), ACT_BANK_PNL_WEEK);
+	if (g_arrears > 0) p.add("Pay the arrears, " + money(g_arrears), ACT_BANK_PAY_ARREARS);
+	if (g_bill_stage >= BILL_STAGE_EMERGENCY and !g_emergency_loan_taken) {
+		p.add("Take the emergency loan, at 24 percent over 26 weeks", ACT_EMERGENCY_LOAN);
+	}
+	p.add("This week so far", ACT_BANK_PNL_WEEK);
+	p.add("Your insurance, " + money_insurance_name(), ACT_BANK_INSURANCE);
+	p.add("Your loans", ACT_BANK_LOANS);
+	p.add("Declare your profit, currently " + g_declared_pct + " percent", ACT_BANK_DECLARE);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ insurance_page() {
+	menu_page@ p = menu_page("Insurance. The premium is paid weekly on bill day");
+	p.add("No insurance at all, " + money(0) + " a week", ACT_INS_NONE);
+	p.add("Basic cover, fire, flood and the building, " + money(INS_PREMIUM_BASIC) + " a week", ACT_INS_BASIC);
+	p.add("Basic and half the stock, " + money(INS_PREMIUM_BASIC_HALF) + " a week", ACT_INS_HALF);
+	p.add("Basic and all the stock, " + money(INS_PREMIUM_BASIC_ALL) + " a week", ACT_INS_ALL);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ loans_page() {
+	menu_page@ p = menu_page(money_loans_text());
+	for (uint i = 0; i < g_loans.length(); i++) {
+		p.add("Pay off loan " + (i + 1) + ", " + money(g_loans[i].remaining), ACT_LOAN_PAYOFF_BASE + int(i));
+	}
+	p.add("Borrow $1,000 over a year", ACT_LOAN_TAKE_BASE + 0);
+	p.add("Borrow $2,500 over a year", ACT_LOAN_TAKE_BASE + 1);
+	p.add("Borrow $5,000 over a year", ACT_LOAN_TAKE_BASE + 2);
+	if (g_arrears > 0 and !g_emergency_loan_taken) p.add("Take the emergency loan, " + money(g_arrears), ACT_EMERGENCY_LOAN);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ declare_page() {
+	int profit = money_week_profit();
+	menu_page@ p = menu_page("Declare your profit. You made " + money(profit) + " this week, taxed at "
+		+ INCOME_TAX_PERCENT + " percent");
+	p.add("Declare a quarter of it", ACT_DECLARE_BASE + 25);
+	p.add("Declare half of it", ACT_DECLARE_BASE + 50);
+	p.add("Declare three quarters of it", ACT_DECLARE_BASE + 75);
+	p.add("Declare every penny", ACT_DECLARE_BASE + 100);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- reports ------------------------------------------------------------- */
+
+menu_page@ reports_page() {
+	menu_page@ p = menu_page("Reports");
+	p.add("What is in the till", ACT_REP_TILL);
+	p.add("Sales off the shelves since the last delivery", ACT_REP_SALES);
+	p.add("How well stocked the shelves are", ACT_REP_LEVELS);
+	p.add("Out of stock, " + plural(shop_out_of_stock_lines(), "line", "lines"), ACT_REP_EMPTY);
+	p.add("What you have spent on stock", ACT_REP_SPEND);
+	p.add("Best and worst rows", ACT_REP_BESTWORST);
+	p.add("The market", ACT_REP_MARKET);
+	p.add("Aisle performance and prices", ACT_REP_AISLES);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ aisles_page() {
+	menu_page@ p = menu_page("Aisles. Pick a face for its report");
+	for (int f = 0; f < FACE_COUNT; f++) {
+		p.add(shop_face_name(f) + ", " + shop_face_theme(f) + ", " + shop_face_stock_pct(f) + " percent full",
+			ACT_PRICE_FACE_BASE + f);
+	}
+	p.add("Behind the counter, " + shop_face_stock_pct(FACE_COUNTER) + " percent full", ACT_PRICE_FACE_BASE + 100);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- prices -------------------------------------------------------------- */
+
+menu_page@ face_price_page(int face) {
+	menu_page@ p = menu_page(shop_report_face(face) + ". Pick a line to reprice");
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ q = g_catalog[i];
+		if (q.face != face) continue;
+		string warn = "";
+		if (q.price <= q.cost) warn = ", below cost";
+		else if (shop_price_over_fair(int(i)) > PRICE_TOLERANCE_PCT) warn = ", over fair";
+		p.add(q.name + ", " + money(q.price) + warn, ACT_PRICE_PROD_BASE + int(i));
+	}
+	p.add("Adjust every price on this face up five percent", ACT_PRICE_FACE_UP5);
+	p.add("Adjust every price on this face up ten percent", ACT_PRICE_FACE_UP10);
+	p.add("Adjust every price on this face down five percent", ACT_PRICE_FACE_DOWN5);
+	p.add("Adjust every price on this face down ten percent", ACT_PRICE_FACE_DOWN10);
+	p.add("Set all on this face to the fair price", ACT_PRICE_FACE_FAIR);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ product_price_page(int index) {
+	product@ q = product_at(index);
+	menu_page@ p = menu_page(shop_product_text(index));
+	p.add("Up five cents", ACT_PRICE_UP5);
+	p.add("Up twenty five cents", ACT_PRICE_UP25);
+	p.add("Down five cents", ACT_PRICE_DOWN5);
+	p.add("Down twenty five cents", ACT_PRICE_DOWN25);
+	p.add("Set to the fair price, " + money((@q !is null) ? q.fair : 0), ACT_PRICE_FAIR);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ prices_home_page() {
+	menu_page@ p = menu_page("Prices. Pick a shelf face");
+	for (int f = 0; f < FACE_COUNT; f++) {
+		p.add(shop_face_name(f) + ", " + shop_face_theme(f), ACT_PRICE_FACE_BASE + f);
+	}
+	p.add("Behind the counter", ACT_PRICE_FACE_BASE + 100);
+	int drifted = shop_prices_drifted();
+	p.add("Set everything that has drifted back to the fair price, " + plural(drifted, "line", "lines"), ACT_PRICE_ALL_FAIR);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- staff --------------------------------------------------------------- */
+
+menu_page@ staff_page() {
+	menu_page@ p = menu_page(staff_summary_text());
+	p.add("Positions", ACT_STAFF_POSITIONS);
+	if (g_staff.length() > 0) p.add("Your staff, " + g_staff.length(), ACT_STAFF_LIST);
+	if (g_applicants.length() > 0) p.add("Applicants waiting, " + g_applicants.length(), ACT_STAFF_APPLICANTS);
+	if (staff_requests_waiting() > 0) p.add("Requests waiting, " + staff_requests_waiting(), ACT_STAFF_LIST);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ positions_page() {
+	menu_page@ p = menu_page("Positions. Open one by Saturday and five applicants turn up on Monday");
+	for (int r = 0; r < ROLE_COUNT; r++) {
+		bool open = (g_positions_open.length() == ROLE_COUNT and g_positions_open[r] == 1);
+		if (open) p.add("Close the position for a " + staff_role_name(r), ACT_STAFF_CLOSE_BASE + r);
+		else p.add("Open a position for a " + staff_role_name(r), ACT_STAFF_OPEN_BASE + r);
+	}
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ staff_list_page() {
+	menu_page@ p = menu_page(staff_summary_text());
+	for (uint i = 0; i < g_staff.length(); i++) {
+		p.add(g_staff[i].name + ", " + staff_role_name(g_staff[i].role) + ", "
+			+ staff_mood_word(g_staff[i].satisfaction) + ", " + money(g_staff[i].wage) + " an hour",
+			ACT_STAFF_EMP_BASE + int(i));
+	}
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ employee_page(int index) {
+	if (index < 0 or uint(index) >= g_staff.length()) return staff_list_page();
+	worker@ w = g_staff[index];
+	menu_page@ p = menu_page(staff_how_they_are_doing(w));
+	p.add("Raise their wage by a dollar an hour", ACT_STAFF_RAISE_BASE + index);
+	p.add("Cut their wage by a dollar an hour", ACT_STAFF_CUT_BASE + index);
+	p.add("Put them on mornings only", ACT_STAFF_ROTA_M_BASE + index);
+	p.add("Put them on evenings only", ACT_STAFF_ROTA_E_BASE + index);
+	if (g_hours_24h) p.add("Put them on nights only", ACT_STAFF_ROTA_N_BASE + index);
+	if (w.request_open) {
+		p.add("Grant what they asked for", ACT_STAFF_GRANT_BASE + index);
+		p.add("Refuse what they asked for", ACT_STAFF_REFUSE_BASE + index);
+	}
+	p.add("Fire them", ACT_STAFF_FIRE_BASE + index);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ applicants_page() {
+	menu_page@ p = menu_page("Applicants. Offers are final, so no haggling them down a quarter at a time");
+	for (uint i = 0; i < g_applicants.length(); i++) {
+		applicant@ a = g_applicants[i];
+		p.add(a.name + ", " + a.stars + " star " + staff_role_name(a.role) + ", asking "
+			+ money(a.wage) + " an hour, " + plural(staff_rota_shift_count_of(a), "shift", "shifts") + " a week",
+			ACT_STAFF_APPL_BASE + int(i));
+	}
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ applicant_page(int index) {
+	if (index < 0 or uint(index) >= g_applicants.length()) return applicants_page();
+	applicant@ a = g_applicants[index];
+	menu_page@ p = menu_page(a.name + ", " + a.stars + " star " + staff_role_name(a.role)
+		+ ", asking " + money(a.wage) + " an hour, " + plural(staff_rota_shift_count_of(a), "shift", "shifts") + " a week");
+	p.add("Offer their asking wage, " + money(a.wage), ACT_STAFF_HIRE_BASE + index);
+	p.add("Offer " + money(a.wage - 25) + " an hour", ACT_STAFF_HIRE_BASE + 500 + index);
+	p.add("Offer " + money(a.wage - 50) + " an hour", ACT_STAFF_HIRE_BASE + 1000 + index);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* ---- policies, hours, music, rename ------------------------------------- */
+
+menu_page@ policies_page() {
+	menu_page@ p = menu_page("Policies");
+	p.add("Coffee and the fountain: " + ((g_drinks_self_serve == 1) ? "self serve" : "employee serve")
+		+ ", press Enter to switch", ACT_POLICY_DRINKS);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ hours_page() {
+	menu_page@ p = menu_page("Hours. You need at least one person employed to open around the clock");
+	p.add(g_hours_24h ? "Open around the clock, press Enter to go back to seven to ten" : "Open seven in the morning to ten at night",
+		ACT_HOURS_TOGGLE);
+	if (staff_uncovered_nights() > 0) p.add("Nights with nobody on the rota, expect trouble", ACT_CLOSE);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+string music_display_name(const string&in path) {
+	string s = path;
+	int cut = s.find_last("/");
+	if (cut >= 0) s = s.substr(uint(cut) + 1);
+	int dot = s.find_last(".");
+	if (dot > 0) s = s.substr(0, uint(dot));
+	s = s.replace("_", " ", true);
+	s = s.replace("-", " ", true);
+	return s;
+}
+
+string music_special_title(const string&in kind) {
+	if (kind == "chase") return "Back Aisle Dash";
+	if (kind == "fight") return "Closing Time Argument";
+	return "something else";
+}
+
+/* What is playing, for the page title and the speakers. */
+string music_now_text() {
+	if (g_music_special.length() > 0) return music_special_title(g_music_special);
+	if (!g_music_on) return "nothing, the music is off";
+	if (g_music_now.length() > 0) return g_music_now;
+	return g_music_tracks.length() > 0 ? music_display_name(g_music_tracks[uint(g_music_track)]) : "nothing yet";
+}
+
+menu_page@ music_page() {
+	menu_page@ p = menu_page("The shop's speakers. The music is " + (g_music_on ? "on" : "off")
+		+ ", playing " + music_now_text() + ". Volume " + g_music_volume
+		+ " percent, subwoofers " + g_sub_volume + " percent");
+	p.add(g_music_on ? "Switch the music off" : "Switch the music on", ACT_MUSIC_TOGGLE);
+	p.add("Skip to the next track", ACT_MUSIC_NEXT);
+	p.add("Back to the previous track", ACT_MUSIC_PREV);
+	p.add("Look for new tracks, " + plural(int(g_music_tracks.length()), "track", "tracks") + " found", ACT_MUSIC_SCAN);
+	p.add("Shuffle is " + (g_music_shuffle ? "on" : "off"), ACT_MUSIC_SHUFFLE);
+	p.add("Volume up five percent", ACT_MUSIC_UP);
+	p.add("Volume down five percent", ACT_MUSIC_DOWN);
+	p.add("Subwoofers up ten percent", ACT_MUSIC_SUB_UP);
+	p.add("Subwoofers down ten percent", ACT_MUSIC_SUB_DOWN);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+menu_page@ rename_page() {
+	menu_page@ p = menu_page("Renaming the store. This can only be done once, and only in your first week");
+	p.add("Keep " + g_store_name, ACT_CLOSE);
+	p.add("Rename it to " + g_store_name, ACT_RENAME_CONFIRM);
+	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+bool music_file_ok(const string&in f) {
+	string lower = f.lower();
+	return lower.ends_with(".mp3") or lower.ends_with(".ogg") or lower.ends_with(".wav")
+		or lower.ends_with(".flac") or lower.ends_with(".m4a") or lower.ends_with(".wma");
+}
+
+/* Look for tracks in every music folder this shop knows about. The player's own
+   folder is scanned first, so their tracks take the front of the playlist. */
+void music_scan(bool quiet = false) {
+	g_music_tracks.resize(0);
+	array<string>@ folders = array<string>();
+	folders.insert_last("sounds/music");
+	folders.insert_last(ASSET_DIR + "/music");
+	folders.insert_last("music");
+	int folders_found = 0;
+	for (uint f = 0; f < folders.length(); f++) {
+		if (!directory_exists(folders[f])) continue;
+		folders_found++;
+		string[]@ files = glob(folders[f] + "/*");
+		for (uint i = 0; i < files.length(); i++) {
+			if (music_file_ok(files[i])) g_music_tracks.insert_last(files[i]);
+		}
+	}
+	if (!quiet) {
+		if (folders_found == 0) {
+			say("There is no music folder yet. Put your own tracks in sounds slash music, or in music next to the game, and look again.", true);
+			return;
+		}
+		say("Found " + plural(int(g_music_tracks.length()), "track", "tracks") + ". "
+			+ (int(g_music_tracks.length()) > 0 ? "The first one is " + music_display_name(g_music_tracks[0]) + "." : ""), true);
+	}
+}
+
+/* Percent to decibels. 100 percent is the recording as it came, 50 is about
+   minus six, and silence is floored rather than infinite. */
+float music_volume_db(int percent) {
+	if (percent <= 0) return -60.0;
+	double ratio = double(percent) / 100.0;
+	return float(20.0 * (log(ratio) / log(10.0)));
+}
+
+float music_sub_db(int percent) {
+	if (percent <= 0) return -60.0;
+	double ratio = double(percent) / 100.0;
+	return float(20.0 * (log(ratio) / log(10.0)));
+}
+
+/* Play track i through the shop's speakers. */
+bool music_play_index(int i) {
+	if (!g_music_on or g_music_tracks.length() == 0) return false;
+	int n = int(g_music_tracks.length());
+	while (i < 0) i += n;
+	while (i >= n) i -= n;
+	g_music_track = i;
+	string path = g_music_tracks[uint(i)];
+	if (!music_start(path, false)) {
+		say("That track will not play: " + music_display_name(path) + ".", true);
+		return false;
+	}
+	g_music_now = music_display_name(path);
+	return true;
+}
+
+void music_play_next() {
+	if (g_music_tracks.length() == 0) return;
+	int n = int(g_music_tracks.length());
+	int next = g_music_shuffle ? random(0, n - 1) : (g_music_track + 1);
+	if (!g_music_on) { g_music_track = (next % n); return; }
+	int tries = 0;
+	while (tries < n and !music_play_index(next)) { next = (next + 1) % n; tries++; }
+}
+
+void music_play_prev() {
+	if (g_music_tracks.length() == 0) return;
+	int n = int(g_music_tracks.length());
+	int prev = (g_music_track - 1);
+	if (!g_music_on) { g_music_track = ((prev + n) % n); return; }
+	int tries = 0;
+	while (tries < n and !music_play_index(prev)) { prev = ((prev - 1) + n) % n; tries++; }
+}
+
+/* Bring the speakers into line with g_music_on. This has to be called whenever
+   that flag changes underneath the player, and in particular when a game starts
+   or a save is loaded: the speakers belong to the process, not to the store, so
+   otherwise the last store's music keeps playing in a shop that has its music
+   switched off, or a store that was left with music on sits in silence. */
+void music_apply() {
+	music_gain_db(music_volume_db(g_music_volume));
+	music_sub_gain_db(music_sub_db(g_sub_volume));
+	if (g_music_special.length() > 0) return;   /* a chase or a fight owns them */
+	if (!g_music_on) { music_stop(); return; }
+	if (g_music_tracks.length() == 0) music_scan(true);   /* silently: just the list */
+	if (g_music_tracks.length() == 0) return;
+	if (!music_playing()) music_play_index(g_music_track);
+}
+
+/* The chase and the fight take the speakers over, the way they do in the
+   reference game: they play through the speakers even when the shop's own music
+   is switched off, and when the trouble is over the speakers go back to whatever
+   was playing before. */
+void music_special_start(const string&in kind) {
+	if (g_music_special == kind) return;
+	if (g_music_special.length() == 0) {
+		g_music_resume_track = g_music_track;
+		g_music_was_on = g_music_on;
+	}
+	g_music_special = kind;
+	music_gain_db(music_volume_db(g_music_volume));
+	music_sub_gain_db(music_sub_db(g_sub_volume));
+	string path = ASSET_DIR + "/music/" + ((kind == "chase") ? "chase_back_aisle.wav" : "fight_ruckus.wav");
+	if (!music_start(path, true)) {
+		/* No such recording: nothing to play, so do not pretend otherwise. */
+		log_line("music", "no recording for the " + kind + " at " + path);
+		g_music_special = "";
+		return;
+	}
+	g_music_now = music_special_title(kind);
+	log_line("music", kind + " music through the shop's speakers");
+}
+
+void music_special_end(const string&in kind) {
+	if (g_music_special != kind) return;
+	g_music_special = "";
+	if (g_music_was_on and g_music_tracks.length() > 0) music_play_index(g_music_resume_track);
+	else music_stop();
+	log_line("music", "the " + kind + " is over, speakers back to " + music_now_text());
+}
+
+/* Once per frame: the playlist moves on when a track plays itself out, and the
+   speakers come back up if something took them away (a load, a special that
+   ended without a track to go back to, a dead slot). */
+void music_tick() {
+	if (g_music_special.length() > 0) return;
+	if (!g_music_on) return;
+	if (g_music_tracks.length() == 0) return;
+	if (music_finished()) { music_play_next(); return; }
+	if (!music_playing()) music_play_index(g_music_track);
+}
+
+/* A shoplifter making a run for the door, with the goods. */
+bool music_thief_on_the_run() {
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or !c.shoplifter) continue;
+		if (c.state == CUST_GONE or c.room != ROOM_SHOP) continue;
+		if (c.swatted or c.ran) return true;
+	}
+	return false;
+}
+
+/* The chase and the fight own the speakers while they last, and hand them back
+   afterwards. Both are read out of the world here rather than pushed in by
+   trouble.nvgt, because this file is the last module included and nothing
+   earlier can call into it. */
+void music_trouble_tick() {
+	if (g_fights.length() > 0) { music_special_start("fight"); return; }
+	if (music_thief_on_the_run()) { music_special_start("chase"); return; }
+	if (g_music_special == "fight") music_special_end("fight");
+	else if (g_music_special == "chase") music_special_end("chase");
+}
+
+/* ==========================================================================
+   8.  THE PHONE
+   ========================================================================== */
+
+menu_page@ phone_page() {
+	menu_page@ p = menu_page("Your phone. The clock has stopped while you are here");
+	p.add("Email, " + plural(int(g_emails.length()), "message", "messages"), ACT_PHONE_EMAIL);
+	p.add("News", ACT_PHONE_NEWS);
+	p.add("Reviews", ACT_PHONE_REVIEWS);
+	/* The handset's own speech speed, for the same reason the terminal has one:
+	   the order the player types into it is read back in its own voice. */
+	p.add(chip_speed_line(CHIP_DEVICE_PHONE), ACT_SPEED_PHONE);
+	p.add(chip_pitch_line(CHIP_DEVICE_PHONE), ACT_PITCH_PHONE);
+	p.add("Put the phone away", ACT_CLOSE);
+	return p;
+}
+
+string send_cap(const string&in s) {
+	if (s.length() == 0) return s;
+	return chip_upper(s.substr(0, 1)) + s.substr(1, s.length() - 1);
+}
+
+/* The page behind a machine's Speech speed: or Pitch: line. Enter on one of those
+   lines opens this rather than stepping the setting where it stands: every
+   setting the machine offers is listed, the one it is on now is named, and the
+   line is read out by the machine as the cursor passes it. Picking one applies
+   it, hears it in the machine's own voice and goes back to the home page with
+   the cursor on the line that was changed. */
+menu_page@ chip_setting_page(int device, bool pitch) {
+	string who = (device == CHIP_DEVICE_PHONE) ? "the phone" : "the terminal";
+	string name = pitch ? "Pitch" : "Speech speed";
+	menu_page@ p = menu_page(name + " on " + who
+		+ ". Enter keeps a setting, and it is saved with this store");
+	string choices = pitch ? CHIP_PITCH_CHOICES : CHIP_SPEED_CHOICES;
+	int base = pitch ? ACT_SPEECH_PITCH_CHOICE_BASE : ACT_SPEECH_SPEED_CHOICE_BASE;
+	int current = pitch ? chip_profile_of(device).pitch_pct : chip_profile_of(device).speed_pct;
+	for (int i = 0; i < chip_pct_choice_count(choices); i++) {
+		int pct = chip_pct_choice(choices, i);
+		string word = pitch ? chip_pitch_word(pct) : chip_speed_word(pct);
+		string label = (word.length() > 0) ? send_cap(word) : ("" + pct);
+		label += ", " + pct + " per cent of " + (pitch ? "its own pitch" : "the chip's own rate");
+		if (pct == current) label += ", the setting now";
+		p.add(label, base + i);
+	}
+	p.add("Back", ACT_BACK);
+	return p;
+}
+
+/* One line of either page was chosen: put that setting on the machine, write it
+   into this store's save, let the machine say what it now sounds like, and go
+   back to its home page with the cursor on the line that changed. */
+void chip_setting_choose(bool pitch, int index) {
+	int device = machine_for_modal();
+	if (device < 0) return;
+	string choices = pitch ? CHIP_PITCH_CHOICES : CHIP_SPEED_CHOICES;
+	int pct = chip_pct_choice(choices, index);
+	if (pitch) chip_pitch_apply(device, pct);
+	else chip_speed_apply(device, pct);
+	chip_settings_save();
+	string line = pitch
+		? chip_pitch_preview_line(device, chip_profile_of(device).pitch_pct)
+		: chip_speed_preview_line(device, chip_profile_of(device).speed_pct);
+	machine_chip_line(device, line);
+	g_menu.remove_last();
+	menu_replace_current((device == CHIP_DEVICE_PHONE) ? phone_page() : computer_home_page(),
+		pitch ? PITCH_LINE_PREFIX : SPEECH_LINE_PREFIX);
+}
+
+string phone_email_text() {
+	if (g_emails.length() == 0) return "There is no email. Even the spam has given up.";
+	string s = "Email, newest first. ";
+	for (int i = int(g_emails.length()) - 1; i >= 0 and i >= int(g_emails.length()) - 8; i--) {
+		s += g_emails[i] + ". ";
+	}
+	return s;
+}
+
+string phone_news_text() {
+	if (g_news.length() == 0) return "Nothing in the news today.";
+	string s = "The local news. ";
+	for (int i = int(g_news.length()) - 1; i >= 0 and i >= int(g_news.length()) - 6; i--) s += g_news[i] + ". ";
+	return s;
+}
+
+/* ==========================================================================
+   9.  JAIL, AND WHAT PUTS YOU THERE
+   ========================================================================= */
+
+void jail_begin(int days) {
+	if (g_in_jail) return;
+	g_in_jail = true;
+	g_jail_days_total = days;
+	g_jail_days_served = 0;
+	g_jail_blackout = false;
+	g_jail_next_step = ticks() + 300;
+	stop_all_speech();
+	say("The cuffs go on, the car door shuts, and the cell door closes. "
+		+ plural(days, "day", "days") + ". The shop keeps trading without you.", true);
+	log_line("jail", "sentence of " + days + " days");
+}
+
+void jail_step() {
+	if (!g_in_jail) return;
+	if (ticks() < g_jail_next_step) return;
+	g_jail_next_step = ticks() + 300;
+	g_jail_days_served++;
+	/* The staff keep the shop open as long as they can. Unpaid, they walk out,
+	   the least capable first. */
+	if (g_jail_days_served % 3 == 0 and g_staff.length() > 0) {
+		int worst = 0;
+		for (uint i = 1; i < g_staff.length(); i++) if (g_staff[i].stars < g_staff[worst].stars) worst = int(i);
+		say(g_staff[worst].name + " has walked out. Nobody has been paid.", true);
+		g_staff.remove_at(uint(worst));
+		g_jail_lost_staff++;
+	}
+	/* Thieves help themselves once nobody is watching. */
+	if (random(1, 100) <= 35) {
+		int loss = random(2000, 9000);
+		g_cash -= loss;
+		if (g_cash < 0) g_cash = 0;
+		g_jail_lost_cash += loss;
+	}
+	if (random(1, 100) <= 20) {
+		int idx = random(0, int(g_catalog.length()) - 1);
+		product@ p = product_at(idx);
+		if (@p !is null) p.stock = 0;
+	}
+	if (g_jail_days_served >= g_jail_days_total) {
+		g_in_jail = false;
+		string s = "You are let out. " + plural(g_jail_days_served, "day", "days") + " have gone by. ";
+		s += plural(g_jail_lost_staff, "member of staff", "members of staff") + " quit while you were in. ";
+		s += money(g_jail_lost_cash) + " walked out of the till. ";
+		if (g_jail_blackout) s += "The power was cut off while you were inside. ";
+		s += "The till holds " + money(g_cash) + ".";
+		say(s, true);
+		log_line("jail", "released after " + g_jail_days_served + " days");
+	}
+}
+
+/* Enough offences and you go to jail. */
+void jail_check_offences() {
+	if (g_in_jail or g_game_over) return;
+	int offences = g_offence_count + g_turn_ins + g_false_alarms / 3;
+	if (offences < 3) return;
+	int days = random(3, 30);
+	if (g_turn_ins >= 3) days = random(60, 120);
+	/* Three months or more and the electricity company cuts the power. */
+	if (days >= 90) g_jail_blackout = true;
+	jail_begin(days);
+}
+
+/* ==========================================================================
+   10.  SAVING AND LOADING
+   ========================================================================= */
+
+string slot_path(int slot) {
+	if (slot < 1) slot = 1;
+	if (slot > 15) slot = 15;
+	return "saves/slot" + pad(slot, 2) + ".txt";
+}
+
+/* Put the two machines' own settings - their speech speed and their pitch -
+   into the save they belong to, in place, without rewriting the rest of the
+   file or rotating its backup. They are facts about this store's machines and
+   not about this computer, so they live in the slot: loading another save puts
+   that store's settings back on the machines. A store with no save on disk yet
+   keeps the setting in memory and it is written by the next full save. */
+void chip_settings_save() {
+	if (!g_game_mode) return;
+	string path = slot_path(g_slot);
+	if (!file_exists(path)) return;
+	string all = file_get_contents(path);
+	if (all.length() == 0) return;
+	for (int d = CHIP_DEVICE_COMPUTER; d <= CHIP_DEVICE_PHONE; d++) {
+		all = config_text_with_value(all, chip_speed_save_key(d), "" + chip_profile_of(d).speed_pct, "");
+		all = config_text_with_value(all, chip_pitch_save_key(d), "" + chip_profile_of(d).pitch_pct, "");
+	}
+	if (!file_put_contents(path, all)) log_line("save", "the machine speech settings could not be written to " + path);
+}
+
+void save_game(bool quiet = false) {
+	if (!g_game_mode) return;
+	string path = slot_path(g_slot);
+	/* Keep the one before it, in case a save goes wrong. */
+	if (file_exists(path)) {
+		file old;
+		if (old.open(path, "rb")) {
+			string all = old.read();
+			old.close();
+			file bak;
+			if (bak.open(path + ".bak", "wb")) { bak.write(all); bak.close(); }
+		}
+	}
+	file f;
+	if (!f.open(path, "wb")) {
+		say("The save file could not be opened, so nothing was written.", true);
+		return;
+	}
+	f.write("store_express_save=2\r\n");
+	f.write("name=" + g_store_name + "\r\n");
+	f.write("slot=" + g_slot + "\r\n");
+	f.write("cash=" + g_cash + "\r\n");
+	f.write("arrears=" + g_arrears + "\r\n");
+	f.write("bill_stage=" + g_bill_stage + "\r\n");
+	f.write("account_hold=" + (g_account_hold ? 1 : 0) + "\r\n");
+	f.write("insurance=" + g_insurance_tier + "\r\n");
+	f.write("declared_pct=" + g_declared_pct + "\r\n");
+	f.write("under_declared=" + (g_under_declared ? 1 : 0) + "\r\n");
+	f.write("takings=" + g_total_takings + "\r\n");
+	f.write("tax_paid=" + g_tax_paid + "\r\n");
+	f.write("wk_sales=" + g_wk_sales + "\r\n");
+	f.write("wk_stock=" + g_wk_stock + "\r\n");
+	f.write("wk_wages=" + g_wk_wages + "\r\n");
+	f.write("wk_fines=" + g_wk_fines + "\r\n");
+	f.write("wk_other=" + g_wk_other + "\r\n");
+	f.write("wk_customers=" + g_wk_customers + "\r\n");
+	f.write("reputation=" + num1(g_reputation) + "\r\n");
+	f.write("unscanned=" + g_unscanned_sales + "\r\n");
+	f.write("restricted=" + g_restricted_sales + "\r\n");
+	f.write("id_scans=" + g_id_scans_logged + "\r\n");
+	f.write("bad_inspections=" + g_bad_inspections + "\r\n");
+	f.write("suspended=" + (g_licence_suspended ? 1 : 0) + "\r\n");
+	f.write("suspension_weeks=" + g_suspension_weeks_left + "\r\n");
+	f.write("board_fines=" + g_fines_from_board + "\r\n");
+	f.write("false_alarms=" + g_false_alarms + "\r\n");
+	f.write("turn_ins=" + g_turn_ins + "\r\n");
+	f.write("police_fines=" + g_fines_owed + "\r\n");
+	f.write("drinks_self_serve=" + g_drinks_self_serve + "\r\n");
+	f.write("hours_24h=" + (g_hours_24h ? 1 : 0) + "\r\n");
+	f.write("music_on=" + (g_music_on ? 1 : 0) + "\r\n");
+	f.write("music_vol=" + g_music_volume + "\r\n");
+	f.write("sub_vol=" + g_sub_volume + "\r\n");
+	f.write("renamed=" + (g_renamed ? 1 : 0) + "\r\n");
+	/* The machines' own speech, speed and pitch, which belong to this store. */
+	for (int d = CHIP_DEVICE_COMPUTER; d <= CHIP_DEVICE_PHONE; d++) {
+		f.write(chip_speed_save_key(d) + "=" + chip_profile_of(d).speed_pct + "\r\n");
+		f.write(chip_pitch_save_key(d) + "=" + chip_profile_of(d).pitch_pct + "\r\n");
+	}
+	f.write("game_over=" + (g_game_over ? 1 : 0) + "\r\n");
+	/* Which machines in this store have been set up, one line per device. */
+	f.write(hardware_save_lines());
+	f.write("clock=" + g_current_minute + "," + g_current_hour + "," + g_current_day_of_week
+		+ "," + g_current_week + "," + g_current_day + "\r\n");
+	f.write("player=" + g_player_room + "," + num1(g_px) + "," + num1(g_py) + "," + num1(g_facing) + "\r\n");
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		f.write("prod=" + i + "," + g_catalog[i].stock + "," + g_catalog[i].price + "," + g_catalog[i].cost + "\r\n");
+	}
+	for (uint i = 0; i < g_draft_qty.length(); i++) {
+		if (g_draft_qty[i] <= 0) continue;
+		f.write("draft=" + i + "," + g_draft_qty[i] + "\r\n");
+	}
+	for (uint i = 0; i < g_orders.length(); i++) {
+		order_rec@ o = g_orders[i];
+		f.write("order=" + o.arrive_day + "," + o.total + "," + o.ordered_day + "\r\n");
+		for (uint j = 0; j < o.qty.length(); j++) {
+			if (o.qty[j] <= 0) continue;
+			f.write("orderline=" + i + "," + j + "," + o.qty[j] + "\r\n");
+		}
+	}
+	for (uint i = 0; i < g_loans.length(); i++) {
+		loan@ l = g_loans[i];
+		f.write("loan=" + l.principal + "," + l.remaining + "," + l.weekly + "," + l.weeks_left
+			+ "," + l.rate_pct + "," + (l.emergency ? 1 : 0) + "\r\n");
+	}
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ w = g_staff[i];
+		string rota = "";
+		for (uint d = 0; d < w.rota.length(); d++) rota += ((d > 0) ? ":" : "") + w.rota[d];
+		f.write("staff=" + w.name + "," + w.role + "," + w.stars + "," + w.wage + "," + w.satisfaction
+			+ "," + (w.dishonest ? 1 : 0) + "," + (w.crooked ? 1 : 0) + "," + rota + "\r\n");
+	}
+	for (uint i = 0; i < g_reviews.length(); i++) {
+		f.write("review=" + g_reviews[i].stars + "," + g_reviews[i].day + "\r\n");
+	}
+	/* What the regulars remember about this shop is part of this shop. Names and
+	   scores rather than sentences, because the sentence is written fresh from
+	   the score when they next walk in. */
+	for (uint i = 0; i < g_regulars.length(); i++) {
+		f.write("regular=" + g_regulars[i].name + "," + g_regulars[i].score + ","
+			+ g_regulars[i].day + "\r\n");
+	}
+	for (uint i = 0; i < FACE_COUNT + 1; i++) { /* placeholder so the format is obvious */ break; }
+	f.close();
+	log_line("save", "saved to " + path);
+	if (!quiet) say("Saved into slot " + g_slot + ".", true);
+}
+
+string save_get(const string&in key, const string&in fallback) {
+	file f;
+	if (!f.open(slot_path(g_slot), "rb")) return fallback;
+	string all = f.read();
+	f.close();
+	string[]@ lines = all.split("\n");
+	for (uint i = 0; i < lines.length(); i++) {
+		string ln = lines[i].trim_whitespace();
+		int eq = ln.find_first("=");
+		if (eq < 0) continue;
+		if (ln.substr(0, eq) != key) continue;
+		return ln.substr(eq + 1).trim_whitespace();
+	}
+	return fallback;
+}
+
+int save_get_int(const string&in key, int fallback) {
+	string v = save_get(key, "");
+	if (v.length() == 0) return fallback;
+	return parse_int(v);
+}
+
+void load_game_from(int slot) {
+	g_slot = slot;
+	if (!file_exists(slot_path(slot))) { say("That slot is empty.", true); return; }
+	g_store_name = save_get("name", "Store Express");
+	g_cash = save_get_int("cash", 250000);
+	g_arrears = save_get_int("arrears", 0);
+	g_bill_stage = save_get_int("bill_stage", 0);
+	g_account_hold = save_get_int("account_hold", 0) == 1;
+	g_insurance_tier = save_get_int("insurance", INS_BASIC);
+	g_declared_pct = save_get_int("declared_pct", 100);
+	g_under_declared = save_get_int("under_declared", 0) == 1;
+	g_total_takings = save_get_int("takings", 0);
+	g_tax_paid = save_get_int("tax_paid", 0);
+	g_wk_sales = save_get_int("wk_sales", 0);
+	g_wk_stock = save_get_int("wk_stock", 0);
+	g_wk_wages = save_get_int("wk_wages", 0);
+	g_wk_fines = save_get_int("wk_fines", 0);
+	g_wk_other = save_get_int("wk_other", 0);
+	g_wk_customers = save_get_int("wk_customers", 0);
+	g_reputation = parse_double(save_get("reputation", "3.0"));
+	g_unscanned_sales = save_get_int("unscanned", 0);
+	g_restricted_sales = save_get_int("restricted", 0);
+	g_id_scans_logged = save_get_int("id_scans", 0);
+	g_bad_inspections = save_get_int("bad_inspections", 0);
+	g_licence_suspended = save_get_int("suspended", 0) == 1;
+	g_suspension_weeks_left = save_get_int("suspension_weeks", 0);
+	g_fines_from_board = save_get_int("board_fines", 0);
+	g_false_alarms = save_get_int("false_alarms", 0);
+	g_turn_ins = save_get_int("turn_ins", 0);
+	g_fines_owed = save_get_int("police_fines", 0);
+	g_drinks_self_serve = save_get_int("drinks_self_serve", 1);
+	g_hours_24h = save_get_int("hours_24h", 0) == 1;
+	g_music_on = save_get_int("music_on", 0) == 1;
+	g_music_volume = save_get_int("music_vol", 100);
+	g_sub_volume = save_get_int("sub_vol", 0);
+	g_renamed = save_get_int("renamed", 0) == 1;
+	g_game_over = save_get_int("game_over", 0) == 1;
+	/* The hardware: a terminal that was never set up reads back as false, which
+	   is also what a save written before the chips existed reads back as. */
+	is_computer_initialized = save_get_int(HW_SAVE_KEY_COMPUTER, 0) == 1;
+	is_phone_initialized    = save_get_int(HW_SAVE_KEY_PHONE, 0) == 1;
+	/* The machines' own speech settings come back with the store. A save written
+	   before they lived here reads back at the defaults. */
+	for (int d = CHIP_DEVICE_COMPUTER; d <= CHIP_DEVICE_PHONE; d++) {
+		chip_speed_apply(d, save_get_int(chip_speed_save_key(d), CHIP_SPEED_DEFAULT));
+		chip_pitch_apply(d, save_get_int(chip_pitch_save_key(d), CHIP_PITCH_NORMAL));
+	}
+
+	string clock = save_get("clock", "0,7,0,1,1");
+	string[]@ cb = clock.split(",");
+	if (cb.length() >= 5) {
+		g_current_minute = uint(parse_int(cb[0]));
+		g_current_hour = uint(parse_int(cb[1]));
+		g_current_day_of_week = uint(parse_int(cb[2]));
+		g_current_week = uint(parse_int(cb[3]));
+		g_current_day = uint(parse_int(cb[4]));
+	}
+	string pl = save_get("player", "");
+	string[]@ pb = pl.split(",");
+	if (pb.length() >= 4) {
+		int room = parse_int(pb[0]);
+		if (room >= 0 and room < ROOM_COUNT) g_player_room = room;
+		g_px = float(parse_double(pb[1]));
+		g_py = float(parse_double(pb[2]));
+		g_facing = parse_double(pb[3]);
+	}
+
+	/* Products, orders, loans and staff are read back from the whole file. */
+	file f;
+	if (!f.open(slot_path(slot), "rb")) return;
+	string all = f.read();
+	f.close();
+	string[]@ lines = all.split("\n");
+	g_orders.resize(0);
+	g_loans.resize(0);
+	g_staff.resize(0);
+	g_reviews.resize(0);
+	g_regulars.resize(0);
+	g_draft_qty.resize(g_catalog.length());
+	for (uint i = 0; i < g_draft_qty.length(); i++) g_draft_qty[i] = 0;
+	for (uint i = 0; i < lines.length(); i++) {
+		string ln = lines[i].trim_whitespace();
+		int eq = ln.find_first("=");
+		if (eq < 0) continue;
+		string key = ln.substr(0, eq);
+		string val = ln.substr(eq + 1).trim_whitespace();
+		string[]@ parts = val.split(",");
+		if (key == "prod" and parts.length() >= 4) {
+			int idx = parse_int(parts[0]);
+			product@ p = product_at(idx);
+			if (@p !is null) {
+				p.stock = parse_int(parts[1]);
+				p.price = parse_int(parts[2]);
+				p.cost = parse_int(parts[3]);
+				/* Put right anything that could not have happened. */
+				if (p.stock > p.capacity) p.stock = p.capacity;
+				if (p.stock < 0) p.stock = 0;
+				if (p.price < 1) p.price = 1;
+				if (p.cost < 1) p.cost = 1;
+			}
+		} else if (key == "regular" and parts.length() >= 3) {
+			g_regulars.insert_last(regular_memory(parts[0], parse_int(parts[1]), parse_int(parts[2])));
+		} else if (key == "draft" and parts.length() >= 2) {
+			int idx = parse_int(parts[0]);
+			if (idx >= 0 and uint(idx) < g_draft_qty.length()) g_draft_qty[idx] = parse_int(parts[1]);
+		} else if (key == "order" and parts.length() >= 3) {
+			order_rec@ o = order_rec(parse_int(parts[0]), TRUCK_MINUTE, parse_int(parts[1]),
+				parse_int(parts[2]), int(g_current_week));
+			o.qty.resize(g_catalog.length());
+			for (uint q = 0; q < o.qty.length(); q++) o.qty[q] = 0;
+			g_orders.insert_last(o);
+		} else if (key == "orderline" and parts.length() >= 3) {
+			int oi = parse_int(parts[0]);
+			int pi = parse_int(parts[1]);
+			if (oi >= 0 and uint(oi) < g_orders.length() and pi >= 0 and uint(pi) < g_catalog.length()) {
+				g_orders[oi].qty[pi] = parse_int(parts[2]);
+			}
+		} else if (key == "loan" and parts.length() >= 6) {
+			loan@ l = loan(parse_int(parts[0]), parse_int(parts[2]), parse_int(parts[3]), parse_int(parts[4]), parse_int(parts[5]) == 1);
+			l.remaining = parse_int(parts[1]);
+			g_loans.insert_last(l);
+		} else if (key == "staff" and parts.length() >= 8) {
+			worker@ w = worker(parts[0], parse_int(parts[1]), parse_int(parts[2]), parse_int(parts[3]), parse_int(parts[4]));
+			w.dishonest = parse_int(parts[5]) == 1;
+			w.crooked = parse_int(parts[6]) == 1;
+			string[]@ rb = parts[7].split(":");
+			w.rota.resize(0);
+			for (uint d = 0; d < rb.length(); d++) w.rota.insert_last(parse_int(rb[d]));
+			g_staff.insert_last(w);
+		} else if (key == "review" and parts.length() >= 2) {
+			g_reviews.insert_last(review("a customer", "It is a shop. It sold me things.",
+				parse_int(parts[0]), parse_int(parts[1])));
+		}
+	}
+
+	g_in_jail = false;
+	people_init_keep_reputation();
+	board_schedule_inspection();
+	rooms_refresh_audibility();
+	g_game_mode = true;
+	g_modal = MODAL_NONE;
+	g_menu.resize(0);
+	/* The speakers follow the store we just loaded, not the one we came from. */
+	music_apply();
+	say("Loaded " + g_store_name + ", slot " + slot + ". It is " + clock_full_text()
+		+ ", the till holds " + money(g_cash) + ", and your reputation is "
+		+ int(g_reputation + 0.5) + " stars.", true);
+	log_line("save", "loaded slot " + slot);
+}
+
+/* Reloading must not wipe the reputation we just read out of the file. */
+void people_init_keep_reputation() {
+	g_customers.resize(0);
+	g_queue.resize(0);
+}
+
+void delete_slot(int slot) {
+	string path = slot_path(slot);
+	if (!file_exists(path)) { say("That slot is empty.", true); return; }
+	file_delete(path);
+	if (file_exists(path + ".bak")) file_delete(path + ".bak");
+	say("Slot " + slot + " has been deleted, and its backup with it.", true);
+}
+
+string slot_summary(int slot) {
+	int keep = g_slot;
+	g_slot = slot;
+	if (!file_exists(slot_path(slot))) { g_slot = keep; return "Slot " + slot + ", empty"; }
+	string name = save_get("name", "a store");
+	int day = save_get_int("clock_day", 0);
+	int cash = save_get_int("cash", 0);
+	g_slot = keep;
+	return "Slot " + slot + ", " + name + ", " + money(cash);
+}
+
+/* ==========================================================================
+   11.  NEW GAME
+   ========================================================================= */
+
+void new_game_in(int slot) {
+	g_slot = slot;
+	g_store_name = "Store Express";
+	g_renamed = false;
+	hardware_reset_for_new_game();   /* no machine here has ever been set up */
+	/* A new store's machines start at the default speed and pitch, not at
+	   whatever the last store the player loaded was left at. */
+	for (int d = CHIP_DEVICE_COMPUTER; d <= CHIP_DEVICE_PHONE; d++) {
+		chip_speed_apply(d, CHIP_SPEED_DEFAULT);
+		chip_pitch_apply(d, CHIP_PITCH_NORMAL);
+	}
+	g_cash = cfg_int("starting_cash_cents", 250000);
+	g_arrears = 0;
+	g_bill_stage = BILL_STAGE_OK;
+	g_account_hold = false;
+	g_emergency_loan_taken = false;
+	g_insurance_tier = INS_BASIC;
+	g_insurance_weeks_unpaid = 0;
+	g_pending_insurance_claim = 0;
+	g_declared_pct = 100;
+	g_under_declared = false;
+	g_total_takings = 0;
+	g_tax_paid = 0;
+	g_fines_paid = 0;
+	g_wk_sales = 0; g_wk_stock = 0; g_wk_wages = 0; g_wk_fines = 0; g_wk_other = 0; g_wk_customers = 0;
+	g_game_over = false;
+	g_game_over_reason = "";
+	g_licence_suspended = false;
+	g_suspension_weeks_left = 0;
+	g_bad_inspections = 0;
+	g_fines_from_board = 0;
+	g_unscanned_sales = 0; g_restricted_sales = 0; g_id_scans_logged = 0;
+	g_in_jail = false;
+	g_hours_24h = false;
+	g_drinks_self_serve = 1;
+	g_music_on = false;
+	g_music_volume = 100;
+	g_sub_volume = 0;
+	g_current_minute = 0;
+	g_current_hour = 7;
+	g_current_day_of_week = MONDAY;
+	g_current_week = 1;
+	g_current_day = 1;
+	g_last_day_seen = 1;
+	g_clock_accum = 0.0;
+
+	/* The world and the catalogue are built once, at startup. Starting a new
+	   store resets their state rather than rebuilding them: rooms_init()
+	   registers the ambient beacons, and calling it twice would leave two copies
+	   of every hum playing on top of each other. */
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		product@ p = g_catalog[i];
+		p.stock = p.capacity;
+		p.price = p.fair;
+		p.cost = p.opening_cost;
+		p.sold_since_delivery = 0;
+		p.revenue_since_delivery = 0;
+	}
+	g_draft_qty.resize(0);
+	g_orders.resize(0);
+	g_mess.resize(0);
+	staff_init();
+	people_init();
+	trouble_init();
+	g_emails.resize(0);
+	g_news.resize(0);
+	g_player_room = ROOM_SHOP;
+	g_px = 4.5; g_py = 2.5; g_facing = 0.0;
+	rooms_camera_drop();
+	rooms_refresh_audibility();
+	board_schedule_inspection();
+	email_add("Marguerite Dell", "Welcome to the shop, and the rules that matter");
+	email_add("Ridgeline Wholesale", "Your account is open, order by Saturday");
+	g_game_mode = true;
+	g_modal = MODAL_NONE;
+	g_menu.resize(0);
+	/* A new store always starts with its music off, so anything playing from a
+	   store you just left has to stop. */
+	music_apply();
+	email_add("The bank", "Bill day is every Friday at six in the morning");
+	email_add("The alcohol board", "Identification scans are audited monthly");
+	say("New store, slot " + slot + ". You are " + g_store_name + ", on Main Street, "
+		+ "with " + money(g_cash) + " in the till and nobody employed. It is Monday, day one, "
+		+ "seven in the morning, and the shop is open. Press F1 for the controls, or B to scan the room.", true);
+	log_line("game", "new game in slot " + slot);
+}
+
+/* ==========================================================================
+   12.  THE CLOCK AND THE DAY CYCLE
+   ========================================================================== */
+
+void world_new_day() {
+	g_current_day++;
+	g_current_day_of_week++;
+	if (g_current_day_of_week > 6) {
+		g_current_day_of_week = 0;
+		g_current_week++;
+		shop_market_week();
+	}
+	staff_accrue_daily_wages();
+	staff_maybe_request();
+	staff_request_deadlines();
+	people_reputation_update();
+	shop_check_deliveries();
+	/* An open position brings five more applicants every Monday. */
+	if (int(g_current_day_of_week) == MONDAY) staff_applicant_morning();
+	log_line("clock", "day " + g_current_day + ", " + day_name(int(g_current_day_of_week))
+		+ ", week " + g_current_week);
+}
+
+void world_hour_struck() {
+	/* Six in the morning: applicants, and the truck. */
+	if (int(g_current_hour) == 6 and int(g_current_minute) == 0) {
+		if (int(g_current_day_of_week) == FRIDAY) {
+			money_bill_day();
+			money_start_new_week();
+			money_audit_check();
+		}
+	}
+	if (int(g_current_hour) == 6 and int(g_current_minute) == 30) shop_check_deliveries();
+	/* Closing time announcements. */
+	if (!g_hours_24h and till_usable()) {
+		int to_close = clock_minutes_to_close();
+		if (to_close == 30 or to_close == 15 or to_close == 5) {
+			/* The bell over the shop's doors rings to call the time, in the doorway
+			   rather than all over the room, and cut to the ring: the recording is a
+			   twenty two second bell and a doorway is the first moment of it. */
+			sfx_at(ROOM_SHOP, 31.5, 24.5, 0.0, A("chime.ogg"), -6.0, DOOR_CHIME_CUT_MS);
+			/* The announcement plays through the same speakers, so the music gets
+			   out of its way first. */
+			music_duck(7000);
+			say("The shop's announcement speakers ring a ding, and call the time. The shop closes in "
+				+ plural(to_close, "minute", "minutes") + ".", true);
+		}
+	}
+	board_check_inspection();
+	g_day_ms_accum = 0;
+}
+
+void clock_advance_one_minute() {
+	g_current_minute++;
+	if (int(g_current_minute) >= 60) {
+		g_current_minute = 0;
+		g_current_hour++;
+	}
+	if (int(g_current_hour) >= 24) {
+		g_current_hour = 0;
+		world_new_day();
+	}
+	shop_check_deliveries();
+	mess_tick_minute();
+	staff_janitor_minute_tick();
+	trouble_tick_minute();
+	if (int(g_current_minute) == 0) world_hour_struck();
+	if (g_in_jail) jail_step();
+}
+
+void clock_tick(double dt_ms) {
+	if (clock_is_paused()) return;
+	if (g_game_over) return;
+	if (g_in_jail) { g_jail_next_step = ticks(); jail_step(); return; }
+	if (g_clock_fast_forward) {
+		/* The jail fast forward runs the same clock, only much faster. */
+		g_clock_accum += dt_ms * 40.0;
+	} else {
+		g_clock_accum += dt_ms * g_minutes_per_second;
+	}
+	while (g_clock_accum >= 1000.0) {
+		g_clock_accum -= 1000.0;
+		clock_advance_one_minute();
+		if (g_game_over) return;
+	}
+}
+
+void clock_announce() {
+	music_duck(6000);      /* anything read out through the shop's speakers */
+	string s = "It is " + clock_full_text() + ". ";
+	s += clock_shop_open() ? "The shop is open. " : "The shop is shut. ";
+	if (!g_hours_24h) {
+		int to_close = clock_minutes_to_close();
+		if (to_close >= 0) s += "It closes in " + duration_text(to_close) + ". ";
+	}
+	if (clock_is_paused()) s += "The clock is stopped while this screen is open. ";
+	else s += "The clock is running. ";
+	s += "The till holds " + money(g_cash) + ". ";
+	if (g_licence_suspended) s += "Your licence is suspended for another " + g_suspension_weeks_left + " weeks. ";
+	if (!g_power_on) s += "The power is out. ";
+	say(s, true);
+}
+
+/* ==========================================================================
+   13.  INTERACTION
+   ========================================================================== */
+
+thing@ thing_find_shim() { return thing_under_player(); }
+
+void open_sleep() {
+	if (g_game_over) return;
+	g_modal = MODAL_SLEEP;
+	g_menu.resize(0);
+	menu_page@ p = menu_page("Your bed. Sleeping moves the clock to six in the morning, and saves the game");
+	p.add("Sleep until six in the morning", ACT_SLEEP);
+	p.add("Not yet", ACT_CLOSE);
+	menu_push(p);
+}
+
+void do_sleep() {
+	stop_all_speech();
+	sfx_ui(A("door_close.ogg"), -12.0);
+	/* If the shop is still open, it keeps trading while you snore, and with
+	   nobody on the till customers get fed up and leave. */
+	if (clock_shop_open() and !staff_any_on_duty(ROLE_CASHIER)) {
+		say("You sleep with the shop still open, and nobody on the till. Customers get fed up and walk out.", true);
+		int lost = random(2, 8);
+		for (int i = 0; i < lost; i++) people_spawn();
+		for (uint i = 0; i < g_customers.length(); i++) {
+			customer@ c = g_customers[i];
+			if (@c is null) continue;
+			c.mood -= 5;
+		}
+	}
+	/* Advance to six in the morning. */
+	int guard = 0;
+	while (guard < 2000) {
+		guard++;
+		if (int(g_current_hour) == 6 and int(g_current_minute) == 0) break;
+		clock_advance_one_minute();
+	}
+	save_game(true);
+	say("You sleep, and wake at six in the morning. " + clock_full_text() + ". The shop is saved.", true);
+	mechanics_close_modal();
+}
+
+void mechanics_interact() {
+	if (g_game_over) { say(g_game_over_reason + " Escape opens the menu, where you can start again or load a save.", true); return; }
+	if (g_in_jail) { say("You are in a cell, not behind the counter.", true); return; }
+
+	/* Standing in a mess is reason enough on its own, and it comes before the
+	   nothing-here reply, because a mop is not a fixture. */
+	mess@ spill = mess_at(g_player_room, g_px, g_py);
+	if (@spill !is null) {
+		string what = mess_word(spill.kind);
+		mess_remove_at(g_player_room, g_px, g_py);
+		sfx_ui(A("squish.mp3"), -12.0);
+		say("You clean up " + what + ". The floor is dry there again.", true);
+		return;
+	}
+
+	thing@ t = thing_under_player();
+	if (@t is null) { say("There is nothing here to use.", true); return; }
+
+	switch (t.kind) {
+		case IK_REGISTER:      open_register(); return;
+		case IK_QUEUE_TILL:    open_register(); return;
+		case IK_COMPUTER:      open_computer(); return;
+		case IK_BACKDOOR:
+			say("The office back door. It is bolted from the inside, and the alley beyond it is empty.", true);
+			return;
+		case IK_BED:           open_sleep(); return;
+		case IK_SHELF_FACE:
+			say(shop_report_face(t.ref) + " Press Enter again to see the lines on this face.", true);
+			/* A second press opens the face's lines. */
+			return;
+		case IK_COFFEE:
+			say("The coffee station. " + shop_face_stock_pct(FACE_COUNTER) + " percent of the counter lines are stocked. "
+				+ ((g_drinks_self_serve == 1) ? "Customers pour their own." : "Somebody has to pour every cup."), true);
+			return;
+		case IK_FOUNTAIN:
+			say("The soda fountain. " + ((g_drinks_self_serve == 1) ? "Self serve, so customers help themselves."
+				: "Employee serve, so the drinks are paid for before they are poured."), true);
+			return;
+		case IK_FRIDGE_CASE:
+			say("The refrigerated display cases hum along the north wall. " + trouble_damaged_text(), true);
+			return;
+		case IK_FROZEN_CASE:
+			say("The frozen food cases. " + trouble_damaged_text(), true);
+			return;
+		case IK_COOLER_DOOR:
+			say("The walk in cooler door. The door is in the middle of the refrigerated cases, which is how you know where you are.", true);
+			return;
+		case IK_FREEZER_DOOR:
+			say("The walk in freezer door.", true);
+			return;
+		case IK_COOLER_RACK: case IK_FREEZER_RACK:
+			say(t.label + ", holding stock for the shelves.", true);
+			return;
+		case IK_COUNTER:
+			if (t.ref == 1) {
+				say("The cigarette and vape cabinet. " + shop_face_stock_pct(FACE_COUNTER)
+					+ " percent stocked. Every sale of these needs an identification scan.", true);
+				return;
+			}
+			say("The counter, where the till sits.", true);
+			return;
+		case IK_SAFE:     say("The office safe. It holds the takings you have banked, " + money(g_bank) + ".", true); return;
+		case IK_TV:       say("The television is " + (g_tv_on ? "on" : "off") + ".", true); return;
+		case IK_KITCHEN_FRIDGE: say("The kitchen fridge hums.", true); return;
+		case IK_SPEAKERS:
+			say("The ceiling speakers. The music is " + (g_music_on ? "on" : "off")
+				+ ", playing " + music_now_text() + ", at " + g_music_volume
+				+ " percent, with the subwoofers at " + g_sub_volume + " percent. "
+				+ "They are only heard in here and through the wall, so walk into the office or the cooler and the shop's music stays behind.", true);
+			return;
+		case IK_PUMP: case IK_AIRPUMP:
+			say("The pumps are not open for business yet. Fuel is coming in a later version. "
+				+ "For now you are a gas station that sells no gas.", true);
+			return;
+		case IK_ROAD:
+			say("The road. Traffic goes by, and nobody stops.", true);
+			return;
+	}
+	say("There is nothing to do with " + t.label + ".", true);
+}
+
+/* ==========================================================================
+   14.  THE OPTIONS AND ISSUE PAGES, AND THE PAUSE MENU
+   ========================================================================== */
+
+void open_issues() {
+	g_modal = MODAL_ISSUES;
+	g_menu.resize(0);
+	menu_page@ p = menu_page("Issue reporter. This writes your exact position to the diagnostics log");
+	p.add("Audio cues do not line up", ACT_ISSUE_AUDIO);
+	p.add("The clock does not look right", ACT_ISSUE_CLOCK);
+	p.add("A room or doorway behaves wrongly", ACT_ISSUE_MAP);
+	p.add("Something else", ACT_ISSUE_OTHER);
+	p.add("Cancel", ACT_CLOSE);
+	menu_push(p);
+}
+
+void file_issue(const string&in category) {
+	file f;
+	if (f.open(ISSUE_FILE, "ab")) {
+		f.write("[" + stamp(ticks()) + "] " + category
+			+ " | room: " + room_name(g_player_room)
+			+ " | at: " + num1(g_px) + "," + num1(g_py)
+			+ " | clock: " + clock_full_text()
+			+ " | cash: " + money(g_cash)
+			+ " | customers: " + people_in_shop()
+			+ " | reputation: " + num1(g_reputation) + "\r\n");
+		f.close();
+	}
+	say("Reported: " + category + ", from " + room_name(g_player_room) + " at "
+		+ num1(g_px) + " east, " + num1(g_py) + " north. It is in the issue log.", true);
+	mechanics_close_modal();
+}
+
+void open_pause() {
+	save_game(true);
+	g_modal = MODAL_PAUSE;
+	g_menu.resize(0);
+	menu_page@ p = menu_page("Paused. The clock has stopped, and customers' patience with it");
+	p.add("Resume trading", ACT_PAUSE_RESUME);
+	p.add("Save the game", ACT_PAUSE_SAVE);
+	p.add("Options", ACT_PAUSE_OPTIONS);
+	p.add("Save and return to the main menu", ACT_PAUSE_MENU);
+	p.add("Save and quit", ACT_PAUSE_QUIT);
+	menu_push(p);
+}
+
+menu_page@ pause_options_page() {
+	menu_page@ p = menu_page("Options. The same choices the main menu offers");
+	p.add("Voice: " + (g_sr_preferred ? "the screen reader when one is available" : "this computer's own voices"),
+		ACT_PAUSE_TTS);
+	p.add("Diagnostics are " + (g_diag_enabled ? "on" : "off"), ACT_PAUSE_DIAG);
+	p.add("Sound output: " + audio_device_summary(), ACT_PAUSE_SOUND);
+	p.add("Back", ACT_BACK);
+	return p;
+}
+
+/* The device list, drawn from audio.nvgt's own list so this page and the main
+   menu's page are the same list with the same numbers. */
+menu_page@ sound_output_page() {
+	audio_devices_refresh();
+	menu_page@ p = menu_page("Sound output. Which speakers or headphones the game plays through");
+	for (int i = 0; i < audio_device_menu_items(); i++) {
+		p.add(audio_device_menu_label(i), ACT_SOUND_DEVICE_BASE + i);
+	}
+	return p;
+}
+
+/* ==========================================================================
+   15.  DISPATCH
+   ========================================================================== */
+
+void menu_dispatch(int action, const string&in label) {
+	/* ---- dynamic families first ---------------------------------------- */
+	if (action == ACT_SERVE_FETCH) { sale_open(); sale_page_build(); return; }
+	if (action >= ACT_SPEECH_SPEED_CHOICE_BASE and action < ACT_SPEECH_SPEED_CHOICE_BASE + 20) {
+		chip_setting_choose(false, action - ACT_SPEECH_SPEED_CHOICE_BASE);
+		return;
+	}
+	if (action >= ACT_SPEECH_PITCH_CHOICE_BASE and action < ACT_SPEECH_PITCH_CHOICE_BASE + 20) {
+		chip_setting_choose(true, action - ACT_SPEECH_PITCH_CHOICE_BASE);
+		return;
+	}
+	if (action >= ACT_SLOT_BASE and action < ACT_SLOT_BASE + 20) {
+		int slot = action - ACT_SLOT_BASE;
+		if (g_game_mode) { save_game(); return; }
+		if (file_exists(slot_path(slot))) load_game_from(slot);
+		else new_game_in(slot);
+		return;
+	}
+	if (action >= ACT_STAFF_HIRE_BASE and action < ACT_STAFF_HIRE_BASE + 1500) {
+		int raw = action - ACT_STAFF_HIRE_BASE;
+		int idx = raw % 500;
+		int level = raw / 500;       /* 0 asking, 1 minus 25, 2 minus 50 */
+		if (uint(idx) >= g_applicants.length()) return;
+		int offer = g_applicants[idx].wage - level * 25;
+		staff_hire(idx, offer);
+		menu_back();
+		return;
+	}
+	if (action >= ACT_STAFF_EMP_BASE and action < ACT_STAFF_EMP_BASE + 400) {
+		menu_push(employee_page(action - ACT_STAFF_EMP_BASE)); return;
+	}
+	if (action >= ACT_STAFF_FIRE_BASE and action < ACT_STAFF_FIRE_BASE + 400) {
+		staff_fire(action - ACT_STAFF_FIRE_BASE); menu_back(); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_RAISE_BASE and action < ACT_STAFF_RAISE_BASE + 400) {
+		staff_give_raise(action - ACT_STAFF_RAISE_BASE, 100); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_CUT_BASE and action < ACT_STAFF_CUT_BASE + 400) {
+		staff_cut_wage(action - ACT_STAFF_CUT_BASE, 100); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_ROTA_M_BASE and action < ACT_STAFF_ROTA_M_BASE + 400) {
+		staff_set_rota_shift(action - ACT_STAFF_ROTA_M_BASE, SHIFT_MORNING); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_ROTA_E_BASE and action < ACT_STAFF_ROTA_E_BASE + 400) {
+		staff_set_rota_shift(action - ACT_STAFF_ROTA_E_BASE, SHIFT_EVENING); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_ROTA_N_BASE and action < ACT_STAFF_ROTA_N_BASE + 400) {
+		staff_set_rota_shift(action - ACT_STAFF_ROTA_N_BASE, SHIFT_NIGHT); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_GRANT_BASE and action < ACT_STAFF_GRANT_BASE + 400) {
+		staff_grant_request(action - ACT_STAFF_GRANT_BASE); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_REFUSE_BASE and action < ACT_STAFF_REFUSE_BASE + 400) {
+		staff_refuse_request(action - ACT_STAFF_REFUSE_BASE); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_APPL_BASE and action < ACT_STAFF_APPL_BASE + 400) {
+		menu_push(applicant_page(action - ACT_STAFF_APPL_BASE)); return;
+	}
+	if (action >= ACT_STAFF_OPEN_BASE and action < ACT_STAFF_CLOSE_BASE) {
+		staff_open_position(action - ACT_STAFF_OPEN_BASE); menu_back(); return;
+	}
+	if (action >= ACT_STAFF_CLOSE_BASE and action < ACT_STAFF_CLOSE_BASE + 400) {
+		staff_close_position(action - ACT_STAFF_CLOSE_BASE); menu_back(); return;
+	}
+	if (action >= ACT_ORDER_CANCEL_BASE and action < ACT_ORDER_CANCEL_BASE + 100) {
+		shop_cancel_order(action - ACT_ORDER_CANCEL_BASE); menu_back(); return;
+	}
+	if (action >= ACT_ORDER_FACE_BASE and action < ACT_ORDER_FACE_BASE + 200) {
+		shop_order_fill_face(action - ACT_ORDER_FACE_BASE); menu_back(); menu_back(); return;
+	}
+	if (action >= ACT_LOAN_TAKE_BASE and action < ACT_LOAN_TAKE_BASE + 3) {
+		int which = action - ACT_LOAN_TAKE_BASE;
+		int amount = (which == 0) ? 100000 : ((which == 1) ? 250000 : 500000);
+		money_take_loan(amount); menu_back(); return;
+	}
+	if (action >= ACT_LOAN_PAYOFF_BASE and action < ACT_LOAN_PAYOFF_BASE + 100) {
+		money_pay_off_loan(action - ACT_LOAN_PAYOFF_BASE); menu_back(); return;
+	}
+	if (action >= ACT_DECLARE_BASE and action < ACT_DECLARE_BASE + 200) {
+		money_declare(action - ACT_DECLARE_BASE); menu_back(); return;
+	}
+	if (action >= ACT_PRICE_PROD_BASE and action < ACT_PRICE_PROD_BASE + 2000) {
+		int idx = action - ACT_PRICE_PROD_BASE;
+		g_price_product = idx;
+		menu_push(product_price_page(idx));
+		return;
+	}
+	if (action >= ACT_PRICE_FACE_BASE and action < ACT_PRICE_FACE_BASE + 200) {
+		int face = action - ACT_PRICE_FACE_BASE;
+		if (face == 100) face = FACE_COUNTER;
+		g_price_face = face;
+		if (g_modal == MODAL_COMPUTER and g_menu.length() > 0) {}
+		menu_push(face_price_page(face));
+		return;
+	}
+	/* The device list of the pause menu's Options page. */
+	if (action >= ACT_SOUND_DEVICE_BASE and action < ACT_SOUND_DEVICE_BASE + 200) {
+		int choice = audio_device_menu_choice(action - ACT_SOUND_DEVICE_BASE);
+		if (choice == OUT_DEVICE_BACK) { menu_back(); return; }
+		if (choice == out_device_trial_index()) {
+			/* The same line twice: the player heard it, so it stays. */
+			audio_device_confirm();
+			device_test_sweep_stop();
+			say("Kept. The game plays through " + audio_device_label(choice) + " now, and will again next time.", true);
+			return;
+		}
+		if (!audio_device_try(choice)) {
+			say("The machine would not open " + audio_device_label(choice) + ", so nothing has changed.", true);
+			return;
+		}
+		device_test_sweep_begin();
+		string trying = "Trying " + audio_device_label(choice) + ". Listen: a blip on the left, then one on the right. ";
+		trying += "Press enter again to keep it, or escape and the sound goes back to ";
+		trying += (g_out_device_home < 0) ? "the system default" : audio_device_label(g_out_device_home);
+		trying += ". Nothing is written until you keep it.";
+		say(trying, true);
+		return;
+	}
+
+	/* Order review line removal uses the same index space as products. */
+	if (action >= 22000 and action < 22000 + 2000) {
+		int idx = action - 22000;
+		if (idx >= 0 and uint(idx) < g_draft_qty.length()) g_draft_qty[idx] = 0;
+		say("Taken off the order.", true);
+		menu_back();
+		return;
+	}
+
+	switch (action) {
+	case ACT_CLOSE:
+	case ACT_COMP_LOGOFF: {
+		int dev = machine_for_modal();
+		if (dev >= 0) { machine_chip_cut(); machine_power_sound(dev, false); }
+		mechanics_close_modal();
+		say(g_modal == MODAL_NONE ? "Closed." : "", true);
+		return;
+	}
+	case ACT_PAUSE_RESUME: mechanics_close_modal(); say("Back to the shop.", true); return;
+	case ACT_PAUSE_SAVE:   save_game(); menu_back(); return;
+	case ACT_PAUSE_OPTIONS: menu_push(pause_options_page()); return;
+	case ACT_PAUSE_TTS:
+		g_sr_preferred = !g_sr_preferred;
+		say(g_sr_preferred ? "Using the screen reader when one is available."
+			: "Using the built in voice instead.", true);
+		menu_back();
+		return;
+	case ACT_PAUSE_DIAG:
+		g_diag_enabled = !g_diag_enabled;
+		say("Diagnostics are " + (g_diag_enabled ? "on" : "off") + ".", true);
+		menu_back();
+		return;
+	case ACT_PAUSE_SOUND:
+		out_device_trial_begin();
+		menu_push(sound_output_page());
+		return;
+	/* The machine's own speech speed and pitch, on the machine's own screen.
+	   Enter on one of those lines opens the page of settings behind it rather
+	   than stepping the setting where it stands. */
+	case ACT_SPEED_TERM:  menu_push(chip_setting_page(CHIP_DEVICE_COMPUTER, false)); return;
+	case ACT_PITCH_TERM:  menu_push(chip_setting_page(CHIP_DEVICE_COMPUTER, true));  return;
+	case ACT_SPEED_PHONE: menu_push(chip_setting_page(CHIP_DEVICE_PHONE, false)); return;
+	case ACT_PITCH_PHONE: menu_push(chip_setting_page(CHIP_DEVICE_PHONE, true));  return;
+	case ACT_BACK: menu_back(); return;
+		case ACT_PAUSE_MENU:
+			save_game(true);
+			mechanics_close_modal();
+			g_game_mode = false;
+			say("Saved. Back to the main menu.", true);
+			return;
+		case ACT_PAUSE_QUIT:   save_game(true); request_quit = true; return;
+
+		/* ---- serving ---------------------------------------------------- */
+case ACT_SERVE_FETCH:      sale_open(); sale_page_build(); return;
+		case ACT_SERVE_SCAN_ONE:   sale_scan_one(); return;
+		case ACT_SERVE_SCAN_REST:  sale_scan_rest(); return;
+		case ACT_SERVE_ASK_ID:     sale_ask_id(); return;
+		case ACT_SERVE_REFUSE_REST: sale_refuse_restricted(); return;
+		case ACT_SERVE_CARD:       sale_take_card(); return;
+		case ACT_SERVE_CASH_EXACT: sale_take_cash(g_sale_total); return;
+		case ACT_SERVE_CASH_ROUND: sale_take_cash(((g_sale_total / 500) + 1) * 500); return;
+		case ACT_SERVE_CASH_WALLET: sale_take_short_payment(); return;
+		case ACT_SERVE_SELL_COVERS: sale_sell_covers(); sale_page_build(); return;
+		case ACT_SERVE_FREE_DRINK:  sale_free_drink(); sale_page_build(); return;
+		case ACT_SERVE_REFUSE_SALE: sale_refuse_sale(); return;
+		case ACT_SERVE_COUNT_CHANGE: sale_count_change(); return;
+		case ACT_SERVE_WALK_AWAY:  sale_walk_away(); return;
+
+		/* ---- computer --------------------------------------------------- */
+		case ACT_COMP_RESTOCK:  menu_push(order_page()); return;
+		case ACT_COMP_DAMAGE:   menu_push(damage_page()); return;
+		case ACT_COMP_BILLS:    menu_push(bills_page()); return;
+		case ACT_COMP_REPORTS:  menu_push(reports_page()); return;
+		case ACT_COMP_PRICES:   menu_push(prices_home_page()); return;
+		case ACT_COMP_STAFF:    menu_push(staff_page()); return;
+		case ACT_COMP_POLICIES: menu_push(policies_page()); return;
+		case ACT_COMP_HOURS:    menu_push(hours_page()); return;
+		case ACT_COMP_MUSIC:    menu_push(music_page()); return;
+		case ACT_COMP_RENAME:   menu_push(rename_page()); return;
+		case ACT_COMP_LAW:      say(trouble_police_record_text() + " " + money_bills_text(), true); return;
+
+		case ACT_ORDER_FILL_ALL: shop_order_fill_all(); menu_back(); return;
+		case ACT_ORDER_REVIEW:   menu_push(order_review_page()); return;
+		case ACT_ORDER_PLACE:    shop_order_place(); menu_back(); return;
+		case ACT_ORDER_CLEAR:    shop_order_clear(); menu_back(); return;
+		case ACT_ORDER_PLACED:   menu_push(order_placed_page()); return;
+		case ACT_ORDER_FACE_BASE: menu_push(order_aisle_page()); return;
+
+		case ACT_REPAIR_ALL:  trouble_repair_all(); menu_back(); return;
+		case ACT_CLAIM_STOCK:
+			if (g_last_thief_loss <= 0) { say("There is nothing to claim for.", true); return; }
+			money_claim_stock(g_last_thief_loss, "a shoplifter");
+			g_last_thief_loss = 0;
+			menu_back();
+			return;
+
+		case ACT_BANK_PAY_ARREARS:
+			if (g_arrears <= 0) { say("You do not owe anything.", true); return; }
+			if (!money_can_afford(g_arrears)) { say("That would take " + money(g_arrears) + " and the till holds " + money(g_cash) + ".", true); return; }
+			g_cash -= g_arrears;
+			g_arrears = 0;
+			g_bill_stage = BILL_STAGE_OK;
+			g_account_hold = false;
+			sfx_ui(A("register.ogg"), -8.0);
+			say("You paid everything you owed. The wholesaler has taken your account off hold, and the bank loves you again.", true);
+			return;
+		case ACT_BANK_PNL_WEEK:  say(money_pnl_text() + " " + money_status_text(), true); return;
+		case ACT_BANK_PNL_LAST:  say(money_pnl_text(), true); return;
+		case ACT_BANK_BILL_LIST: say(money_bills_text(), true); return;
+		case ACT_BANK_INSURANCE: menu_push(insurance_page()); return;
+		case ACT_BANK_LOANS:     menu_push(loans_page()); return;
+		case ACT_BANK_DECLARE:   menu_push(declare_page()); return;
+		case ACT_INS_NONE:  money_set_insurance(INS_NONE);  menu_back(); return;
+		case ACT_INS_BASIC: money_set_insurance(INS_BASIC); menu_back(); return;
+		case ACT_INS_HALF:  money_set_insurance(INS_BASIC_HALF); menu_back(); return;
+		case ACT_INS_ALL:   money_set_insurance(INS_BASIC_ALL); menu_back(); return;
+		case ACT_EMERGENCY_LOAN: money_take_emergency_loan(); menu_back(); return;
+
+		case ACT_REP_TILL:      say("The till holds " + money(g_cash) + ".", true); return;
+		case ACT_REP_SALES:     say(shop_report_sales(), true); return;
+		case ACT_REP_LEVELS:    say(shop_report_levels(), true); return;
+		case ACT_REP_EMPTY:     say(shop_report_out_of_stock(), true); return;
+		case ACT_REP_SPEND:     say(shop_report_spend(), true); return;
+		case ACT_REP_BESTWORST: say(shop_report_best_worst(), true); return;
+		case ACT_REP_MARKET:    say(shop_market_text(), true); return;
+		case ACT_REP_AISLES:    menu_push(aisles_page()); return;
+
+		case ACT_PRICE_UP5:    if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price + 5); } return;
+		case ACT_PRICE_UP25:   if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price + 25); } return;
+		case ACT_PRICE_DOWN5:  if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price - 5); } return;
+		case ACT_PRICE_DOWN25: if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price - 25); } return;
+		case ACT_PRICE_FAIR:   shop_price_to_fair(g_price_product); return;
+		case ACT_PRICE_FACE_UP5:    shop_price_face(g_price_face, 5); return;
+		case ACT_PRICE_FACE_UP10:   shop_price_face(g_price_face, 10); return;
+		case ACT_PRICE_FACE_DOWN5:  shop_price_face(g_price_face, -5); return;
+		case ACT_PRICE_FACE_DOWN10: shop_price_face(g_price_face, -10); return;
+		case ACT_PRICE_FACE_FAIR:   shop_price_face_to_fair(g_price_face); return;
+		case ACT_PRICE_ALL_FAIR:    shop_price_all_to_fair(); menu_back(); return;
+
+		case ACT_STAFF_POSITIONS:  menu_push(positions_page()); return;
+		case ACT_STAFF_LIST:       menu_push(staff_list_page()); return;
+		case ACT_STAFF_APPLICANTS: menu_push(applicants_page()); return;
+
+		case ACT_POLICY_DRINKS:
+			g_drinks_self_serve = (g_drinks_self_serve == 1) ? 0 : 1;
+			say(g_drinks_self_serve == 1 ? "Self serve. Customers pour their own, which is faster, easier to walk out without paying, and every so often somebody spills."
+				: "Employee serve. Somebody has to pour every cup, and the drink is paid for before it is poured.", true);
+			return;
+		case ACT_HOURS_TOGGLE:
+			if (!g_hours_24h and staff_count() == 0) {
+				say("You cannot open around the clock with nobody employed, because you cannot stay awake forever. Hire somebody first.", true);
+				return;
+			}
+			g_hours_24h = !g_hours_24h;
+			say(g_hours_24h ? "The shop is open around the clock now." : "The shop is open from seven in the morning to ten at night again.", true);
+			return;
+		case ACT_MUSIC_TOGGLE:
+			g_music_on = !g_music_on;
+			music_apply();
+			say(g_music_on ? ("The shop's music is on. " + music_now_text() + " is playing through the ceiling speakers.")
+				: "The shop's music is off.", true);
+			return;
+		case ACT_MUSIC_SCAN:   music_scan(); return;
+		case ACT_MUSIC_SHUFFLE: g_music_shuffle = !g_music_shuffle; say(g_music_shuffle ? "Shuffle on." : "Playing in order.", true); return;
+		case ACT_MUSIC_NEXT:   music_play_next(); say("Playing " + music_now_text() + ".", true); return;
+		case ACT_MUSIC_PREV:   music_play_prev(); say("Playing " + music_now_text() + ".", true); return;
+		case ACT_MUSIC_UP:     g_music_volume += 5; if (g_music_volume > 200) g_music_volume = 200; music_apply(); say("Volume " + g_music_volume + " percent.", true); return;
+		case ACT_MUSIC_DOWN:   g_music_volume -= 5; if (g_music_volume < 0) g_music_volume = 0; music_apply(); say("Volume " + g_music_volume + " percent.", true); return;
+		case ACT_MUSIC_SUB_UP: g_sub_volume += 10; if (g_sub_volume > 300) g_sub_volume = 300; music_apply(); say("Subwoofers " + g_sub_volume + " percent. The shelves are starting to rattle.", true); return;
+		case ACT_MUSIC_SUB_DOWN: g_sub_volume -= 10; if (g_sub_volume < 0) g_sub_volume = 0; music_apply(); say("Subwoofers " + g_sub_volume + " percent.", true); return;
+		case ACT_RENAME:
+			g_store_name = "Shop McShopface";
+			g_renamed = true;
+			say("The store is now called " + g_store_name + ". Choose wisely. That is permanent.", true);
+			menu_back();
+			return;
+		case ACT_RENAME_CONFIRM:
+			g_store_name = "Shop McShopface";
+			g_renamed = true;
+			say("The store is now called " + g_store_name + ".", true);
+			menu_back();
+			return;
+
+		case ACT_SLEEP: do_sleep(); return;
+
+		case ACT_PHONE_EMAIL:   say(phone_email_text(), true); return;
+		case ACT_PHONE_NEWS:    say(phone_news_text(), true); return;
+		case ACT_PHONE_REVIEWS: say(people_reviews_text(), true); return;
+
+		case ACT_ISSUE_AUDIO: file_issue("audio cues do not line up"); return;
+		case ACT_ISSUE_CLOCK: file_issue("the clock does not look right"); return;
+		case ACT_ISSUE_MAP:   file_issue("a room or doorway behaves wrongly"); return;
+		case ACT_ISSUE_OTHER: file_issue("something else"); return;
+	}
+	say("That is not available.", true);
+}
+
+
+void menu_move(int delta) {
+	if (g_menu.length() == 0) return;
+	menu_page@ p = g_menu[g_menu.length() - 1];
+	if (p.count() == 0) return;
+	p.index += delta;
+	if (p.index < 0) p.index = p.count() - 1;
+	if (p.index >= p.count()) p.index = 0;
+	sfx_tick();
+	menu_speak_current(false);
+}
+
+void menu_jump(int delta) {
+	if (g_menu.length() == 0) return;
+	menu_page@ p = g_menu[g_menu.length() - 1];
+	if (p.count() == 0) return;
+	p.index += delta;
+	if (p.index < 0) p.index = 0;
+	if (p.index >= p.count()) p.index = p.count() - 1;
+	sfx_tick();
+	menu_speak_current(false);
+}
+
+void menu_select() {
+	if (g_menu.length() == 0) { mechanics_close_modal(); return; }
+	menu_page@ p = g_menu[g_menu.length() - 1];
+	if (p.count() == 0) { menu_back(); return; }
+	int a = p.actions[p.index];
+	g_last_action = a;
+	diag("menu", "select action " + a + " in " + p.title);
+	/* Somebody is using a machine: what the action has to report is the machine's
+	   to say, so it is caught here and handed to the chip of whichever machine is
+	   on screen instead of being read out in the player's voice. The device is
+	   remembered rather than looked up afterwards, because an action is allowed
+	   to close the screen it was taken from (logging off does exactly that) and
+	   the machine still has to give its answer. */
+	int machine = machine_for_modal();
+	if (machine >= 0) {
+		/* Enter is a move too: the line being read stops and the machine answers
+		   at once, rather than the answer waiting behind the label. */
+		machine_chip_cut();
+		terminal_capture_begin();
+	}
+	menu_dispatch(a, p.labels[p.index]);
+	if (machine >= 0) machine_action_spoken(machine);
+}
+
+/* ==========================================================================
+   16.  SPAWNING CUSTOMERS
+   ========================================================================== */
+
+uint g_next_spawn_at = 0;
+
+void people_spawn_tick(uint now) {
+	if (!g_game_mode or g_game_over or g_in_jail) return;
+	if (!clock_shop_open()) return;
+	if (g_modal == MODAL_SLEEP) return;
+	if (now < g_next_spawn_at) return;
+	double per_hour = people_arrivals_per_hour();
+	int ms = int(3600000.0 / ((per_hour > 0.2) ? per_hour : 0.2));
+	if (ms < 4000) ms = 4000;
+	g_next_spawn_at = now + uint(ms);
+	people_spawn();
+	/* A cashier on shift means the till is covered even when you are not there. */
+	worker@ cashier = staff_on_duty(ROLE_CASHIER);
+	if (@cashier !is null and random(1, 100) <= 60) staff_cashier_crooked_sale(cashier);
+}
+
+/* ==========================================================================
+   17.  THE FRAME AND MINUTE HOOKS
+   ========================================================================== */
+
+/* How long a cashier takes over one customer, from their star rating. A five
+   star is twice the speed of a one star, which is what makes the rating worth
+   the wage. One place decides it, so nothing else re-derives it. */
+int cashier_serve_interval_ms(worker@ w) {
+	int stars = (@w is null or w.stars <= 0) ? 1 : w.stars;
+	return 2400 / stars;
+}
+
+/* A cashier works the till from the same spot you do. Better cashiers are
+   faster and miscount change less often. */
+void cashier_serve_one(worker@ w) {
+	customer@ c = people_queue_head();
+	if (@c is null) return;
+	if (!staff_worker_on_now(w)) return;
+	int total = people_basket_total(c);
+	/* They ring it through. Crooked ones skip the ID scan, which the board will
+	   find in the till log. */
+	bool restricted = people_basket_has_restricted(c);
+	if (restricted) {
+		if (w.crooked) { board_note_sale(true, false); }
+		else { log_id_scan("a restricted line"); board_note_sale(true, true); w.ids_checked++; }
+	}
+	board_note_sale(false, true);
+	/* Take the stock off the shelves. */
+	for (uint i = 0; i < c.basket.length(); i++) shop_sell(c.basket[i], c.basket_qty[i]);
+	money_earn(total);
+	g_wk_customers++;
+	w.served++;
+	/* A five star cashier rarely mistcounts. */
+	int mistake_chance = (6 - w.stars) * 4;
+	if (random(1, 100) <= mistake_chance) {
+		w.change_mistakes++;
+		if (random(1, 100) <= 30) {
+			int short_by = random(50, 400);
+			people_note_short_change(c, short_by);
+		}
+	}
+	c.served = true;
+	c.bought = true;
+	c.spent = total;
+	c.state = CUST_LEAVING;
+	for (int i = int(g_queue.length()) - 1; i >= 0; i--) if (g_queue[i] is c) g_queue.remove_at(uint(i));
+	people_event(c, EV_SERVED);
+	if (!restricted and random(1, 100) <= 20) people_event(c, EV_ID_ASKED);
+	sfx_ui(A("register.ogg"), -12.0);
+	diag("staff", w.name + " served " + c.name + " for " + money(total));
+}
+
+/* ==========================================================================
+   17b.  A CASHIER WITH NOTHING TO DO
+   --------------------------------------------------------------------------
+   A till with somebody behind it is not the same shop as a till on its own, and
+   most of the difference is the talking. A cashier chats with whoever is near
+   the counter when there is no queue, which customers like, and which is the
+   part of a shop a player hears and remembers.
+   ========================================================================== */
+
+/* One slot in the voice pool per member of staff, handed out the first time
+   they speak and kept for the session, so the same cashier sounds like the same
+   person all evening. Nothing here is saved: it is the voice of this session. */
+class staff_voice_rec {
+	string name;
+	int    slot;
+	staff_voice_rec(const string&in n, int s) { name = n; slot = s; }
+}
+
+array<staff_voice_rec@> g_staff_voice_recs;
+
+int staff_voice_for(worker@ w) {
+	/* -1 means "nobody's voice": a member of staff with no worker behind them,
+	   or a shop with no voices left to hand out, speaks in the player's own
+	   channel rather than borrowing somebody else's voice. */
+	if (@w is null) return -1;
+	for (uint i = 0; i < g_staff_voice_recs.length(); i++) {
+		if (g_staff_voice_recs[i].name == w.name) return g_staff_voice_recs[i].slot;
+	}
+	int slot = voice_pool_assign();
+	g_staff_voice_recs.insert_last(staff_voice_rec(w.name, slot));
+	return slot;
+}
+
+/* A staff voice that has been dropped: the member of staff is given another one,
+   so a dead server does not leave the cashier sounding like the player. */
+void staff_reassign_lost_voice(int dead) {
+	if (dead < 0) return;
+	for (uint i = 0; i < g_staff_voice_recs.length(); i++) {
+		if (g_staff_voice_recs[i].slot != dead) continue;
+		g_staff_voice_recs[i].slot = voice_pool_assign();
+		log_line("staff", g_staff_voice_recs[i].name + " moved off a voice that was lost");
+	}
+}
+
+uint g_next_cashier_chatter = 0;
+
+/* Somebody near the till who is not queueing, not leaving and not mid-sale. */
+customer@ cashier_chatter_customer(worker@ w) {
+	customer@ best = null;
+	float bestd = 999.0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.room != ROOM_SHOP) continue;
+		if (c.state == CUST_GONE or c.state == CUST_LEAVING) continue;
+		if (c.state == CUST_QUEUEING or c.state == CUST_SERVING) continue;
+		if (@g_sale_customer is c) continue;
+		float d = dist2(c.x, c.y, 7.5, 2.5);
+		if (d < bestd) { bestd = d; @best = c; }
+	}
+	return best;
+}
+
+void cashier_chatter_tick(uint now) {
+	if (!g_game_mode or g_game_over or g_in_jail) return;
+	if (now < g_next_cashier_chatter) return;
+	g_next_cashier_chatter = now + uint(random(25000, 70000));
+	worker@ w = staff_on_duty(ROLE_CASHIER);
+	if (@w is null) return;
+	if (people_queue_length() > 0) return;      // nobody chats with a queue waiting
+	customer@ c = cashier_chatter_customer(w);
+	if (@c is null) return;
+	int slot = staff_voice_for(w);
+	voice_use(slot);
+	say(w.name + ", behind the counter, says: " + staff_chatter_open(w, c), true);
+	voice_clear();
+	voice_use(c.voice);
+	say(c.name + staff_chatter_reply(c), false);
+	voice_clear();
+	/* Being talked to is the thing customers like about a staffed shop. */
+	c.mood += 1;
+	people_event(c, EV_CHATTED);
+	w.satisfaction += 1;
+	if (w.satisfaction > SAT_MAX) w.satisfaction = SAT_MAX;
+	log_line("staff", w.name + " chatted with " + c.name + " at the till");
+}
+
+/* The camera can fly around on its own for the demo style listening, but here it
+   is the player's; this hook just keeps the ambience flag honest. */
+void rooms_camera_update_tick(uint now) {
+	if (!g_cam_up) return;
+	/* Nothing to do each frame: rooms_listener() reads the camera state. Kept as
+	   a hook so future camera work has an obvious home. */
+}
+
+/* ==========================================================================
+   18.  THE FRAME
+   ========================================================================== */
+
+void mechanics_update(double dt_ms) {
+	uint now = ticks();
+	if (!g_game_mode) return;
+
+	if (g_in_jail) { jail_step(); return; }
+
+	clock_tick(dt_ms);
+	if (g_game_over) return;
+
+	/* The hardware in the building. The chips write their lines a slice of a
+	   frame at a time, and a device that is installing itself keeps its own time
+	   here, so a long chip line or a hardware routine cannot stall the shop.
+	   This sits above the g_game_over and jail returns on purpose: a chip that
+	   is already talking finishes its sentence. */
+	hardware_tick();
+	if (g_hw_need_save) { g_hw_need_save = false; save_game(true); }
+	if (g_hw_need_open) { g_hw_need_open = false; open_computer(); }
+	if (g_hw_need_open_phone) { g_hw_need_open_phone = false; open_phone(); }
+
+	/* A voice that has been dropped takes the people who had it with it. They are
+	   handed other voices of their own rather than falling into whoever is next
+	   to them, which is the difference between a shop and a chorus. audio.nvgt
+	   cannot see the people (it is included first), so it leaves the lost slot on
+	   a flag and this is where it is acted on. */
+	int lost_voice = voice_lost_take();
+	while (lost_voice >= 0) {
+		people_reassign_lost_voice(lost_voice);
+		staff_reassign_lost_voice(lost_voice);
+		lost_voice = voice_lost_take();
+	}
+
+	people_tick(now);
+	people_spawn_tick(now);
+	trouble_tick(now);
+	cashier_chatter_tick(now);
+
+	/* The cashier on shift serves the queue when you are not on the till. */
+	worker@ cashier = staff_on_duty(ROLE_CASHIER);
+	if (@cashier !is null and g_modal != MODAL_REGISTER and people_queue_length() > 0) {
+		if (now >= g_next_cashier_serve) {
+			g_next_cashier_serve = now + uint(cashier_serve_interval_ms(cashier));
+			cashier_serve_one(cashier);
+		}
+	}
+	music_trouble_tick();
+	music_tick();
+}
+
+/* ==========================================================================
+   18.  THE DEMO SHOP BEHIND THE MAIN MENU
+   --------------------------------------------------------------------------
+   The shop does not fall silent when the player is at the main menu. Its room
+   tone is already playing - the beacons in rooms.nvgt run from startup - and
+   this adds the parts of a shop that only people make: the door, feet, the till,
+   a customer or two talking, a delivery outside, the office terminal, the odd
+   cough or ring. A listener who cannot see the window can then tell that the
+   game is waiting for them at a shop that is working, rather than at a dead
+   screen.
+
+   It is a demo and not a simulation: the same short script every time, nothing
+   bought, nothing paid for, nobody served, and nothing written to a save. It is
+   deliberately not the store's own customers spawning behind the menu, which
+   would need the clock, the shelves and a save to run against.
+
+   Two rules it keeps. Nothing plays until the audio walk has finished, because
+   a shop of placeholder tones is a shop of beeps. And it can be turned off in
+   Options, because a player reading the menu with a screen reader is exactly
+   the person an attract mode must not talk over.
+   ========================================================================== */
+
+bool g_demo_shop_enabled = true;   /* Options, main menu */
+bool g_demo_on = false;
+uint g_demo_next_at = 0;
+int  g_demo_event = 0;
+
+/* How long after the cue before it, each cue plays, in milliseconds. Entry 0 is
+   both the lead-in when the demo starts and the lull before the cycle begins
+   again, which is why it is the long one. */
+array<int> g_demo_gap;
+
+void demo_script_init() {
+	g_demo_gap.resize(0);
+	g_demo_gap.insert_last(12000);  /* 0  the lead-in, and the lull between cycles */
+	g_demo_gap.insert_last(1500);   /* 1  the door opens */
+	g_demo_gap.insert_last(520);    /* 2  feet, left */
+	g_demo_gap.insert_last(400);    /* 3  and further in */
+	g_demo_gap.insert_last(400);    /* 4  and further */
+	g_demo_gap.insert_last(400);    /* 5  at the counter */
+	g_demo_gap.insert_last(620);    /* 6  the register */
+	g_demo_gap.insert_last(380);    /* 7  the scanner */
+	g_demo_gap.insert_last(420);    /* 8  change into the drawer */
+	g_demo_gap.insert_last(1400);   /* 9  a customer says something */
+	g_demo_gap.insert_last(1100);   /* 10 another one answers */
+	g_demo_gap.insert_last(1000);   /* 11 feet, turning away */
+	g_demo_gap.insert_last(420);    /* 12 past the aisle */
+	g_demo_gap.insert_last(420);    /* 13 and out */
+	g_demo_gap.insert_last(520);    /* 14 the door shuts */
+	g_demo_gap.insert_last(2600);   /* 15 the terminal in the back office */
+	g_demo_gap.insert_last(3400);   /* 16 a delivery out on the forecourt */
+	g_demo_gap.insert_last(2600);   /* 17 somebody coughs, and a phone rings */
+}
+
+/* One cue of the demo. A menu is not a place in the shop, so these are panned
+   rather than positioned - the same reason the chip's own blips are panned.
+   The gains are the ones the game plays the same recordings at on the shop
+   floor, so the demo is the shop's own level rather than a quieter imitation of
+   it. */
+void demo_cue(const string&in soundfile, float pan, float gain, int cut_ms = 0, double offset = 0.0) {
+	if (@g_pool is null or !g_power_on) return;
+	int slot = g_pool.play_stationary_extended(soundfile, false, offset, pan, gain, 100.0);
+	if (slot >= 0) sfx_cut_after(slot, cut_ms);
+}
+
+/* One step of the walk through the demo shop: the shop's own tile step, from
+   one of its three measured offsets, cut where the game cuts it. */
+void demo_step(float pan, double offset) {
+	demo_cue(A("step_tile.mp3"), pan, -10.5, FOOTSTEP_CUT_MS, offset);
+}
+
+/* A line from one of the shop's voices, and never from the player's. If the
+   pool has nothing usable to speak with - which is the first minute or so on a
+   machine whose voices are still being enumerated - the line is dropped rather
+   than read out by the player's own channel: a customer speaking in the
+   screen reader is worse than a quiet shop. */
+int demo_voice_slot() {
+	int n = voice_pool_count();
+	if (n <= 0) return -1;
+	int start = random(0, n - 1);
+	for (int i = 0; i < n; i++) {
+		int s = (start + i) % n;
+		if (speech_slot_usable(s)) return s;
+	}
+	return -1;
+}
+
+void demo_voice_line(const string&in text) {
+	int slot = demo_voice_slot();
+	if (slot >= 0) say_as(slot, text, false);
+}
+
+/* The script itself, one case per cue in the same order as the gaps above. */
+void demo_fire(int i) {
+	switch (i) {
+		case 0:  demo_cue(A("door_open.ogg"), -25.0, -11.0, 1300); break;
+		case 1:  demo_step(-70.0, 7.02); break;
+		case 2:  demo_step(-45.0, 10.26); break;
+		case 3:  demo_step(-22.0, 13.26); break;
+		case 4:  demo_step(0.0, 7.02); break;
+		case 5:  demo_cue(A("register.ogg"), 10.0, -12.0, 900); break;
+		case 6:  demo_cue(A("scanner.ogg"), 10.0, -16.0, 700); break;
+		case 7:  demo_cue(A("coins.ogg"), 10.0, -13.0, 800); break;
+		case 8:  demo_voice_line("Just these, thanks."); break;
+		case 9:  demo_voice_line("Have you got a bag?"); break;
+		case 10: demo_step(20.0, 10.26); break;
+		case 11: demo_step(45.0, 13.26); break;
+		case 12: demo_step(70.0, 7.02); break;
+		case 13: demo_cue(A("door_close.ogg"), 20.0, -11.0, 1300); break;
+		case 14: chip_say("STORE REPORT READY.", CHIP_DEVICE_COMPUTER, 40, -18.0); break;
+		case 15: demo_cue(A("truck.mp3"), -30.0, -15.0, 3000); break;
+		case 16: demo_cue(A(people_emote_file(EMO_COUGH)), -10.0, -15.0,
+			people_emote_cut_ms(EMO_COUGH), people_emote_offset(EMO_COUGH)); break;
+		case 17: demo_cue(A("ring.ogg"), 15.0, -14.0, 3500); break;
+	}
+}
+
+void demo_shop_start() {
+	g_demo_on = true;
+	g_demo_event = 0;
+	g_demo_next_at = ticks() + 1500;   /* a moment before the door opens */
+	log_line("demo", "the demo shop is playing behind the main menu");
+}
+
+void demo_shop_stop() {
+	if (!g_demo_on) return;
+	g_demo_on = false;
+	/* A machine line the demo asked for goes with it; nothing else of the
+	   demo's is left hanging, because every other cue is a one-shot that cuts
+	   itself off. */
+	chip_stop_device(CHIP_DEVICE_COMPUTER);
+	log_line("demo", "the demo shop stopped");
+}
+
+/* Called once a frame from the main loop, in every mode, so the demo can stop
+   itself the moment a store is started or loaded. */
+void demo_shop_tick() {
+	bool wanted = (!g_game_mode and g_demo_shop_enabled and g_boot_state == BOOT_DONE
+		and g_demo_gap.length() > 0);
+	if (!wanted) { demo_shop_stop(); return; }
+	if (!g_demo_on) demo_shop_start();
+	if (ticks() < g_demo_next_at) return;
+	demo_fire(g_demo_event);
+	g_demo_event++;
+	if (g_demo_event >= int(g_demo_gap.length())) g_demo_event = 0;
+	g_demo_next_at = ticks() + uint(g_demo_gap[uint(g_demo_event)]);
+}
+
+/* ==========================================================================
+   19.  SETUP
+   ========================================================================== */
+
+void mechanics_init() {
+	g_menu.resize(0);
+	g_modal = MODAL_NONE;
+	g_slot = 1;
+	g_game_mode = false;
+	g_store_name = "Store Express";
+	g_emails.resize(0);
+	g_news.resize(0);
+	sale_reset();
+	g_music_tracks.resize(0);
+	demo_script_init();      /* the shop heard behind the main menu */
+	g_demo_shop_enabled = cfg_bool("menu_demo_shop", true);
+	hardware_init();         /* the speech devices and their chips */
+	log_line("mechanics", "mechanics ready");
+}

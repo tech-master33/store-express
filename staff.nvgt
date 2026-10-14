@@ -1,0 +1,769 @@
+/* ============================================================================
+   Store Express  -  staff.nvgt
+   ----------------------------------------------------------------------------
+   You start with nobody. Hiring goes on the truck's week, too.
+
+     * Positions: a cashier, a drink server and a janitor. Open one by Saturday
+       and five applicants turn up on Monday at six in the morning.
+     * Applicants: a star rating, an asking wage and the shifts they want. Offer
+       at or above their asking wage and they always say yes; every twenty five
+       cents under it makes a no more likely. Offers are final.
+     * Rotas: morning, evening and night. Night shifts only exist if you are open
+       around the clock, and they pay twenty percent more.
+     * Satisfaction, which moves once a week on bill day, and staff requests,
+       which you have three days to answer.
+     * Wages, which accrue through the week and come out of the till on bill day.
+
+   INCLUDE ORDER
+     Included after shop.nvgt. It never calls into people, trouble, mechanics or
+     main. people.nvgt and trouble.nvgt ask this file who is on duty.
+
+   WHAT THE REFERENCE SAYS A CASHIER DOES
+     Works the till whenever you are not on it, from the same spot you do. Better
+     cashiers are faster, check more IDs, and miscount change less often. A
+     dishonest one leaves the drawer short, and a crooked one rings restricted
+     goods through without scanning the ID, which the alcohol board will find.
+   ========================================================================= */
+
+/* ==========================================================================
+   1.  CONSTANTS AND NAMES
+   ========================================================================= */
+
+const int ROLE_CASHIER = 0;
+const int ROLE_SERVER  = 1;
+const int ROLE_JANITOR = 2;
+const int ROLE_COUNT   = 3;
+
+const int SHIFT_MORNING = 0;    // 7 am to 3 pm
+const int SHIFT_EVENING = 1;    // 3 pm until closing
+const int SHIFT_NIGHT   = 2;    // 11 pm to 7 am, only when open around the clock
+const int SHIFT_COUNT   = 3;
+const int SHIFT_OFF     = -1;
+
+const int BASE_WAGE_CENTS = 1000;    // $10 an hour
+const int STARS_PER_WAGE_STEP = 125; // each extra star asks 25 cents an hour more
+
+const int SAT_MIN = 0;
+const int SAT_MAX = 100;
+const int SAT_START = 70;
+
+const int REQUEST_DAYS_TO_ANSWER = 3;
+
+string staff_role_name(int role) {
+	switch (role) {
+		case ROLE_CASHIER: return "cashier";
+		case ROLE_SERVER:  return "drink server";
+		case ROLE_JANITOR: return "janitor";
+	}
+	return "member of staff";
+}
+
+string staff_shift_name(int shift) {
+	switch (shift) {
+		case SHIFT_MORNING: return "morning";
+		case SHIFT_EVENING: return "evening";
+		case SHIFT_NIGHT:   return "night";
+	}
+	return "off";
+}
+
+int staff_shift_hours(int shift) {
+	switch (shift) {
+		case SHIFT_MORNING: return 8;
+		case SHIFT_EVENING: return 7;
+		case SHIFT_NIGHT:   return 8;
+	}
+	return 0;
+}
+
+string staff_given_names() {
+	return "Marguerite,Deb,Daryl,Ken,Bev,Lorna,Vince,Ada,Frank,Norma,"
+		+ "Cyril,Mabel,Geoff,Rita,Roy,Ivy,Stan,Phyllis,Alf,Doreen,"
+		+ "Marcus,Tanya,Leon,Priya,Nadia,Gus,Mo,Hattie,Otis,Rosalind,"
+		+ "Kenji,Amara,Sully,Terry,Winnie,Bo,Corinne,Farid,Lena,Walter";
+}
+
+string staff_family_names() {
+	return "Dell,Pike,Travers,Okafor,Brennan,Marsh,Wheelwright,Quist,Novak,Hale,"
+		+ "Byrne,Ruddock,Fenwick,Okonkwo,Lacey,Sandoval,Braithwaite,Proctor,Kaur,Meade,"
+		+ "Ashby,Tunnock,Everly,Grieve,Sowerby,Whitlock,Nkemelu,Radcliffe,Farrow,Dunmore";
+}
+
+string staff_pick_name() {
+	string[]@ g = staff_given_names().split(",");
+	string[]@ f = staff_family_names().split(",");
+	int gi = random(0, int(g.length()) - 1);
+	int fi = random(0, int(f.length()) - 1);
+	return g[gi] + " " + f[fi];
+}
+
+/* ==========================================================================
+   2.  THE PEOPLE
+   ========================================================================= */
+
+class worker {
+	string name;
+	int    role;
+	int    stars;          // one to five
+	int    wage;           // cents an hour
+	int    satisfaction;   // 0 to 100
+	array<int> rota;       // seven entries, each SHIFT_OFF or a shift id
+	bool   dishonest;      // leaves the drawer short after their sales
+	bool   crooked;        // rings restricted goods through with no ID scan
+	/* how they are doing */
+	int    hours_worked;
+	int    no_shows;
+	int    served;
+	int    change_mistakes;
+	int    ids_checked;
+	int    ids_skipped;
+	int    drinks_poured;
+	int    drinks_spilled;
+	int    messes_mopped;
+	int    drawer_short;
+	/* an open request, or none */
+	string request;
+	int    request_day;    // the day it was made
+	bool   request_open;
+	worker(const string&in n, int r, int st, int w, int sat) {
+		name = n; role = r; stars = st; wage = w; satisfaction = sat;
+		hours_worked = 0; no_shows = 0; served = 0; change_mistakes = 0;
+		ids_checked = 0; ids_skipped = 0; drinks_poured = 0; drinks_spilled = 0;
+		messes_mopped = 0; drawer_short = 0;
+		request = ""; request_day = 0; request_open = false;
+		dishonest = (random(1, 100) <= 8);
+		crooked = (random(1, 100) <= 6);
+	}
+}
+
+class applicant {
+	string name;
+	int    role;
+	int    stars;
+	int    wage;
+	int    satisfaction;
+	array<int> rota;
+	bool   gone;          // took another job
+	applicant(const string&in n, int r, int st, int w) {
+		name = n; role = r; stars = st; wage = w; satisfaction = SAT_START; gone = false;
+	}
+}
+
+array<worker@>    g_staff;
+array<applicant@> g_applicants;
+
+/* One flag per role: is a position open? */
+array<int> g_positions_open;
+/* The day each open position was opened, so applicants know when to turn up. */
+array<int> g_position_opened_day;
+
+int g_staff_requests_waiting = 0;
+
+/* ==========================================================================
+   3.  ROTAS
+   ========================================================================= */
+
+/* Build a rota that covers the shifts somebody asked for, spread over the week.
+   The rota is seven entries, one per weekday, each off or a shift id. */
+array<int> staff_make_rota(int shifts_wanted, int preferred_shift, bool nights_allowed) {
+	array<int> rota;
+	rota.resize(7);
+	for (int d = 0; d < 7; d++) rota[d] = SHIFT_OFF;
+	if (shifts_wanted <= 0) return rota;
+	if (shifts_wanted > 7) shifts_wanted = 7;
+	/* Spread the shifts as evenly as a week allows, starting from the preferred
+	   one, which is how the reference's "shifts they want" reads: they have a
+	   pattern in mind, not a preference per day. */
+	int placed = 0;
+	for (int d = 0; d < 7 and placed < shifts_wanted; d++) {
+		int idx = d;
+		rota[idx] = preferred_shift;
+		placed++;
+	}
+	if (nights_allowed and preferred_shift == SHIFT_NIGHT) {
+		/* Night work is heavy going, so nobody asks for seven of them. */
+		for (int d = 0; d < 7; d++) if (d % 2 == 1 and rota[d] != SHIFT_OFF) rota[d] = SHIFT_OFF;
+	}
+	return rota;
+}
+
+int staff_rota_shift_count(worker@ w) {
+	int n = 0;
+	for (uint d = 0; d < w.rota.length(); d++) if (w.rota[d] != SHIFT_OFF) n++;
+	return n;
+}
+
+int staff_rota_hours(worker@ w) {
+	int h = 0;
+	for (uint d = 0; d < w.rota.length(); d++) {
+		if (w.rota[d] == SHIFT_OFF) continue;
+		h += staff_shift_hours(w.rota[d]);
+		if (w.rota[d] == SHIFT_NIGHT) h += 1;    // the twenty percent, rounded to an hour
+	}
+	return h;
+}
+
+/* ==========================================================================
+   4.  WHO IS ON DUTY
+   ========================================================================= */
+
+int staff_shift_now() {
+	int h = int(g_current_hour);
+	if (h >= 7 and h < 15)  return SHIFT_MORNING;
+	if (h >= 15 and h < 23) return SHIFT_EVENING;
+	return SHIFT_NIGHT;
+}
+
+/* The weekday rotation: two people on the same rota take turns by the day, so
+   the same face is not always behind the counter. */
+bool staff_worker_on_now(worker@ w) {
+	if (@w is null) return false;
+	if (w.rota.length() < 7) return false;
+	int today = int(g_current_day_of_week);
+	if (w.rota[today] != staff_shift_now()) return false;
+	/* If several people are rostered for the same shift today, they alternate by
+	   the absolute day, so everyone gets roughly the same number of them. */
+	int peers = 0, mine = -1;
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ o = g_staff[i];
+		if (o.role != w.role) continue;
+		if (o.rota.length() < 7 or o.rota[today] != w.rota[today]) continue;
+		if (@o is w) mine = peers;
+		peers++;
+	}
+	if (peers <= 1 or mine < 0) return true;
+	return (int(g_current_day) % peers) == mine;
+}
+
+worker@ staff_on_duty(int role) {
+	for (uint i = 0; i < g_staff.length(); i++) {
+		if (g_staff[i].role != role) continue;
+		if (staff_worker_on_now(g_staff[i])) return g_staff[i];
+	}
+	return null;
+}
+
+bool staff_any_on_duty(int role) { return @staff_on_duty(role) !is null; }
+
+/* ---- the quota -----------------------------------------------------------
+   A cashier is not just a slow way of ringing up a basket. They are expected to
+   clear a certain number of people an hour, and the better the rating the higher
+   that number is, which is what makes a five star cashier worth the wage. Their
+   page says how they are doing against it, and the week's satisfaction follows
+   it. Nothing here is saved: it is worked out from the hours and the customers,
+   both of which are already in the save. */
+
+int staff_cashier_quota(worker@ w) {
+	if (@w is null) return 0;
+	return 6 + w.stars * 2;          // customers an hour
+}
+
+double staff_cashier_rate(worker@ w) {
+	if (@w is null or w.hours_worked <= 0) return 0.0;
+	return double(w.served) / double(w.hours_worked);
+}
+
+string staff_cashier_quota_text(worker@ w) {
+	if (@w is null) return "";
+	if (w.hours_worked <= 0) return "They have not worked a shift yet this week. ";
+	int quota = staff_cashier_quota(w);
+	int rate = int(staff_cashier_rate(w) + 0.5);
+	string s = "They are serving " + rate + " an hour, against a quota of " + quota
+		+ " an hour for a " + w.stars + " star cashier. ";
+	if (double(rate) < double(quota) * 0.7) s += "That is behind, and they know it. ";
+	else if (double(rate) > double(quota) * 1.3) s += "That is well clear of it, and they know that too. ";
+	else s += "That is about what they are worth. ";
+	return s;
+}
+
+/* ---- what a cashier talks about when the till is quiet -------------------
+   A shop with a person behind the counter is not the same shop as a till on its
+   own, and the difference is mostly the talking. */
+string staff_chatter_open(worker@ w, customer@ c) {
+	int r = random(1, 100);
+	if (r <= 22) return "Nice day out there, if you like that sort of thing.";
+	if (r <= 40) return "The truck is due Monday, so the shelves will be full again by Tuesday.";
+	if (r <= 56) return "The coffee machine has been behaving itself today, for once.";
+	if (r <= 72) return "Did you see who was in here on Thursday? No? Nor did I, apparently.";
+	if (r <= 86) return "Take your time. It is only me and you in here.";
+	return "If you are after anything in particular, ask me and I will have a look out back.";
+}
+
+string staff_chatter_reply(customer@ c) {
+	switch (c.arch) {
+		case ARCH_TRUCKER:    return " says the road is the same as ever, and takes their time.";
+		case ARCH_TEENAGER:   return " says yeah, and goes back to the phone.";
+		case ARCH_FARMER:     return " says it looked like rain this morning and looks like it still does.";
+		case ARCH_NIGHTSHIFT: return " says they finish at six, and this is their morning.";
+		case ARCH_KAREN:      return " says, at length, what the coffee machine has been doing to her.";
+		case ARCH_POLICE:     return " says they are on a break, and thanks them for it.";
+		case ARCH_BIGSPENDER: return " says they are in a hurry, and then is not.";
+		case ARCH_DRUNK:      return " says they love this shop, and asks again whether it is open.";
+	}
+	return " says that is about right, and carries on looking.";
+}
+
+int staff_count_role(int role) {
+	int n = 0;
+	for (uint i = 0; i < g_staff.length(); i++) if (g_staff[i].role == role) n++;
+	return n;
+}
+
+/* How many people are employed at all, which is what the always open option
+   needs before it will let you switch. */
+int staff_count() { return int(g_staff.length()); }
+
+/* Naked nights: around the clock open, and nobody rostered for the small hours. */
+int staff_uncovered_nights() {
+	if (!g_hours_24h) return 0;
+	int n = 0;
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ w = g_staff[i];
+		if (w.role != ROLE_CASHIER) continue;
+		bool covers = false;
+		for (uint d = 0; d < w.rota.length(); d++) if (w.rota[d] == SHIFT_NIGHT) covers = true;
+		if (covers) n++;
+	}
+	return (n > 0) ? 0 : 1;
+}
+
+/* ==========================================================================
+   5.  THE WEEKLY WAGE BILL
+   ========================================================================= */
+
+int staff_daily_wage_for(worker@ w) {
+	if (@w is null) return 0;
+	int today = int(g_current_day_of_week);
+	if (w.rota.length() < 7) return 0;
+	int shift = w.rota[today];
+	if (shift == SHIFT_OFF) return 0;
+	int cents = w.wage * staff_shift_hours(shift);
+	if (shift == SHIFT_NIGHT) cents += (cents * 20) / 100;
+	return cents;
+}
+
+int staff_noshow_chance(worker@ w) {
+	if (@w is null) return 0;
+	int chance = 3;
+	if (w.satisfaction < 60) chance += 8;
+	if (w.satisfaction < 40) chance += 15;
+	if (w.satisfaction < 25) chance += 20;
+	return chance;
+}
+
+/* Called by mechanics.nvgt when the day rolls over. Wages accrue through the
+   week and come out of the till on bill day. A no-show is not paid. */
+void staff_accrue_daily_wages() {
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ w = g_staff[i];
+		int cents = staff_daily_wage_for(w);
+		if (cents <= 0) continue;
+		if (random(1, 100) <= staff_noshow_chance(w)) { w.no_shows++; continue; }
+		g_wk_wages += cents;
+		w.hours_worked += staff_shift_hours(w.rota[int(g_current_day_of_week)]);
+	}
+}
+
+/* ==========================================================================
+   6.  SATISFACTION, ONCE A WEEK
+   ========================================================================= */
+
+string staff_mood_word(int sat) {
+	if (sat >= 85) return "delighted";
+	if (sat >= 70) return "happy";
+	if (sat >= 55) return "fine";
+	if (sat >= 40) return "unhappy";
+	if (sat >= 25) return "miserable";
+	return "furious";
+}
+
+int staff_going_rate(int stars) {
+	return BASE_WAGE_CENTS + (stars - 1) * STARS_PER_WAGE_STEP;
+}
+
+int staff_requests_waiting() {
+	int n = 0;
+	for (uint i = 0; i < g_staff.length(); i++) if (g_staff[i].request_open) n++;
+	return n;
+}
+
+void staff_weekly_satisfaction(int wages_paid_last_week) {
+	string s = "";
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ w = g_staff[i];
+		int before = w.satisfaction;
+		int going = staff_going_rate(w.stars);
+
+		/* Paying above the going rate for their rating helps, and a cut hurts
+		   more than a raise helps. */
+		if (w.wage > going) w.satisfaction += 6;
+		else if (w.wage < going) w.satisfaction -= 9;
+		else w.satisfaction += 2;
+
+		/* A rota that does not cover what they asked for hurts. */
+		if (staff_rota_shift_count(w) < 3) w.satisfaction -= 5;
+
+		/* A crazy busy week hurts everybody. */
+		if (g_wk_customers > 200) w.satisfaction -= 4;
+
+		/* The quota. A cashier who is well behind what their own rating is worth
+		   hears about it here; one who clears it easily is the reason the queue
+		   moves, and that is worth something to them. */
+		if (w.role == ROLE_CASHIER and w.hours_worked > 0) {
+			double rate = staff_cashier_rate(w);
+			double quota = double(staff_cashier_quota(w));
+			if (rate < quota * 0.7) {
+				w.satisfaction -= 3;
+				s += w.name + " is behind on the till. ";
+			} else if (rate > quota * 1.3) {
+				w.satisfaction += 2;
+				s += w.name + " is well ahead on the till. ";
+			}
+		}
+
+		if (w.satisfaction > SAT_MAX) w.satisfaction = SAT_MAX;
+		if (w.satisfaction < SAT_MIN) w.satisfaction = SAT_MIN;
+
+		if (w.satisfaction != before) {
+			s += w.name + " is " + staff_mood_word(w.satisfaction) + ". ";
+		}
+		if (w.satisfaction <= 15) {
+			s += w.name + " hands in a week's notice. ";
+			/* The reference says really unhappy staff hand in a week's notice, so
+			   they stay a week and then leave. Marking them here would need a
+			   second list; instead they walk out at their next shift. */
+			w.request = "notice";
+			w.request_day = int(g_current_day);
+			w.request_open = true;
+		}
+	}
+	g_staff_requests_waiting = staff_requests_waiting();
+	if (s.length() > 0) say("On the staff front. " + s, true);
+}
+
+/* ==========================================================================
+   7.  APPLICANTS
+   ========================================================================= */
+
+int staff_next_applicant_day() {
+	int w = int(g_current_day_of_week);
+	if (w == SUNDAY) return int(g_current_day) + 8;
+	int lead = (7 - w) % 7;
+	if (lead == 0) lead = 7;
+	return int(g_current_day) + lead;
+}
+
+void staff_open_position(int role) {
+	if (role < 0 or role >= ROLE_COUNT) return;
+	if (g_positions_open.length() != ROLE_COUNT) g_positions_open.resize(ROLE_COUNT);
+	g_positions_open[role] = 1;
+	if (g_position_opened_day.length() != ROLE_COUNT) g_position_opened_day.resize(ROLE_COUNT);
+	g_position_opened_day[role] = int(g_current_day);
+	int arrive = staff_next_applicant_day();
+	say("The position for a " + staff_role_name(role) + " is open. Five applicants will turn up on "
+		+ day_name(MONDAY) + ", day " + arrive + ", at six in the morning. "
+		+ "Applicants not hired by the following Monday are gone.", true);
+	log_line("staff", "position opened: " + staff_role_name(role));
+}
+
+void staff_close_position(int role) {
+	if (role < 0 or role >= ROLE_COUNT) return;
+	if (g_positions_open.length() != ROLE_COUNT) return;
+	g_positions_open[role] = 0;
+	say("The position for a " + staff_role_name(role) + " is closed.", true);
+}
+
+/* Monday, six in the morning. Five applicants per open position. */
+void staff_applicant_morning() {
+	g_applicants.resize(0);
+	if (g_positions_open.length() != ROLE_COUNT) return;
+	int roles = 0;
+	string s = "";
+	for (int role = 0; role < ROLE_COUNT; role++) {
+		if (g_positions_open[role] != 1) continue;
+		roles++;
+		for (int n = 0; n < 5; n++) {
+			int stars = random(1, 5);
+			int wage = staff_going_rate(stars) + random(-50, 120);
+			if (wage < BASE_WAGE_CENTS) wage = BASE_WAGE_CENTS;
+			applicant@ a = applicant(staff_pick_name(), role, stars, wage);
+			int wanted = random(2, 5);
+			/* Applicants prefer the day shifts unless the shop runs all night. */
+			int pref = (g_hours_24h and random(1, 100) <= 30) ? SHIFT_NIGHT : random(SHIFT_MORNING, SHIFT_EVENING);
+			a.rota = staff_make_rota(wanted, pref, g_hours_24h);
+			g_applicants.insert_last(a);
+		}
+	}
+	if (roles == 0) return;
+	s = "Five applicants for each open position are waiting in the office, "
+		+ plural(int(g_applicants.length()), "person", "people") + ". "
+		+ "Their rating runs from one star to five, and each one has an asking wage and the shifts they want. "
+		+ "Make an offer from the staff page. At or above their asking wage they always say yes; "
+		+ "every twenty five cents under it makes a no more likely. Offers are final.";
+	say(s, true);
+	sfx_ui(A("register.ogg"), -8.0, 700);
+	log_line("staff", "applicants arrived: " + g_applicants.length());
+}
+
+/* Hiring. At or above the asking wage they always say yes; under it, each
+   twenty five cents of shortfall makes a no more likely. */
+bool staff_hire(int index, int offer) {
+	if (index < 0 or uint(index) >= g_applicants.length()) return false;
+	applicant@ a = g_applicants[index];
+	if (offer < a.wage) {
+		int shortfall = a.wage - offer;
+		int quarter_steps = shortfall / 25;
+		int no_chance = quarter_steps * 18;
+		if (no_chance > 96) no_chance = 96;
+		if (random(1, 100) <= no_chance) {
+			a.gone = true;
+			sfx_ui(A("door_close.ogg"), -10.0);
+			say(a.name + " turns it down. " + money(offer) + " an hour is not enough for a "
+				+ a.stars + " star " + staff_role_name(a.role) + ". They have taken another job, and "
+				+ "offers are final, so that is that.", true);
+			return false;
+		}
+	}
+	worker@ w = worker(a.name, a.role, a.stars, offer, SAT_START);
+	w.rota = a.rota;
+	w.dishonest = (random(1, 100) <= 8);
+	w.crooked = (random(1, 100) <= 6);
+	g_staff.insert_last(w);
+	sfx_ui(A("register.ogg"), -6.0, 700);
+	say(a.name + " starts as your " + staff_role_name(a.role) + ", " + a.stars
+		+ " stars, at " + money(offer) + " an hour, working "
+		+ plural(staff_rota_shift_count(w), "shift", "shifts") + " a week. "
+		+ "Wages come out of the till on bill day.", true);
+	g_applicants.remove_at(uint(index));
+	log_line("staff", "hired " + a.name);
+	return true;
+}
+
+void staff_fire(int index) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	string name = w.name;
+	g_staff.remove_at(uint(index));
+	sfx_ui(A("door_close.ogg"), -8.0);
+	say(name + " has been let go. That is final, and they get a letter.", true);
+	log_line("staff", "fired " + name);
+}
+
+/* ==========================================================================
+   8.  REQUESTS AND ROTAS
+   ========================================================================= */
+
+void staff_give_raise(int index, int cents) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	w.wage += cents;
+	w.satisfaction += 12;
+	if (w.satisfaction > SAT_MAX) w.satisfaction = SAT_MAX;
+	if (w.request == "raise") { w.request = ""; w.request_open = false; }
+	say(w.name + " is now on " + money(w.wage) + " an hour, and is " + staff_mood_word(w.satisfaction) + " about it.", true);
+}
+
+void staff_cut_wage(int index, int cents) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	w.wage -= cents;
+	if (w.wage < 1) w.wage = 1;
+	w.satisfaction -= 18;
+	if (w.satisfaction < SAT_MIN) w.satisfaction = SAT_MIN;
+	say(w.name + " is on " + money(w.wage) + " an hour now, and is " + staff_mood_word(w.satisfaction)
+		+ ". A cut hurts more than a raise helps.", true);
+}
+
+void staff_set_rota_shift(int index, int shift) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	if (shift != SHIFT_OFF and shift != SHIFT_MORNING and shift != SHIFT_EVENING and shift != SHIFT_NIGHT) return;
+	array<int> r;
+	r.resize(7);
+	for (int d = 0; d < 7; d++) r[d] = shift;
+	w.rota = r;
+	w.request = ""; w.request_open = false;
+	w.satisfaction += 4;
+	if (w.satisfaction > SAT_MAX) w.satisfaction = SAT_MAX;
+	say(w.name + " now works " + staff_shift_name(shift) + " shifts only.", true);
+}
+
+void staff_grant_request(int index) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	if (!w.request_open) { say(w.name + " has not asked for anything.", true); return; }
+	if (w.request == "raise") {
+		staff_give_raise(index, 100);
+		say("You gave them a dollar an hour, and they are " + staff_mood_word(w.satisfaction) + ".", true);
+	} else if (w.request == "rota") {
+		staff_set_rota_shift(index, SHIFT_MORNING);
+		say("They are on mornings from now on.", true);
+	} else if (w.request == "notice") {
+		say(w.name + " has already handed in notice. There is nothing to grant.", true);
+	} else {
+		say("You agreed to what they asked for.", true);
+		w.request_open = false;
+		w.satisfaction += 10;
+	}
+}
+
+void staff_refuse_request(int index) {
+	if (index < 0 or uint(index) >= g_staff.length()) return;
+	worker@ w = g_staff[index];
+	if (!w.request_open) { say(w.name + " has not asked for anything.", true); return; }
+	w.request_open = false;
+	w.request = "";
+	w.satisfaction -= 10;
+	if (w.satisfaction < SAT_MIN) w.satisfaction = SAT_MIN;
+	say("You turned it down. " + w.name + " is " + staff_mood_word(w.satisfaction) + " about that.", true);
+}
+
+/* Called once a day. Requests older than three days are ignored, which is the
+   worst way to handle them. */
+void staff_request_deadlines() {
+	for (uint i = 0; i < g_staff.length(); i++) {
+		worker@ w = g_staff[i];
+		if (!w.request_open) continue;
+		if (int(g_current_day) - w.request_day < REQUEST_DAYS_TO_ANSWER) continue;
+		if (w.request == "notice") continue;
+		w.request_open = false;
+		w.request = "";
+		w.satisfaction -= 15;
+		if (w.satisfaction < SAT_MIN) w.satisfaction = SAT_MIN;
+		say(w.name + " asked for something three days ago and heard nothing back, so they are "
+			+ staff_mood_word(w.satisfaction) + " now.", true);
+	}
+}
+
+/* A chance of somebody writing in, once a day. */
+void staff_maybe_request() {
+	if (g_staff.length() == 0) return;
+	int idx = random(0, int(g_staff.length()) - 1);
+	worker@ w = g_staff[idx];
+	if (w.request_open) return;
+	if (random(1, 100) > 12) return;
+	w.request = (random(1, 100) <= 60) ? "raise" : "rota";
+	w.request_day = int(g_current_day);
+	w.request_open = true;
+	string what = (w.request == "raise")
+		? "asking for a raise, a dollar an hour more"
+		: "asking to be moved onto a different shift";
+	say("You have a letter from " + w.name + ", " + what + ". You have "
+		+ REQUEST_DAYS_TO_ANSWER + " days to answer from their page on the computer. "
+		+ "Granting it makes them happier. Refusing makes them a little less happy. "
+		+ "Ignoring it is worst.", true);
+	sfx_ui(A("register.ogg"), -12.0, 700);
+}
+
+/* ==========================================================================
+   9.  WHAT THEY ACTUALLY DO
+   ========================================================================= */
+
+/* A dishonest cashier leaves the drawer short after their sales. */
+void staff_cashier_drawer_check(worker@ w) {
+	if (@w is null or !w.dishonest) return;
+	if (random(1, 100) > 20) return;
+	int short_by = random(200, 1800);
+	w.drawer_short += short_by;
+	if (g_cash >= short_by) g_cash -= short_by; else g_cash = 0;
+	say("The drawer is short by " + money(short_by) + " after " + w.name + "'s shift. "
+		+ "Their page says how much has gone missing in total.", true);
+}
+
+/* A crooked cashier rings restricted goods through with no ID scan. This is what
+   the alcohol board's inspector reads out of the till log. */
+void staff_cashier_crooked_sale(worker@ w) {
+	if (@w is null or !w.crooked) return;
+	w.ids_skipped++;
+}
+
+/* Satisfaction words for the staff page. */
+string staff_how_they_are_doing(worker@ w) {
+	string s = w.name + ", " + w.stars + " star " + staff_role_name(w.role)
+		+ ", on " + money(w.wage) + " an hour. They are " + staff_mood_word(w.satisfaction) + ". ";
+	s += "This week: " + plural(w.hours_worked, "hour", "hours") + " worked. ";
+	if (w.no_shows > 0) s += plural(w.no_shows, "shift", "shifts") + " not turned up to. ";
+	if (w.role == ROLE_CASHIER) {
+		s += plural(w.served, "customer", "customers") + " served, "
+			+ plural(w.change_mistakes, "change error", "change errors") + ", "
+			+ plural(w.ids_checked, "ID checked", "IDs checked");
+		if (w.ids_skipped > 0) s += ", and " + plural(w.ids_skipped, "sale rung through", "sales rung through") + " with no ID scan";
+		s += ". ";
+		s += staff_cashier_quota_text(w);
+		if (w.drawer_short > 0) s += "The drawer has come up " + money(w.drawer_short) + " short on their shifts. ";
+	}
+	if (w.role == ROLE_SERVER) s += plural(w.drinks_poured, "drink", "drinks") + " poured, " + plural(w.drinks_spilled, "spilled", "spilled") + ". ";
+	if (w.role == ROLE_JANITOR) s += plural(w.messes_mopped, "mess", "messes") + " mopped. ";
+	if (w.request_open) s += "They have asked for something and are waiting to hear back. ";
+	return s;
+}
+
+string staff_summary_text() {
+	string s = "";
+	if (g_staff.length() == 0) s += "Nobody is employed. ";
+	else {
+		s += plural(int(g_staff.length()), "person is", "people are") + " employed: ";
+		for (uint i = 0; i < g_staff.length(); i++) {
+			s += g_staff[i].name + ", " + staff_role_name(g_staff[i].role) + ", "
+				+ staff_mood_word(g_staff[i].satisfaction) + ". ";
+		}
+	}
+	if (g_applicants.length() > 0) s += plural(int(g_applicants.length()), "applicant is", "applicants are") + " waiting. ";
+	if (g_positions_open.length() == ROLE_COUNT) {
+		for (int r = 0; r < ROLE_COUNT; r++) {
+			if (g_positions_open[r] == 1) s += "The position for a " + staff_role_name(r) + " is open. ";
+		}
+	}
+	s += "The wage bill so far this week is " + money(g_wk_wages) + ". ";
+	int on_duty = 0;
+	for (int r = 0; r < ROLE_COUNT; r++) if (staff_any_on_duty(r)) on_duty++;
+	s += (on_duty > 0) ? (on_duty + " of the three roles are covered right now. ") : "Nobody is on shift right now. ";
+	return s;
+}
+
+/* ==========================================================================
+   10.  SETUP
+   ========================================================================= */
+
+void staff_init() {
+	g_staff.resize(0);
+	g_applicants.resize(0);
+	g_positions_open.resize(ROLE_COUNT);
+	g_position_opened_day.resize(ROLE_COUNT);
+	for (int r = 0; r < ROLE_COUNT; r++) { g_positions_open[r] = 0; g_position_opened_day[r] = 0; }
+	log_line("staff", "staff module ready, nobody employed");
+}
+
+/* ==========================================================================
+   11.  THE JANITOR'S ROUND
+   --------------------------------------------------------------------------
+   A janitor on shift mops a patch a minute, worst mess first. Without one the
+   floor just collects what the shop drops on it, and you have to walk over
+   there and do it yourself.
+   ========================================================================== */
+
+void staff_janitor_minute_tick() {
+	worker@ j = staff_on_duty(ROLE_JANITOR);
+	if (@j is null) return;
+	if (g_mess.length() == 0) return;
+	/* A decent janitor keeps up with a spill a minute. A worse one is on the
+	   floor with a broom at half that, and never quite catches up. */
+	int every = (j.stars >= 3) ? 1 : 2;
+	if ((int(g_current_minute) % every) != 0) return;
+	/* Nearest the middle of the shop floor goes first, because that is what
+	   customers walk through. */
+	int best = -1;
+	float best_score = 999999.0;
+	for (uint i = 0; i < g_mess.length(); i++) {
+		mess@ m = g_mess[i];
+		float d = dist2(m.x, m.y, 4.5, 0.5);
+		if (d < best_score) { best_score = d; best = int(i); }
+	}
+	if (best < 0) return;
+	mess@ m = g_mess[best];
+	string what = mess_word(m.kind);
+	int where_room = m.room;
+	mess_remove_at(m.room, m.x, m.y);
+	j.messes_mopped++;
+	diag("staff", j.name + " mopped up " + what + " in " + room_name(where_room));
+}
