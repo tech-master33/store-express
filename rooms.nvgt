@@ -862,7 +862,7 @@ void rooms_scan() {
 	int loops_here = 0;
 	for (uint i = 0; i < g_beacons.length(); i++) {
 		beacon@ b = g_beacons[i];
-		if (!b.loopable) continue;
+		if (!b.loopable or !b.enabled) continue;
 		if (b.room == g_player_room) {
 			hear += b.id + " is " + dir_word(b.x - g_px, b.y - g_py) + ", "
 				+ tiles_away(int(dist(b.x, b.y, g_px, g_py) + 0.5)) + ". ";
@@ -876,7 +876,7 @@ void rooms_scan() {
 		int n = 0; string first = "";
 		for (uint i = 0; i < g_beacons.length(); i++) {
 			beacon@ b = g_beacons[i];
-			if (!b.loopable or b.room != rr) continue;
+			if (!b.loopable or !b.enabled or b.room != rr) continue;
 			n++;
 			if (first.length() == 0) first = b.id;
 		}
@@ -907,6 +907,19 @@ const int FACE_EAST = 1;
    either side, and each column carries one shelf face with its own stock. */
 float aisle_face_x(int aisle, int face) {
 	return tile_centre(4 + aisle * 3 + face);
+}
+
+/* Where a pump's island stands. shop.nvgt needs this to put a fill's sound on
+   the exact pump the driver named, and it is found from the things registered
+   above so there is one description of where the pumps are. */
+void fuel_pump_pos(int pump, float &out x, float &out y) {
+	x = 3.5; y = 6.5;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.kind != IK_PUMP or t.ref != (pump - 1)) continue;
+		x = t.x; y = t.y;
+		return;
+	}
 }
 
 void rooms_init() {
@@ -972,10 +985,12 @@ void rooms_init() {
 	g_things.insert_last(thing(ROOM_FREEZER, 6.5, 4.5, IK_FREEZER_RACK, "the ice cream rack", true));
 
 	/* ---- fuel forecourt -------------------------------------------------- */
-	g_things.insert_last(thing(ROOM_FORECOURT,  3.5,  6.5, IK_PUMP,  "fuel pump one", true));
-	g_things.insert_last(thing(ROOM_FORECOURT,  3.5, 10.5, IK_PUMP,  "fuel pump two", true));
-	g_things.insert_last(thing(ROOM_FORECOURT, 12.5,  6.5, IK_PUMP,  "fuel pump three", true));
-	g_things.insert_last(thing(ROOM_FORECOURT, 12.5, 10.5, IK_PUMP,  "fuel pump four", true));
+	/* The pumps carry their number in the thing's ref, so a fill can find the
+	   pump a driver named at the till and put its sound on that exact island. */
+	g_things.insert_last(thing(ROOM_FORECOURT,  3.5,  6.5, IK_PUMP,  "fuel pump one",   true, 0));
+	g_things.insert_last(thing(ROOM_FORECOURT,  3.5, 10.5, IK_PUMP,  "fuel pump two",   true, 1));
+	g_things.insert_last(thing(ROOM_FORECOURT, 12.5,  6.5, IK_PUMP,  "fuel pump three", true, 2));
+	g_things.insert_last(thing(ROOM_FORECOURT, 12.5, 10.5, IK_PUMP,  "fuel pump four",  true, 3));
 	g_things.insert_last(thing(ROOM_FORECOURT,  1.5,  1.5, IK_AIRPUMP, "the air and water pump", true));
 	g_things.insert_last(thing(ROOM_FORECOURT,  8.5,  1.5, IK_ROAD,    "the road", false));
 
@@ -1024,8 +1039,17 @@ void rooms_init() {
 	audio_beacon_add("the television",          ROOM_APARTMENT,  2.5,  5.5, 0.0, "tv.mp3",       true, -11.0);
 	audio_beacon_add("the cooler compressor",   ROOM_COOLER,     4.0,  3.0, 0.0, "cooler.ogg",   true, -3.0);
 	audio_beacon_add("the freezer compressor",  ROOM_FREEZER,    4.0,  3.0, 0.0, "cooler.ogg",   true, -3.0);
-	audio_beacon_add("an idling car",           ROOM_FORECOURT, 10.5,  3.5, 0.0, "car_idle.mp3", true, -7.0);
-	audio_beacon_add("a running fuel pump",     ROOM_FORECOURT,  3.5,  6.5, 0.0, "pump.mp3",     true, -6.0);
+	/* The forecourt's own sounds are NOT ambience: an idling car means somebody
+	   has actually pulled up, and a running pump means a fill is in progress.
+	   Both are registered switched off and only started when the game says so
+	   (fuel_set_waiting and fuel_pump_start in shop.nvgt), so an empty forecourt
+	   is a quiet one. */
+	audio_beacon_add("an idling car",           ROOM_FORECOURT, 10.5,  3.5, 0.0, "car_idle.mp3", true, -7.0, false);
+	for (int pump = 1; pump <= 4; pump++) {
+		float px, py;
+		fuel_pump_pos(pump, px, py);
+		audio_beacon_add(fuel_pump_beacon_id(pump), ROOM_FORECOURT, px, py, 0.0, "pump.mp3", true, -6.0, false);
+	}
 	audio_beacon_add("the road",                ROOM_FORECOURT,  8.5,  1.5, 0.0, "road.mp3",     true, -11.0);
 
 	/* The shop's ceiling speakers are a sound source in room space, not a track

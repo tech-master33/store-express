@@ -125,6 +125,11 @@ const int ACT_ORDER_REVIEW       = 61;
 const int ACT_ORDER_PLACE        = 62;
 const int ACT_ORDER_CLEAR        = 63;
 const int ACT_ORDER_PLACED       = 64;
+const int ACT_ORDER_FUEL         = 65;   /* the tanker load page */
+/* One line of the fuel order page: the load at that position in the list of
+   sizes the terminal offers. Kept above every fixed family, like the other
+   dynamic ones. */
+const int ACT_FUEL_ORDER_BASE    = 24000;  /* + load index: 200, 500, 1000 litres */
 const int ACT_ORDER_FACE_BASE    = 2000;   /* + face */
 const int ACT_ORDER_CANCEL_BASE  = 3000;   /* + order index */
 
@@ -154,6 +159,7 @@ const int ACT_REP_SPEND          = 94;
 const int ACT_REP_BESTWORST      = 95;
 const int ACT_REP_MARKET         = 96;
 const int ACT_REP_AISLES         = 97;
+const int ACT_REP_FUEL           = 98;
 
 /* computer: prices */
 const int ACT_PRICE_FACE_BASE    = 7000;   /* + face */
@@ -169,6 +175,13 @@ const int ACT_PRICE_FACE_DOWN5   = 13007;
 const int ACT_PRICE_FACE_DOWN10  = 13008;
 const int ACT_PRICE_FACE_FAIR    = 13009;
 const int ACT_PRICE_ALL_FAIR     = 13010;
+/* the sign by the road: what a litre of unleaded costs */
+const int ACT_PRICE_FUEL         = 13011;
+const int ACT_FUEL_PRICE_UP5     = 13012;
+const int ACT_FUEL_PRICE_UP25    = 13013;
+const int ACT_FUEL_PRICE_DOWN5   = 13014;
+const int ACT_FUEL_PRICE_DOWN25  = 13015;
+const int ACT_FUEL_PRICE_FAIR    = 13016;
 
 /* computer: staff */
 const int ACT_STAFF_POSITIONS    = 110;
@@ -212,6 +225,7 @@ const int ACT_SLEEP              = 150;
 const int ACT_PHONE_EMAIL        = 151;
 const int ACT_PHONE_NEWS         = 152;
 const int ACT_PHONE_REVIEWS      = 153;
+const int ACT_PHONE_FUEL         = 154;   /* the tank level from wherever you are */
 const int ACT_ISSUE_AUDIO        = 160;
 const int ACT_ISSUE_CLOCK        = 161;
 const int ACT_ISSUE_MAP          = 162;
@@ -569,6 +583,11 @@ int  g_sale_drink_cost = 0;   /* a drink was poured and charged before the lines
 int  g_sale_change_due = 0;
 bool g_sale_change_given = false;
 bool g_sale_active = false;
+/* A fuel sale has no lines to scan: the customer named their litres at the
+   till and the bill is the litres times the sign. g_sale_fuel_litres is what
+   the tank can actually put out, which can be less than they asked for. */
+bool g_sale_fuel = false;
+int  g_sale_fuel_litres = 0;
 
 void sale_reset() {
 	@g_sale_customer = null;
@@ -584,6 +603,8 @@ void sale_reset() {
 	g_sale_change_due = 0;
 	g_sale_change_given = false;
 	g_sale_active = false;
+	g_sale_fuel = false;
+	g_sale_fuel_litres = 0;
 }
 
 int sale_restricted_remaining() {
@@ -692,13 +713,27 @@ void sale_finish(bool paid) {
 			   is further in than they were when they came in. */
 			if (c.wants_drink and g_sale_drink_cost > 0) people_drink_count_add(c);
 			sfx_ui(A("register.ogg"), -8.0);
+			/* Fuel was paid for before it moves: the tank gives up the litres
+			   now, and the pump starts when the driver reaches the car. */
+			if (g_sale_fuel) {
+				c.fuel_litres = g_sale_fuel_litres;
+				fuel_take(g_sale_fuel_litres);
+			}
 			/* A receipt prints after the sale, and about half of them wave it
 			   away. It matters to the one in ten who comes back about their
 			   change, which is the whole point of a receipt. */
 			c.waved_receipt = sale_waves_receipt();
-			say("The drawer opens and the sale is rung up. A receipt prints, and " + c.name + " "
-				+ (c.waved_receipt ? "waves it away" : "folds it into a pocket")
-				+ ", takes their bag and heads for the door. That is " + money(g_sale_total) + ".", true);
+			if (g_sale_fuel) {
+				say("The drawer opens and the sale is rung up. A receipt prints, and " + c.name + " "
+					+ (c.waved_receipt ? "waves it away" : "folds it into a pocket")
+					+ ", and heads back out to the car on pump " + fuel_pump_word(c.fuel_pump) + ". That is "
+					+ money(g_sale_total) + " for " + plural(g_sale_fuel_litres, "litre", "litres")
+					+ " of unleaded.", true);
+			} else {
+				say("The drawer opens and the sale is rung up. A receipt prints, and " + c.name + " "
+					+ (c.waved_receipt ? "waves it away" : "folds it into a pocket")
+					+ ", takes their bag and heads for the door. That is " + money(g_sale_total) + ".", true);
+			}
 			email_add("The till", "Sale of " + money(g_sale_total));
 		} else {
 			say(c.name + " leaves with nothing.", true);
@@ -833,6 +868,23 @@ void sale_take_short_payment() {
 void sale_sell_covers() {
 	customer@ c = g_sale_customer;
 	if (@c is null) return;
+	if (g_sale_fuel) {
+		/* Fuel comes off in whole litres: they get what their money buys at the
+		   sign, and the rest of the fill is quietly not put through. */
+		int afford = c.wallet / g_fuel_price;
+		if (afford >= g_sale_fuel_litres) {
+			say("Nothing has to come off: their money covers the fill after all.", true);
+			return;
+		}
+		if (afford < 0) afford = 0;
+		g_sale_fuel_litres = afford;
+		g_sale_total = afford * g_fuel_price;
+		c.mood -= 1;
+		say("You ring up " + plural(afford, "litre", "litres") + ", " + money(g_sale_total)
+			+ ", which is what their money covers. That is "
+			+ plural(c.fuel_litres - afford, "litre", "litres") + " short of the fill they asked for.", true);
+		return;
+	}
 	int budget = c.wallet;
 	int left_off = 0;
 	bool again = true;
@@ -902,8 +954,12 @@ void sale_refuse_sale() {
 	c.mood -= 4;
 	people_event(c, EV_COULD_NOT_PAY);
 	people_drunk_no_drink(c);
-	say("You refuse the sale. " + plural(restocked, "item goes", "items go") + " back on the shelves, and "
-		+ c.name + " leaves with nothing.", true);
+	if (g_sale_fuel) {
+		say("You tell " + c.name + " the fill cannot go through after all. They look around for another station and leave the car where it is.", true);
+	} else {
+		say("You refuse the sale. " + plural(restocked, "item goes", "items go") + " back on the shelves, and "
+			+ c.name + " leaves with nothing.", true);
+	}
 	sale_finish(false);
 }
 
@@ -942,11 +998,22 @@ void sale_open() {
 	/* Everything said over the counter from here until the sale closes belongs to
 	   the customer standing in front of you. */
 	voice_use(c.voice);
-	/* Copy their basket. */
-	for (uint i = 0; i < c.basket.length(); i++) {
-		g_sale_line.insert_last(c.basket[i]);
-		g_sale_qty.insert_last(c.basket_qty[i]);
-		g_sale_scanned.insert_last(0);
+	if (c.fuel_litres > 0) {
+		/* A driver's bill is the litres they named times the sign, and nothing
+		   is scanned. What the tank can actually give can be less than they
+		   asked for, and that is decided here, before any money moves. */
+		g_sale_fuel = true;
+		int have = g_fuel_litres;
+		int give = (c.fuel_litres > have) ? have : c.fuel_litres;
+		g_sale_fuel_litres = give;
+		g_sale_total = give * g_fuel_price;
+	} else {
+		/* Copy their basket. */
+		for (uint i = 0; i < c.basket.length(); i++) {
+			g_sale_line.insert_last(c.basket[i]);
+			g_sale_qty.insert_last(c.basket_qty[i]);
+			g_sale_scanned.insert_last(0);
+		}
 	}
 	/* Everybody walks in with a wallet. If the basket was filled off a shelf this
 	   was counted then; a customer handed a basket another way gets counted here,
@@ -965,8 +1032,21 @@ void sale_open() {
 			+ money(table_cost) + " has gone on the bill.", true);
 	}
 	sfx_ui(A("register.ogg"), -16.0, 700);
-	string s = c.name + ", " + people_arch_name(c.arch) + ", at the counter with "
-		+ plural(people_basket_lines(c), "line", "lines") + " in their basket.";
+	string s = "";
+	if (g_sale_fuel) {
+		s = c.name + ", " + people_arch_name(c.arch) + ", at the counter here for "
+			+ plural(c.fuel_litres, "litre", "litres") + " of unleaded on pump " + fuel_pump_word(c.fuel_pump)
+			+ ". At " + money(g_fuel_price) + " a litre that is " + money(c.fuel_litres * g_fuel_price) + ".";
+		if (g_sale_fuel_litres < c.fuel_litres) {
+			s += " The tank holds only " + plural(g_fuel_litres, "litre", "litres") + ", so that is all you can put on.";
+		}
+		if (g_sale_fuel_litres <= 0) {
+			s += " The tank is dry, so there is nothing you can sell them.";
+		}
+	} else {
+		s = c.name + ", " + people_arch_name(c.arch) + ", at the counter with "
+			+ plural(people_basket_lines(c), "line", "lines") + " in their basket.";
+	}
 	if (g_sale_id_needed) s += " Something in there is age restricted, so it needs an identification scan.";
 	if (c.wants_drink) s += " They want a drink as well.";
 	/* A regular says what they remember about last time before anything else. */
@@ -1001,6 +1081,14 @@ void sale_page_build() {
 	if (g_sale_id_needed and !g_sale_id_checked and sale_restricted_remaining() > 0) {
 		p.add("Ask for identification", ACT_SERVE_ASK_ID);
 		p.add("Refuse the age restricted lines", ACT_SERVE_REFUSE_REST);
+	}
+	if (g_sale_fuel and g_sale_total <= 0) {
+		/* The tank is dry: there is nothing to charge for and nothing to scan. */
+		p.add("Tell them the tank is dry and send them on their way", ACT_SERVE_REFUSE_SALE);
+		p.add("Step away from the till", ACT_SERVE_WALK_AWAY);
+		if (g_menu.length() == 0) menu_push(p);
+		else { g_menu[g_menu.length() - 1] = p; menu_speak_current(true); }
+		return;
 	}
 	if (sale_all_scanned() and (int(g_sale_total) > 0)) {
 		p.add("Run the card for " + money(g_sale_total), ACT_SERVE_CARD);
@@ -1190,11 +1278,36 @@ menu_page@ order_page() {
 	menu_page@ p = menu_page(t);
 	p.add("Fill every shelf, " + money(shop_draft_total_estimate_fill()) + " approximately", ACT_ORDER_FILL_ALL);
 	p.add("Order one aisle", ACT_ORDER_FACE_BASE);
+	p.add("Fuel for the forecourt, " + fuel_tank_text(), ACT_ORDER_FUEL);
 	p.add("Review the order, " + plural(shop_draft_lines(), "line", "lines") + ", " + money(shop_draft_total()), ACT_ORDER_REVIEW);
 	p.add("Place the order", ACT_ORDER_PLACE);
 	p.add("Clear the order", ACT_ORDER_CLEAR);
 	p.add("Orders already placed, " + shop_order_count() + ", " + money(shop_orders_total()), ACT_ORDER_PLACED);
 	p.add("Back", ACT_CLOSE);
+	return p;
+}
+
+/* Fuel is ordered on its own, by the tanker load, from the same terminal and
+   on the same Monday truck as everything else. It never joins the shelf draft:
+   it is one product, measured in litres, and the driver hoses it in. */
+menu_page@ fuel_order_page() {
+	string t = "Fuel by the tanker load. " + fuel_tank_text()
+		+ ". It costs " + money(g_fuel_cost) + " a litre wholesale, and comes with the truck on "
+		+ day_name(MONDAY) + " morning";
+	menu_page@ p = menu_page(t);
+	array<int> loads;
+	loads.insert_last(200);
+	loads.insert_last(500);
+	loads.insert_last(1000);
+	for (uint i = 0; i < loads.length(); i++) {
+		int litres = loads[i];
+		string line = plural(litres, "load", "loads") + ", " + money(litres * g_fuel_cost) + ", "
+			+ (g_fuel_litres + litres > FUEL_TANK_CAPACITY ? FUEL_TANK_CAPACITY : (g_fuel_litres + litres))
+			+ " litres in the tank after";
+		if (g_fuel_litres + litres > FUEL_TANK_CAPACITY) line += ", and the rest is more than the tank holds";
+		p.add(line, ACT_FUEL_ORDER_BASE + int(i));
+	}
+	p.add("Back", ACT_BACK);
 	return p;
 }
 
@@ -1317,6 +1430,7 @@ menu_page@ reports_page() {
 	p.add("Best and worst rows", ACT_REP_BESTWORST);
 	p.add("The market", ACT_REP_MARKET);
 	p.add("Aisle performance and prices", ACT_REP_AISLES);
+	p.add("The forecourt, " + fuel_tank_text(), ACT_REP_FUEL);
 	p.add("Back", ACT_CLOSE);
 	return p;
 }
@@ -1365,12 +1479,37 @@ menu_page@ product_price_page(int index) {
 	return p;
 }
 
+/* The price moved: put a floor under it, write it to the log, and rebuild the
+   page so its title quotes the new sign. The cursor stays on the line that
+   was pressed, and the fresh title is what answers it. */
+void fuel_price_tell(const string&in label) {
+	if (g_fuel_price < FUEL_PRICE_FLOOR) g_fuel_price = FUEL_PRICE_FLOOR;
+	log_line("shop", "fuel price set to " + g_fuel_price + " a litre");
+	menu_replace_current(fuel_price_page(), label);
+	menu_speak_current(true);
+}
+
+/* The sign by the road: what a litre of unleaded goes for. */
+menu_page@ fuel_price_page() {
+	string t = "Unleaded. It costs " + money(g_fuel_cost) + " a litre and goes at " + money(g_fuel_price)
+		+ " on the sign. " + fuel_tank_text();
+	menu_page@ p = menu_page(t);
+	p.add("Up five cents", ACT_FUEL_PRICE_UP5);
+	p.add("Up twenty five cents", ACT_FUEL_PRICE_UP25);
+	p.add("Down five cents", ACT_FUEL_PRICE_DOWN5);
+	p.add("Down twenty five cents", ACT_FUEL_PRICE_DOWN25);
+	p.add("Set to the fair price, " + money(fuel_fair_price()), ACT_FUEL_PRICE_FAIR);
+	p.add("Back", ACT_BACK);
+	return p;
+}
+
 menu_page@ prices_home_page() {
 	menu_page@ p = menu_page("Prices. Pick a shelf face");
 	for (int f = 0; f < FACE_COUNT; f++) {
 		p.add(shop_face_name(f) + ", " + shop_face_theme(f), ACT_PRICE_FACE_BASE + f);
 	}
 	p.add("Behind the counter", ACT_PRICE_FACE_BASE + 100);
+	p.add("Unleaded on the forecourt, " + money(g_fuel_price) + " a litre", ACT_PRICE_FUEL);
 	int drifted = shop_prices_drifted();
 	p.add("Set everything that has drifted back to the fair price, " + plural(drifted, "line", "lines"), ACT_PRICE_ALL_FAIR);
 	p.add("Back", ACT_CLOSE);
@@ -1692,6 +1831,9 @@ menu_page@ phone_page() {
 	p.add("Email, " + plural(int(g_emails.length()), "message", "messages"), ACT_PHONE_EMAIL);
 	p.add("News", ACT_PHONE_NEWS);
 	p.add("Reviews", ACT_PHONE_REVIEWS);
+	/* The forecourt from wherever you are standing: a shop that sells fuel
+	   needs to know its tank level away from the terminal. */
+	p.add("The forecourt, " + fuel_tank_text(), ACT_PHONE_FUEL);
 	/* The handset's own speech speed, for the same reason the terminal has one:
 	   the order the player types into it is read back in its own voice. */
 	p.add(chip_speed_line(CHIP_DEVICE_PHONE), ACT_SPEED_PHONE);
@@ -1934,6 +2076,11 @@ void save_game(bool quiet = false) {
 		if (g_draft_qty[i] <= 0) continue;
 		f.write("draft=" + i + "," + g_draft_qty[i] + "\r\n");
 	}
+	/* The tank under the forecourt and the sign above it belong to this store,
+	   like the machines' speech: one line, litres, price, cost, and any tanker
+	   load already paid for. */
+	f.write("fuel=" + g_fuel_litres + "," + g_fuel_price + "," + g_fuel_cost + ","
+		+ g_fuel_order_litres + "," + g_fuel_order_day + "\r\n");
 	for (uint i = 0; i < g_orders.length(); i++) {
 		order_rec@ o = g_orders[i];
 		f.write("order=" + o.arrive_day + "," + o.total + "," + o.ordered_day + "\r\n");
@@ -2072,6 +2219,14 @@ void load_game_from(int slot) {
 	g_regulars.resize(0);
 	g_draft_qty.resize(g_catalog.length());
 	for (uint i = 0; i < g_draft_qty.length(); i++) g_draft_qty[i] = 0;
+	/* A save written before the fuel lived here reads back at the shop's own
+	   defaults, and no pump is running in a store that was not open. */
+	g_fuel_litres = FUEL_TANK_START;
+	g_fuel_price = FUEL_PRICE_START;
+	g_fuel_cost = FUEL_COST_START;
+	g_fuel_order_litres = 0;
+	g_fuel_order_day = 0;
+	fuel_init();
 	for (uint i = 0; i < lines.length(); i++) {
 		string ln = lines[i].trim_whitespace();
 		int eq = ln.find_first("=");
@@ -2097,6 +2252,19 @@ void load_game_from(int slot) {
 		} else if (key == "draft" and parts.length() >= 2) {
 			int idx = parse_int(parts[0]);
 			if (idx >= 0 and uint(idx) < g_draft_qty.length()) g_draft_qty[idx] = parse_int(parts[1]);
+		} else if (key == "fuel" and parts.length() >= 5) {
+			g_fuel_litres = parse_int(parts[0]);
+			g_fuel_price = parse_int(parts[1]);
+			g_fuel_cost = parse_int(parts[2]);
+			g_fuel_order_litres = parse_int(parts[3]);
+			g_fuel_order_day = parse_int(parts[4]);
+			/* Put right anything that could not have happened. */
+			if (g_fuel_litres < 0) g_fuel_litres = 0;
+			if (g_fuel_litres > FUEL_TANK_CAPACITY) g_fuel_litres = FUEL_TANK_CAPACITY;
+			if (g_fuel_price < FUEL_PRICE_FLOOR) g_fuel_price = FUEL_PRICE_FLOOR;
+			if (g_fuel_cost < FUEL_COST_FLOOR) g_fuel_cost = FUEL_COST_FLOOR;
+			if (g_fuel_order_litres < 0) g_fuel_order_litres = 0;
+			if (g_fuel_order_day < 0) g_fuel_order_day = 0;
 		} else if (key == "order" and parts.length() >= 3) {
 			order_rec@ o = order_rec(parse_int(parts[0]), TRUCK_MINUTE, parse_int(parts[1]),
 				parse_int(parts[2]), int(g_current_week));
@@ -2232,6 +2400,14 @@ void new_game_in(int slot) {
 	g_draft_qty.resize(0);
 	g_orders.resize(0);
 	g_mess.resize(0);
+	/* The previous owner left the tank part full and the sign at the going
+	   rate. Nothing is running on the forecourt. */
+	g_fuel_litres = FUEL_TANK_START;
+	g_fuel_price = FUEL_PRICE_START;
+	g_fuel_cost = FUEL_COST_START;
+	g_fuel_order_litres = 0;
+	g_fuel_order_day = 0;
+	fuel_init();
 	staff_init();
 	people_init();
 	trouble_init();
@@ -2474,12 +2650,30 @@ void mechanics_interact() {
 				+ " percent, with the subwoofers at " + g_sub_volume + " percent. "
 				+ "They are only heard in here and through the wall, so walk into the office or the cooler and the shop's music stays behind.", true);
 			return;
-		case IK_PUMP: case IK_AIRPUMP:
-			say("The pumps are not open for business yet. Fuel is coming in a later version. "
-				+ "For now you are a gas station that sells no gas.", true);
+		case IK_PUMP:
+		{
+			string s = "Unleaded, " + money(g_fuel_price) + " a litre, paid for inside at the till before any of it moves. ";
+			if (g_fuel_litres <= 0) {
+				s += "The tank under the forecourt is dry, so the pumps have nothing to give. "
+					+ "Order a load on the manager terminal and it comes with the truck on Monday morning.";
+			} else {
+				s += "The tank holds " + plural(g_fuel_litres, "litre", "litres") + ". ";
+			}
+			int running = fuel_pumps_running();
+			if (running > 0) s += plural(running, "pump is", "pumps are") + " running out here now.";
+			else if (g_fuel_litres > 0) s += "No pump is running. A driver comes in and pays, and then you hear the nozzle start out here.";
+			say(s, true);
+			return;
+		}
+		case IK_AIRPUMP:
+			say("The air and water pump. Free, like every forecourt's air pump, and it works.", true);
 			return;
 		case IK_ROAD:
-			say("The road. Traffic goes by, and nobody stops.", true);
+			if (g_fuel_litres > 0) {
+				say("The road. Traffic goes by, and the cars that want fuel pull up by the pumps and come in to pay at the till.", true);
+			} else {
+				say("The road. Traffic goes by, and nobody stops: with the tank dry there is nothing to sell them.", true);
+			}
 			return;
 	}
 	say("There is nothing to do with " + t.label + ".", true);
@@ -2572,6 +2766,20 @@ void menu_dispatch(int action, const string&in label) {
 		if (g_game_mode) { save_game(); return; }
 		if (file_exists(slot_path(slot))) load_game_from(slot);
 		else new_game_in(slot);
+		return;
+	}
+	if (action >= ACT_FUEL_ORDER_BASE and action < ACT_FUEL_ORDER_BASE + 10) {
+		int raw = action - ACT_FUEL_ORDER_BASE;
+		int litres = 200;
+		if (raw == 1) litres = 500;
+		if (raw >= 2) litres = 1000;
+		fuel_order(litres);
+		/* Back to the restock page, rebuilt so its tank line is the truth. The
+		   confirmation has already been said, so nothing else is spoken here. */
+		if (g_menu.length() > 1) {
+			g_menu.remove_last();
+			menu_replace_current(order_page(), "Fuel for the forecourt");
+		}
 		return;
 	}
 	if (action >= ACT_STAFF_HIRE_BASE and action < ACT_STAFF_HIRE_BASE + 1500) {
@@ -2757,6 +2965,7 @@ case ACT_SERVE_FETCH:      sale_open(); sale_page_build(); return;
 		case ACT_COMP_LAW:      say(trouble_police_record_text() + " " + money_bills_text(), true); return;
 
 		case ACT_ORDER_FILL_ALL: shop_order_fill_all(); menu_back(); return;
+		case ACT_ORDER_FUEL:     menu_push(fuel_order_page()); return;
 		case ACT_ORDER_REVIEW:   menu_push(order_review_page()); return;
 		case ACT_ORDER_PLACE:    shop_order_place(); menu_back(); return;
 		case ACT_ORDER_CLEAR:    shop_order_clear(); menu_back(); return;
@@ -2801,6 +3010,7 @@ case ACT_SERVE_FETCH:      sale_open(); sale_page_build(); return;
 		case ACT_REP_BESTWORST: say(shop_report_best_worst(), true); return;
 		case ACT_REP_MARKET:    say(shop_market_text(), true); return;
 		case ACT_REP_AISLES:    menu_push(aisles_page()); return;
+		case ACT_REP_FUEL:      say(shop_fuel_text(), true); return;
 
 		case ACT_PRICE_UP5:    if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price + 5); } return;
 		case ACT_PRICE_UP25:   if (g_price_product >= 0) { product@ p = product_at(g_price_product); if (@p !is null) shop_price_set(g_price_product, p.price + 25); } return;
@@ -2810,9 +3020,14 @@ case ACT_SERVE_FETCH:      sale_open(); sale_page_build(); return;
 		case ACT_PRICE_FACE_UP5:    shop_price_face(g_price_face, 5); return;
 		case ACT_PRICE_FACE_UP10:   shop_price_face(g_price_face, 10); return;
 		case ACT_PRICE_FACE_DOWN5:  shop_price_face(g_price_face, -5); return;
-		case ACT_PRICE_FACE_DOWN10: shop_price_face(g_price_face, -10); return;
-		case ACT_PRICE_FACE_FAIR:   shop_price_face_to_fair(g_price_face); return;
+		case ACT_PRICE_FACE_DOWN10: shop_price_face(g_price_face, -10); return;		case ACT_PRICE_FACE_FAIR:  shop_price_face_to_fair(g_price_face); return;
 		case ACT_PRICE_ALL_FAIR:    shop_price_all_to_fair(); menu_back(); return;
+		case ACT_PRICE_FUEL:        menu_push(fuel_price_page()); return;
+		case ACT_FUEL_PRICE_UP5:    g_fuel_price += 5;   fuel_price_tell(label); return;
+		case ACT_FUEL_PRICE_UP25:   g_fuel_price += 25;  fuel_price_tell(label); return;
+		case ACT_FUEL_PRICE_DOWN5:  g_fuel_price -= 5;   fuel_price_tell(label); return;
+		case ACT_FUEL_PRICE_DOWN25: g_fuel_price -= 25;  fuel_price_tell(label); return;
+		case ACT_FUEL_PRICE_FAIR:   g_fuel_price = fuel_fair_price(); fuel_price_tell(label); return;
 
 		case ACT_STAFF_POSITIONS:  menu_push(positions_page()); return;
 		case ACT_STAFF_LIST:       menu_push(staff_list_page()); return;
@@ -2863,6 +3078,7 @@ case ACT_SERVE_FETCH:      sale_open(); sale_page_build(); return;
 		case ACT_PHONE_EMAIL:   say(phone_email_text(), true); return;
 		case ACT_PHONE_NEWS:    say(phone_news_text(), true); return;
 		case ACT_PHONE_REVIEWS: say(people_reviews_text(), true); return;
+		case ACT_PHONE_FUEL:    say(shop_fuel_text(), true); return;
 
 		case ACT_ISSUE_AUDIO: file_issue("audio cues do not line up"); return;
 		case ACT_ISSUE_CLOCK: file_issue("the clock does not look right"); return;
@@ -2958,6 +3174,35 @@ void cashier_serve_one(worker@ w) {
 	customer@ c = people_queue_head();
 	if (@c is null) return;
 	if (!staff_worker_on_now(w)) return;
+	/* A driver is served the same way, with the litres instead of a basket:
+	   money first, tank second, pump when they reach the car. */
+	if (c.fuel_litres > 0) {
+		int give = c.fuel_litres;
+		if (give > g_fuel_litres) give = g_fuel_litres;
+		if (give <= 0) {
+			say(w.name + " tells " + c.name + " the tank is dry, so there is no fuel to put in the car.", true);
+			c.mood -= 3;
+			c.state = CUST_LEAVING;
+			for (int i = int(g_queue.length()) - 1; i >= 0; i--) if (g_queue[i] is c) g_queue.remove_at(uint(i));
+			return;
+		}
+		int fuel_total = give * g_fuel_price;
+		board_note_sale(false, true);
+		fuel_take(give);
+		money_earn(fuel_total);
+		g_wk_customers++;
+		w.served++;
+		c.fuel_litres = give;
+		c.served = true;
+		c.bought = true;
+		c.spent = fuel_total;
+		c.state = CUST_LEAVING;
+		for (int i = int(g_queue.length()) - 1; i >= 0; i--) if (g_queue[i] is c) g_queue.remove_at(uint(i));
+		people_event(c, EV_SERVED);
+		sfx_ui(A("register.ogg"), -12.0);
+		diag("staff", w.name + " sold " + give + " litres to " + c.name + " for " + money(fuel_total));
+		return;
+	}
 	int total = people_basket_total(c);
 	/* They ring it through. Crooked ones skip the ID scan, which the board will
 	   find in the till log. */
@@ -3134,6 +3379,10 @@ void mechanics_update(double dt_ms) {
 			cashier_serve_one(cashier);
 		}
 	}
+	/* The forecourt's own business: a pump that has finished handing its island
+	   back, and whether anybody is out there with an engine running. */
+	fuel_tick(now);
+	fuel_set_waiting(people_fuel_waiting());
 	music_trouble_tick();
 	music_tick();
 }

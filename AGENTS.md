@@ -205,7 +205,16 @@ allowed to rewrite a single key in place, preserving the file's own line
 endings (it is CRLF); the machines' speech speed and pitch are NOT in
 `config.ini` - they are saved with the store as `chip_*_speed_pct` and
 `chip_*_pitch_pct` in `saves/slotNN.txt`, one pair per machine, and the player
-changes them on the machine's own screen rather than in a menu.
+changes them on the machine's own screen rather than in a menu; the fuel under
+the forecourt is store state the same way, as one `fuel=` line (litres in the
+tank, cents per litre on the sign, cents per litre wholesale, tanker load on its
+way, the day it is due), and a save written before it existed reads back at the
+defaults. The forecourt's pumps are NOT ambience: their four beacons and the
+idling-car one are registered switched off (`audio_beacon_add(..., false)`) and
+only `audio_beacon_enable()` ever starts one, because a running pump means a
+fill is actually in progress and an engine out there means a driver is actually
+in the shop - so an empty forecourt is a quiet one, and the room scan only lists
+beacons that are enabled.
 
 Two more that are cheap to get wrong and expensive to find:
 

@@ -168,6 +168,12 @@ class customer {
 	bool   swatted;
 	int    swats;
 	bool   ran;
+	/* --- the forecourt -------------------------------------------------
+	   A driver is here for fuel rather than for a basket: they named their
+	   litres and their pump at the till, paid, and went back out to the car.
+	   fuel_litres is 0 for everybody who came in for the shop. */
+	int    fuel_litres;         // litres they asked for, 0 = not a fuel visit
+	int    fuel_pump;           // the pump they are filling at, 1 to 4
 	uint   next_step_at;
 	int    voice;        // their slot in the voice pool, so they sound like somebody
 	/* --- the body layer -------------------------------------------------
@@ -203,6 +209,7 @@ class customer {
 		memory = 0; waved_receipt = false;
 		mood = 0; price_complaints = 0; bare_shelf_hits = 0; stepped_in_mess = false;
 		shoplifter = false; rustled = false; swatted = false; swats = 0; ran = false;
+		fuel_litres = 0; fuel_pump = 1;
 		next_step_at = 0;
 		voice = -1;     // replaced by voice_pool_assign() as they come in the door
 		next_emote_at = 0;
@@ -549,6 +556,19 @@ int people_in_shop() {
 
 int people_queue_length() { return int(g_queue.length()); }
 
+/* How many drivers are still in the building on forecourt business, which is
+   what decides whether an engine is idling out there (shop.nvgt owns the
+   beacon; mechanics.nvgt calls this every frame). */
+int people_fuel_waiting() {
+	int n = 0;
+	for (uint i = 0; i < g_customers.length(); i++) {
+		customer@ c = g_customers[i];
+		if (@c is null or c.state == CUST_GONE) continue;
+		if (c.fuel_litres > 0) n++;
+	}
+	return n;
+}
+
 customer@ people_customer(int index) {
 	if (index < 0 or uint(index) >= g_customers.length()) return null;
 	return g_customers[index];
@@ -591,6 +611,9 @@ void people_queue_spot(int place, float &out x, float &out y) {
 
 int people_basket_total(customer@ c) {
 	int total = 0;
+	/* A driver's basket is the litres they named at the till, priced off the
+	   sign rather than off any shelf. */
+	if (c.fuel_litres > 0) return c.fuel_litres * g_fuel_price;
 	for (uint i = 0; i < c.basket.length(); i++) {
 		product@ p = product_at(c.basket[i]);
 		if (@p is null) continue;
@@ -1402,6 +1425,17 @@ customer@ people_spawn(int arch = -1) {
 	c.x = 4.5; c.y = 1.5;          // just inside the front door
 	c.face_target = random(0, FACE_COUNT - 1);
 	c.state = CUST_ARRIVING;
+	/* A driver is somebody who came for the forecourt, not for the shop: they
+	   named their litres and their pump, so they walk straight up to the till
+	   and never look at a shelf. They only come while there is fuel to sell.
+	   A shoplifter and a fuel driver cannot be the same visit. */
+	if (!lift and g_fuel_litres >= 8 and random(1, 100) <= 30) {
+		c.fuel_litres = random(8, 40);
+		if (c.fuel_litres > g_fuel_litres) c.fuel_litres = g_fuel_litres;
+		c.fuel_pump = random(1, FUEL_PUMPS);
+		c.state = CUST_TO_TILL;
+		c.face_target = -1;
+	}
 	/* A familiar face walks in already thinking about last time. */
 	c.memory = people_regular_lookup(c.name);
 	c.mood += c.memory * 2;
@@ -1457,6 +1491,11 @@ void people_reassign_lost_voice(int dead) {
 
 void people_customer_finish(customer@ c) {
 	if (@c is null) return;
+	/* A driver who has paid reaches their car at the same moment as the door
+	   shuts behind them, and the pump starts where they left it. The tank was
+	   already drained when the money went over the counter; this is the sound
+	   of the fill, in its own place on the forecourt. */
+	if (c.fuel_litres > 0 and c.bought) fuel_pump_start(c.fuel_pump, c.fuel_litres, c.name);
 	/* They remember, and they tell you so the next time they are in. */
 	people_regular_remember(c);
 	people_review_maybe(c, c.mood >= 0);
@@ -1526,7 +1565,7 @@ void people_tick(uint now) {
 			c.next_step_at = now + 300;
 			/* A drunk who has not had enough yet does not leave: they turn round
 			   at the door and start the whole visit again, one level further in. */
-			if (c.arch == ARCH_DRUNK and c.drink_count < 3 and random(1, 100) <= 25) {
+			if (c.arch == ARCH_DRUNK and c.fuel_litres == 0 and c.drink_count < 3 and random(1, 100) <= 25) {
 				people_drunk_another(c, now);
 				continue;
 			}
@@ -1573,7 +1612,11 @@ string people_face_word(int face) {
    the only warning the shop ever gets. */
 string people_note_word(customer@ c) {
 	string s = "";
-	if (c.on_phone) s += "on the phone";
+	if (c.fuel_litres > 0) {
+		s = plural(c.fuel_litres, "litre", "litres") + " of unleaded on pump " + fuel_pump_word(c.fuel_pump);
+		if (!c.bought and c.served) s += ", and leaving without it";
+	}
+	if (c.on_phone) s += (s.length() > 0) ? ", on the phone" : "on the phone";
 	if (c.drink_count > 0) s += (s.length() > 0) ? ", and well on their way" : "well on their way";
 	if (c.karen_level >= 3) s += (s.length() > 0) ? ", and making a scene" : "making a scene";
 	if (c.entourage_host.length() > 0) s += (s.length() > 0) ? ", in with the big spender" : "in with the big spender";
@@ -1603,8 +1646,13 @@ void people_scan_occupancy() {
 		customer@ head = people_queue_head();
 		if (@head !is null) {
 			s += "At the counter, " + head.name + ", " + people_arch_name(head.arch) + ", "
-				+ people_arch_voice(head.arch) + ", with "
-				+ plural(people_basket_lines(head), "line", "lines") + " in their basket";
+				+ people_arch_voice(head.arch);
+			if (head.fuel_litres > 0) {
+				s += ", here for " + plural(head.fuel_litres, "litre", "litres") + " of unleaded on pump "
+					+ fuel_pump_word(head.fuel_pump) + ", " + money(people_basket_total(head)) + " at the sign";
+			} else {
+				s += ", with " + plural(people_basket_lines(head), "line", "lines") + " in their basket";
+			}
 			if (people_basket_has_restricted(head)) s += ", and needs identification";
 			string note = people_note_word(head);
 			if (note.length() > 0) s += ", " + note;

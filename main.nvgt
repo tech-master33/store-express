@@ -495,7 +495,7 @@ bool step_key(uint key, int which) {
 }
 
 void world_money_report() {
-	say(money_status_text() + " " + shop_orders_text(), true);
+	say(money_status_text() + " " + shop_orders_text() + " " + shop_fuel_orders_text(), true);
 }
 
 void world_who_report() {
@@ -644,6 +644,7 @@ void main() {
 	staff_init();            /* nobody employed */
 	people_init();           /* nobody in the shop */
 	rooms_init();            /* the world, then the beacons */
+	fuel_init();             /* the pumps start silent: they run only during a fill */
 	trouble_init();          /* damages cleared, police record empty */
 	log_line("main", "world ready: " + room_name(g_player_room) + " with " + g_catalog.length()
 		+ " products across " + FACE_COUNT + " faces");

@@ -125,6 +125,24 @@ string duration_text(int mins) {
 	return parts;
 }
 
+/* The forecourt's four pumps, in words. A driver asks for pump two by name at
+   the till, so the same word is used by the people, the sale and the pump's
+   own sound beacon. The beacon id is built from the word too, so nothing can
+   spell the pump differently from the sound of it. */
+string fuel_pump_word(int pump) {
+	switch (pump) {
+		case 1:  return "one";
+		case 2:  return "two";
+		case 3:  return "three";
+		case 4:  return "four";
+	}
+	return "one";
+}
+
+string fuel_pump_beacon_id(int pump) {
+	return "fuel pump " + fuel_pump_word(pump) + ", running";
+}
+
 /* A rough time of day, for atmosphere. */
 string time_of_day_word() {
 	if (g_current_hour < 5)  return "the middle of the night";

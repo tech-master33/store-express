@@ -1455,6 +1455,13 @@ class beacon {
 	float  gain;
 	int    slot;
 	bool   silenced;
+	/* Whether this loop should be running at all. Most beacons are ambience and
+	   are on from the moment the world is built; the forecourt's pumps are not
+	   ambience, they are the sound of a fill in progress, so each one is
+	   registered off and only switched on while somebody is actually fueling.
+	   A disabled beacon is never resumed by audio_update, whatever room the
+		player is standing in. */
+	bool   enabled;
 
 	beacon(const string&in i, int r, float bx, float by, float bz,
 	       const string&in f, bool lp, float g) {
@@ -1463,6 +1470,7 @@ class beacon {
 		file = f; loopable = lp; gain = g;
 		slot = -1;
 		silenced = true;
+		enabled = true;
 	}
 }
 
@@ -1779,12 +1787,16 @@ void audio_field_init() {
 	for (uint i = 0; i < uint(MAX_ROOMS); i++) g_room_gain[i] = g_silent_gain;
 }
 
-/* Register a looping or one-shot point source of sound in a room. */
+/* Register a looping or one-shot point source of sound in a room. A beacon
+   registered switched off (the pumps) owns no sound at all until
+   audio_beacon_enable starts it. */
 void audio_beacon_add(const string&in id, int room, float x, float y, float z,
-                      const string&in soundfile, bool loopable, float gain) {
+                      const string&in soundfile, bool loopable, float gain,
+                      bool start_enabled = true) {
 	if (@g_pool is null) return;
 	beacon@ b = beacon(id, room, x, y, z, soundfile, loopable, gain);
-	if (loopable) {
+	b.enabled = start_enabled;
+	if (loopable and start_enabled) {
 		/* Start beneath the floor and let the first audio_update bring it up. */
 		b.slot = g_pool.play_extended_3d(soundfile, g_lis_x, g_lis_y, g_lis_z,
 			x, y, z, g_lis_rot,
@@ -1797,6 +1809,44 @@ void audio_beacon_add(const string&in id, int room, float x, float y, float z,
 		}
 	}
 	g_beacons.insert_last(b);
+}
+
+/* Switch a beacon on or off. This is how the forecourt's pumps run only while
+   they are being used: the beacon is registered off, started when a fill
+   begins and taken back off when it ends. Switching one on starts its loop if
+   nothing is playing yet, at silence, and the next audio_update brings it up
+   in its own room and place. Switching one off pauses its loop where it is, so
+   a pump that has just stopped does not start again from the top next time. */
+void audio_beacon_enable(const string&in id, bool on) {
+	for (uint i = 0; i < g_beacons.length(); i++) {
+		beacon@ b = g_beacons[i];
+		if (b.id != id) continue;
+		b.enabled = on;
+		if (!on) {
+			if (b.slot >= 0 and !b.silenced and @g_pool !is null) g_pool.pause_sound(b.slot);
+			b.silenced = true;
+			return;
+		}
+		if (b.loopable and b.slot < 0 and @g_pool !is null) {
+			b.slot = g_pool.play_extended_3d(b.file, g_lis_x, g_lis_y, g_lis_z,
+				b.x, b.y, b.z, g_lis_rot,
+				0, 0, 0, 0, 0, 0,
+				true, 0.0, 0.0, g_silent_gain, 100.0,
+				true);
+			if (b.slot >= 0) g_pool.set_sound_owner(b.slot, b.id, 1);
+			b.silenced = true;
+		}
+		return;
+	}
+}
+
+/* What the game says about a beacon when it asks whether a pump is running:
+   enabled, not audible. A beacon that does not exist is not on. */
+bool audio_beacon_on(const string&in id) {
+	for (uint i = 0; i < g_beacons.length(); i++) {
+		if (g_beacons[i].id == id) return g_beacons[i].enabled;
+	}
+	return false;
 }
 
 /* ---- the shop's speakers --------------------------------------------------
@@ -1928,6 +1978,14 @@ void audio_update(float lx, float ly, float lz, double rot, int room) {
 	for (uint i = 0; i < g_beacons.length(); i++) {
 		beacon@ b = g_beacons[i];
 		if (b.slot < 0) continue;
+		if (!b.enabled) {
+			/* Switched off: hold it down wherever the player is standing. */
+			if (!b.silenced) {
+				g_pool.pause_sound(b.slot);
+				b.silenced = true;
+			}
+			continue;
+		}
 		float g = audio_gain_for_room(b.room);
 		bool should_silence = (g <= (g_silent_gain + 1.0));
 		if (should_silence) {

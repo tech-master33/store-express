@@ -83,7 +83,7 @@ tells you in exact agreement.
 | Main shop floor | Till, ten aisles (twenty shelf faces), entry doors, the door to the office. |
 | Cooler | Walk-in chiller. |
 | Freezer | Walk-in freezer. |
-| Fuel forecourt | Fuel pumps and idling cars. |
+| Fuel forecourt | Four pumps, the tank under them, the road. Cars pull up and the engines idle. |
 | Back office | Manager terminal, the secure back door. |
 | Studio apartment | Bed, television, kitchen fridge. Behind the office, not the shop. |
 
@@ -182,6 +182,44 @@ price by line, take a line back to fair, or move every line on a face up or down
 by a percentage. Pricing over fair sells for more and moves less; under cost is a
 warning the computer will repeat to you. Prices drift on their own over time, so
 a shop left alone slowly loses its margin.
+
+---
+
+## Fuel on the forecourt
+
+The pumps sell what the tank under the forecourt holds: **unleaded, measured in
+litres, priced on the sign**. It is the one thing in the shop that is ordered by
+the tanker load and sold by the litre, and it trades inside out compared with the
+shelves:
+
+1. A driver pulls up at a pump - you hear the engine idling out on the
+   forecourt, muffled through the wall if you are inside - and comes in to the
+   till. They name their litres and their pump: "eighteen litres on pump three".
+2. You ring it up like any other sale. The bill is the litres times the sign,
+   and the register offers the card, the exact money, a round note or what their
+   wallet actually covers.
+3. Money changes hands **before any fuel moves**, so a drive-off cannot happen.
+   The tank gives up the litres when the sale closes, and the driver walks back
+   out to the car.
+4. The pump starts where they left it - the nozzle cue, then the pump running
+   on its own island, for as long as the litres take - and when it finishes the
+   engine catches and the car goes. From inside the shop it is all through the
+   wall, which is exactly how a real forecourt behind a shop sounds.
+
+The tank holds **2,000 litres** and starts part full. When it runs low, order a
+load by the tanker on the manager terminal (200, 500 or 1000 litres at
+wholesale); it is paid for when you order it and arrives with **Monday's truck**.
+Order more than the tank holds and the excess goes back - the terminal tells you
+what fits before you commit. With the tank dry no driver comes at all, so the
+forecourt earns nothing until you order.
+
+**The sign is yours to set** on the terminal's Prices page, next to the shelf
+faces. Fuel's wholesale cost moves with the same weekly market as everything
+else, quoted by name on the market report, so a refinery story in the news is
+your chance to order before the cost lands. The fair price is cost plus sixty
+cents. The forecourt report (Reports on the terminal, or the phone) gives the
+tank level, the cost, the sign and the margin; `M` from anywhere reports any
+tanker load on its way.
 
 ---
 

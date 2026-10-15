@@ -676,6 +676,247 @@ void shop_check_deliveries() {
 		shop_delivery_arrive(o);
 		g_orders.remove_at(uint(i));
 	}
+	fuel_check_delivery();
+}
+
+/* ==========================================================================
+   7b.  THE FUEL UNDER THE FORECOURT
+   --------------------------------------------------------------------------
+   The pumps sell what the tank under the forecourt holds. Everything here is
+   shop state in whole litres and whole cents: the tank's level, what a litre
+   cost on the wholesale market, what the sign by the road says a litre goes
+   for, and any tanker load on its way.
+
+   The shape of the trade is the real one, inside out: a driver pulls up at a
+   pump, comes in and pays at the till for a stated number of litres, and goes
+   back out to the car. Money changes hands before any fuel moves, so a
+   drive-off cannot happen, and the whole sale goes through the queue, the
+   wallet and the register that every other sale uses (see mechanics.nvgt).
+   The pump's sound is part of the business rather than ambience: each of the
+   four pumps owns a beacon that is registered switched off, and a fill
+   switches it on where that pump stands (rooms.nvgt registers them,
+   audio.nvgt runs them). An idle forecourt is a quiet forecourt.
+
+   Fuel is ordered on its own, by the tanker load, from the same terminal and
+   on the same Monday truck as everything else. It is store state and goes in
+   the save as one line: litres, price, cost, and any load on the way.
+   ========================================================================= */
+
+const int FUEL_TANK_CAPACITY  = 2000;   // litres the tank under the forecourt holds
+const int FUEL_TANK_START     = 800;    // what the previous owner left in it
+const int FUEL_PRICE_START    = 175;    // cents per litre on the sign
+const int FUEL_COST_START     = 112;    // cents per litre on the wholesale list
+const int FUEL_COST_FLOOR     = 30;     // the market can only push a litre so low
+const int FUEL_PRICE_FLOOR    = 5;      // and the sign can only be marked so low
+const int FUEL_MARGIN_FAIR    = 60;     // the fair price is cost plus this
+const int FUEL_PUMPS          = 4;
+const int FUEL_FILL_MS_PER_LITRE = 1100; // a fill is heard for its length
+const int FUEL_FILL_MIN_MS    = 6000;
+const int FUEL_FILL_MAX_MS    = 45000;
+const int FUEL_PUMP_CUT_MS    = 4500;   // the nozzle cue is cut here, like the doors
+
+int g_fuel_litres = FUEL_TANK_START;
+int g_fuel_price  = FUEL_PRICE_START;
+int g_fuel_cost   = FUEL_COST_START;
+int g_fuel_order_litres = 0;   // a tanker load placed and paid for
+int g_fuel_order_day    = 0;   // the day it is due with the truck
+
+/* One slot per pump: when its current fill ends (0 = standing still), and how
+   many litres are on it, for the pump's own page and the logs. Litres that are
+   paid for with every pump busy wait here for the next one to free up. */
+array<uint> g_fuel_pump_until;
+array<int>  g_fuel_pump_litres;
+array<int>  g_fuel_pending;
+uint g_fuel_next_check = 0;
+
+void fuel_pumps_reset() {
+	g_fuel_pump_until.resize(FUEL_PUMPS);
+	g_fuel_pump_litres.resize(FUEL_PUMPS);
+	for (int i = 0; i < FUEL_PUMPS; i++) { g_fuel_pump_until[i] = 0; g_fuel_pump_litres[i] = 0; }
+	g_fuel_pending.resize(0);
+	g_fuel_next_check = 0;
+}
+
+/* Called at startup and whenever a store is started or loaded: no pump is
+   running, nothing is waiting, and every pump's sound is taken off. */
+void fuel_init() {
+	fuel_pumps_reset();
+	for (int p = 1; p <= FUEL_PUMPS; p++) audio_beacon_enable(fuel_pump_beacon_id(p), false);
+	audio_beacon_enable("an idling car", false);
+}
+
+int fuel_space() { return FUEL_TANK_CAPACITY - g_fuel_litres; }
+int fuel_fair_price() { return g_fuel_cost + FUEL_MARGIN_FAIR; }
+int fuel_fill_price(int litres) { return litres * g_fuel_price; }
+void fuel_take(int litres) {
+	g_fuel_litres -= litres;
+	if (g_fuel_litres < 0) g_fuel_litres = 0;
+}
+
+string fuel_tank_text() {
+	string s = plural(g_fuel_litres, "litre", "litres") + " in the tank";
+	if (g_fuel_litres <= 0) s += ", which is dry";
+	else if (fuel_space() > 0) s += ", " + fuel_space() + " short of full";
+	return s;
+}
+
+int fuel_pumps_running() {
+	int n = 0;
+	uint now = ticks();
+	if (g_fuel_pump_until.length() != FUEL_PUMPS) return 0;
+	for (int i = 0; i < FUEL_PUMPS; i++) if (g_fuel_pump_until[i] > now) n++;
+	return n;
+}
+
+/* The whole forecourt, for the terminal's reports and the phone. */
+string shop_fuel_text() {
+	string s = "The forecourt. ";
+	if (g_fuel_litres <= 0) {
+		s += "The tank under the pumps is dry, so nobody can be sold fuel. Order a load on the manager terminal and it comes with the truck on Monday morning.";
+	} else {
+		s += "The tank holds " + plural(g_fuel_litres, "litre", "litres") + " of unleaded";
+		if (fuel_space() > 0) s += ", " + fuel_space() + " short of full";
+		s += ". It cost " + money(g_fuel_cost) + " a litre on the wholesale list and goes at "
+			+ money(g_fuel_price) + " a litre on the sign";
+		if (g_fuel_price <= g_fuel_cost) {
+			s += ", which is under what it cost you";
+		} else {
+			s += ", a margin of " + money(g_fuel_price - g_fuel_cost) + " a litre";
+		}
+		s += ".";
+	}
+	if (g_fuel_order_litres > 0) {
+		s += " " + plural(g_fuel_order_litres, "load is", "loads are") + " on the tanker for day "
+			+ g_fuel_order_day + ", which is " + plural(g_fuel_order_day - int(g_current_day), "day", "days") + " from now.";
+	}
+	int running = fuel_pumps_running();
+	if (running > 0) s += " " + plural(running, "pump is", "pumps are") + " running out there.";
+	return s;
+}
+
+/* The line the money report adds, and empty when there is nothing to say. */
+string shop_fuel_orders_text() {
+	if (g_fuel_order_litres <= 0) return "";
+	return plural(g_fuel_order_litres, "litre", "litres") + " of fuel on the tanker, arriving day "
+		+ g_fuel_order_day + ".";
+}
+
+/* Order a tanker load. Paid for the moment it is placed, like every other
+   order, and it comes with the Monday truck. */
+void fuel_order(int litres) {
+	if (litres <= 0) return;
+	int cost = litres * g_fuel_cost;
+	if (g_account_hold) {
+		sfx_ui(A("knock.wav"), -10.0);
+		say("Ridgeline refuses the fuel order. Your account is on hold because of the unpaid bill day.", true);
+		return;
+	}
+	if (!money_can_afford(cost)) {
+		say("The load comes to " + money(cost) + " and the till holds " + money(g_cash)
+			+ ". Ridgeline will not extend credit, so the tanker stays where it is.", true);
+		return;
+	}
+	money_spend(cost, 1);
+	g_fuel_order_litres += litres;
+	g_fuel_order_day = shop_next_delivery_day();
+	sfx_ui(A("register.ogg"), -8.0);
+	say(plural(litres, "load", "loads") + " of unleaded, " + money(cost) + ", ordered and paid for. "
+		+ "The tanker comes with the truck on " + day_name(MONDAY) + ", day " + g_fuel_order_day
+		+ ", at half past six in the morning. The till holds " + money(g_cash) + ".", true);
+	log_line("shop", "fuel ordered: " + litres + " litres arriving day " + g_fuel_order_day);
+}
+
+/* The tanker fills the tank when the truck comes. Called by
+   shop_check_deliveries, which only runs at the truck's own minute. */
+void fuel_check_delivery() {
+	if (g_fuel_order_litres <= 0) return;
+	if (int(g_current_day) < g_fuel_order_day) return;
+	int litres = g_fuel_order_litres;
+	g_fuel_order_litres = 0;
+	g_fuel_order_day = 0;
+	int space = fuel_space();
+	int into = (litres > space) ? space : litres;
+	g_fuel_litres += into;
+	sfx_ui(A("truck.mp3"), -8.0);
+	string s = "The fuel tanker is here. The driver hoses " + plural(into, "litre", "litres")
+		+ " into the tank under the forecourt, which now holds " + plural(g_fuel_litres, "litre", "litres") + ". ";
+	if (litres > into) {
+		s += plural(litres - into, "litre was", "litres were") + " more than the tank holds and has gone back. "
+			+ "Order to the space you have next time. ";
+	}
+	say(s, true);
+	log_line("shop", "fuel delivery: " + into + " litres into the tank");
+}
+
+/* ---- running the pumps --------------------------------------------------
+   A fill is heard where it happens and for as long as it takes: the nozzle
+   cue, then the pump's own loop on its beacon until the litres are gone. This
+   is the only thing in the game that switches a beacon on. */
+void fuel_pump_run(int idx, int litres, const string&in who) {
+	uint now = ticks();
+	int ms = litres * FUEL_FILL_MS_PER_LITRE;
+	if (ms < FUEL_FILL_MIN_MS) ms = FUEL_FILL_MIN_MS;
+	if (ms > FUEL_FILL_MAX_MS) ms = FUEL_FILL_MAX_MS;
+	g_fuel_pump_until[uint(idx)] = now + uint(ms);
+	g_fuel_pump_litres[uint(idx)] = litres;
+	audio_beacon_enable(fuel_pump_beacon_id(idx + 1), true);
+	float px, py;
+	fuel_pump_pos(idx + 1, px, py);
+	sfx_at(ROOM_FORECOURT, px, py, 0.0, A("pump.mp3"), -8.0, FUEL_PUMP_CUT_MS);
+	log_line("shop", "pump " + (idx + 1) + " running for " + litres + " litres, " + who);
+}
+
+/* Somebody has paid for fuel and walked back out to the car. If their pump is
+   free it starts there and then; if every pump is busy their litres wait in
+   line rather than being lost. */
+void fuel_pump_start(int pump, int litres, const string&in who) {
+	if (g_fuel_pump_until.length() != FUEL_PUMPS) fuel_pumps_reset();
+	if (litres <= 0) return;
+	if (pump < 1) pump = 1;
+	if (pump > FUEL_PUMPS) pump = FUEL_PUMPS;
+	int idx = pump - 1;
+	if (g_fuel_pump_until[uint(idx)] > ticks()) {
+		g_fuel_pending.insert_last(litres);
+		log_line("shop", litres + " litres queued behind pump " + pump + ", " + who);
+		return;
+	}
+	fuel_pump_run(idx, litres, who);
+}
+
+/* Once per frame from mechanics.nvgt: a pump that has finished hands its
+   island back, its car is heard pulling away, and the next driver waiting gets
+   the pump. */
+void fuel_tick(uint now) {
+	if (g_fuel_pump_until.length() != FUEL_PUMPS) return;
+	if (now < g_fuel_next_check) return;
+	g_fuel_next_check = now + 400;
+	for (int i = 0; i < FUEL_PUMPS; i++) {
+		if (g_fuel_pump_until[uint(i)] == 0) continue;
+		if (now < g_fuel_pump_until[uint(i)]) continue;
+		int litres = g_fuel_pump_litres[uint(i)];
+		g_fuel_pump_until[uint(i)] = 0;
+		g_fuel_pump_litres[uint(i)] = 0;
+		audio_beacon_enable(fuel_pump_beacon_id(i + 1), false);
+		float px, py;
+		fuel_pump_pos(i + 1, px, py);
+		/* The engine catches and the car goes: the recording is an idling engine,
+		   so it is cut where the game cuts everything that outlasts its cue. */
+		sfx_at(ROOM_FORECOURT, px, py, 0.0, A("car_idle.mp3"), -8.0, 2600);
+		log_line("shop", "pump " + (i + 1) + " finished " + litres + " litres");
+		if (g_fuel_pending.length() > 0) {
+			int next = g_fuel_pending[0];
+			g_fuel_pending.remove_at(0);
+			fuel_pump_run(i, next, "the next driver");
+		}
+	}
+}
+
+/* The idling-car beacon means somebody is actually out there with an engine
+   running: it is on while any driver is still in the shop on their way to or
+   from the till, and the moment the last one is gone the forecourt is quiet
+   again. Called every frame with the count from people.nvgt. */
+void fuel_set_waiting(int drivers) {
+	audio_beacon_enable("an idling car", drivers > 0);
 }
 
 /* ==========================================================================
@@ -742,6 +983,20 @@ void shop_market_week() {
 			story += "There is a story in the local news about " + p.category + ": costs there are "
 				+ signed_pct(pct) + " this week. ";
 		}
+	}
+	/* Fuel moves with the same market, on its own line: it is the one thing the
+	   shop sells by the litre and orders by the tanker load, so its cost is
+	   watched separately and quoted by name on the market report. */
+	int fuel_pct = random(-5, 6);
+	bool fuel_shock = (random(1, 100) <= 12);
+	if (fuel_shock) fuel_pct = (fuel_pct >= 0) ? random(15, 26) : random(-20, -12);
+	g_fuel_cost = (g_fuel_cost * (100 + fuel_pct)) / 100;
+	if (g_fuel_cost < FUEL_COST_FLOOR) g_fuel_cost = FUEL_COST_FLOOR;
+	shop_market_set("fuel", fuel_pct);
+	if (fuel_shock and fuel_pct > 0) {
+		story += (story.length() > 0) ? " " : "";
+		story += "There is a refinery story on the news: wholesale fuel is " + signed_pct(fuel_pct)
+			+ " this week, so a tanker load costs noticeably more. ";
 	}
 	g_market_warning_out = true;
 	string s = "The wholesaler's price list has moved. ";
