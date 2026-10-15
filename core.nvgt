@@ -180,6 +180,10 @@ bool   g_clock_fast_forward  = false;  // the jail fast-forward toggle
    stay awake forever. money.nvgt and staff.nvgt enforce that. */
 bool g_hours_24h = false;
 
+/* Coffee and the fountain: 1 self serve, 0 employee serve. Lives here alongside
+   g_hours_24h so people.nvgt and mechanics.nvgt both see the same policy. */
+int g_drinks_self_serve = 1;
+
 int clock_minute_of_day() { return int(g_current_hour) * 60 + int(g_current_minute); }
 
 string clock_time_text() {

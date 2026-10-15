@@ -244,7 +244,6 @@ bool request_quit = false;
 /* ---- shop identity and policy ------------------------------------------ */
 string g_store_name = "Store Express";
 bool   g_renamed = false;
-int    g_drinks_self_serve = 1;  /* 1 self serve, 0 employee serve */
 bool   g_tv_on = true;
 
 /* ---- the till's paperwork ---------------------------------------------- */
@@ -1022,14 +1021,50 @@ void sale_open() {
 	if (!c.wallet_known) { c.wallet = people_wallet_for(c); c.wallet_known = true; }
 	g_sale_id_needed = people_basket_has_restricted(c);
 	if (c.wants_drink) {
-		/* A coffee or a fountain drink, served before the rest. */
-		int table_cost = (c.drink_kind == 0) ? 250 : 200;
-		g_sale_drink_cost = table_cost;
-		money_earn(table_cost);
-		sfx_at(ROOM_SHOP, 1.5, 8.5, 0.0, A("pump.mp3"), -14.0);
-		say("They also want a " + ((c.drink_kind == 0) ? "coffee" : "fountain drink") + ". "
-			+ ((g_drinks_self_serve == 1) ? "They pour it themselves." : "You pour it for them.") + " "
-			+ money(table_cost) + " has gone on the bill.", true);
+		int kind = (c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN;
+		if (c.drink_poured) {
+			/* Already poured at the machine by the drink server on shift or by
+			   the customer on self serve. */
+			int table_cost = c.drink_cost;
+			g_sale_drink_cost = table_cost;
+			if (table_cost > 0) money_earn(table_cost);
+			string who = (c.drink_poured_by.length() > 0)
+				? (c.drink_poured_by + " already poured their " + drink_word(kind) + " at " + drink_station_word(kind) + ".")
+				: ("They already poured their own " + drink_word(kind) + " at " + drink_station_word(kind) + ".");
+			if (table_cost > 0) say(who + " " + money(table_cost) + " has gone on the bill.", true);
+			else say(who, true);
+		} else if (drink_station_damaged(kind)) {
+			c.wants_drink = false;
+			c.mood -= 2;
+			people_event(c, EV_BARE);
+			say("They ask for a " + drink_word(kind) + ", but " + drink_station_word(kind) + " is knocked over.", true);
+		} else {
+			worker@ srv = staff_on_duty(ROLE_SERVER);
+			if (@srv !is null) {
+				int table_cost = staff_server_pour(srv, kind, c.name);
+				c.drink_poured = true;
+				c.drink_cost = table_cost;
+				c.drink_poured_by = srv.name;
+				g_sale_drink_cost = table_cost;
+				if (table_cost > 0) money_earn(table_cost);
+				say("They also want a " + drink_word(kind) + ". " + srv.name + " pours it at "
+					+ drink_station_word(kind) + ". "
+					+ ((table_cost > 0) ? (money(table_cost) + " has gone on the bill.") : ""), true);
+			} else {
+				/* You pour it yourself (or they pour it now on self serve). */
+				int table_cost = drink_price_cents(kind);
+				float sx, sy;
+				drink_station_pos(kind, sx, sy);
+				c.drink_poured = true;
+				c.drink_cost = table_cost;
+				g_sale_drink_cost = table_cost;
+				money_earn(table_cost);
+				sfx_at(ROOM_SHOP, sx, sy, 0.0, A("pump.mp3"), -14.0, DRINK_POUR_CUT_MS);
+				say("They also want a " + drink_word(kind) + ". "
+					+ ((g_drinks_self_serve == 1) ? "They pour it themselves." : "You pour it for them.") + " "
+					+ money(table_cost) + " has gone on the bill.", true);
+			}
+		}
 	}
 	sfx_ui(A("register.ogg"), -16.0, 700);
 	string s = "";
@@ -2611,13 +2646,22 @@ void mechanics_interact() {
 			/* A second press opens the face's lines. */
 			return;
 		case IK_COFFEE:
-			say("The coffee station. " + shop_face_stock_pct(FACE_COUNTER) + " percent of the counter lines are stocked. "
-				+ ((g_drinks_self_serve == 1) ? "Customers pour their own." : "Somebody has to pour every cup."), true);
+		{
+			worker@ srv = staff_on_duty(ROLE_SERVER);
+			string who = (@srv !is null) ? (srv.name + " is on the rota here, pouring the cups.")
+				: ((g_drinks_self_serve == 1) ? "Customers pour their own." : "Employee serve, and nobody is on the rota for it, so you pour them at the till.");
+			say("The coffee station. " + (t.damaged ? "It has been knocked over and needs a repair. " : "") + who, true);
 			return;
+		}
 		case IK_FOUNTAIN:
-			say("The soda fountain. " + ((g_drinks_self_serve == 1) ? "Self serve, so customers help themselves."
-				: "Employee serve, so the drinks are paid for before they are poured."), true);
+		{
+			worker@ srv = staff_on_duty(ROLE_SERVER);
+			string who = (@srv !is null) ? (srv.name + " is on the rota here, pouring the fountain drinks.")
+				: ((g_drinks_self_serve == 1) ? "Self serve, so customers help themselves."
+					: "Employee serve, and nobody is on the rota for it, so the drinks wait for you at the till.");
+			say("The soda fountain. " + (t.damaged ? "It has been knocked over and needs a repair. " : "") + who, true);
 			return;
+		}
 		case IK_FRIDGE_CASE:
 			say("The refrigerated display cases hum along the north wall. " + trouble_damaged_text(), true);
 			return;
@@ -3168,6 +3212,49 @@ int cashier_serve_interval_ms(worker@ w) {
 	return 2400 / stars;
 }
 
+/* A customer at the till with a cashier on duty: if their drink was not
+   already poured at the station, a drink server on shift pours it now; on
+   employee serve with no server on duty, a cashier will not leave the till to
+   work the fountain, so the customer goes without their cup. Returns what the
+   drink adds to the bill if it was not already counted in people_basket_total. */
+int cashier_handle_drink(customer@ c) {
+	if (@c is null or !c.wants_drink) return 0;
+	int kind = (c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN;
+	if (c.drink_poured) {
+		if (c.drink_cost > 0) people_drink_count_add(c);
+		return 0;    /* already inside people_basket_total(c) */
+	}
+	if (drink_station_damaged(kind)) {
+		c.wants_drink = false;
+		c.mood -= 2;
+		people_event(c, EV_BARE);
+		return 0;
+	}
+	worker@ srv = staff_on_duty(ROLE_SERVER);
+	if (@srv !is null) {
+		int price = staff_server_pour(srv, kind, c.name);
+		c.drink_poured = true;
+		c.drink_cost = price;
+		c.drink_poured_by = srv.name;
+		if (price > 0) people_drink_count_add(c);
+		return price;
+	}
+	if (g_drinks_self_serve == 1) {
+		int price = drink_price_cents(kind);
+		c.drink_poured = true;
+		c.drink_cost = price;
+		people_drink_count_add(c);
+		return price;
+	}
+	/* Employee serve, and no drink server on shift: the cashier stays on the
+	   register and cannot pour it. */
+	c.mood -= 2;
+	people_event(c, EV_DRINK_REFUSED);
+	people_karen_note(c, 1);
+	people_drunk_no_drink(c);
+	return 0;
+}
+
 /* A cashier works the till from the same spot you do. Better cashiers are
    faster and miscount change less often. */
 void cashier_serve_one(worker@ w) {
@@ -3186,7 +3273,9 @@ void cashier_serve_one(worker@ w) {
 			for (int i = int(g_queue.length()) - 1; i >= 0; i--) if (g_queue[i] is c) g_queue.remove_at(uint(i));
 			return;
 		}
-		int fuel_total = give * g_fuel_price;
+		int extra_drink = cashier_handle_drink(c);
+		int fuel_total = give * g_fuel_price + (c.drink_poured ? c.drink_cost : 0);
+		if (extra_drink > 0) fuel_total = give * g_fuel_price + extra_drink;
 		board_note_sale(false, true);
 		fuel_take(give);
 		money_earn(fuel_total);
@@ -3203,6 +3292,7 @@ void cashier_serve_one(worker@ w) {
 		diag("staff", w.name + " sold " + give + " litres to " + c.name + " for " + money(fuel_total));
 		return;
 	}
+	cashier_handle_drink(c);
 	int total = people_basket_total(c);
 	/* They ring it through. Crooked ones skip the ID scan, which the board will
 	   find in the till log. */

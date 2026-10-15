@@ -922,6 +922,55 @@ void fuel_pump_pos(int pump, float &out x, float &out y) {
 	}
 }
 
+/* The coffee station and the soda fountain along the west wall. drink_kind is
+   0 for coffee and 1 for the fountain; one place knows where each stands and
+   whether a drunk has knocked it over. */
+const int DRINK_COFFEE   = 0;
+const int DRINK_FOUNTAIN = 1;
+const int DRINK_COFFEE_CENTS   = 250;
+const int DRINK_FOUNTAIN_CENTS = 200;
+
+string drink_word(int kind) {
+	return (kind == DRINK_COFFEE) ? "coffee" : "fountain drink";
+}
+
+string drink_station_word(int kind) {
+	return (kind == DRINK_COFFEE) ? "the coffee station" : "the soda fountain";
+}
+
+int drink_price_cents(int kind) {
+	return (kind == DRINK_COFFEE) ? DRINK_COFFEE_CENTS : DRINK_FOUNTAIN_CENTS;
+}
+
+void drink_station_pos(int kind, float &out x, float &out y) {
+	int ik = (kind == DRINK_COFFEE) ? IK_COFFEE : IK_FOUNTAIN;
+	x = 1.5; y = (kind == DRINK_COFFEE) ? 8.5 : 12.5;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.kind != ik) continue;
+		x = t.x; y = t.y;
+		return;
+	}
+}
+
+/* Where a customer or a drink server stands to use the station: one tile east
+   of the west wall, in front of the machine. */
+void drink_spot_pos(int kind, float &out x, float &out y) {
+	float sx, sy;
+	drink_station_pos(kind, sx, sy);
+	x = sx + 1.0;
+	y = sy;
+}
+
+bool drink_station_damaged(int kind) {
+	int ik = (kind == DRINK_COFFEE) ? IK_COFFEE : IK_FOUNTAIN;
+	for (uint i = 0; i < g_things.length(); i++) {
+		thing@ t = g_things[i];
+		if (t.kind == ik) return t.damaged;
+	}
+	return false;
+}
+
 void rooms_init() {
 	g_rooms.resize(0);
 	g_things.resize(0);

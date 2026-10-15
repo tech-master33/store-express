@@ -233,8 +233,14 @@ Three roles, and each one is a job you are otherwise doing yourself.
   they are on duty. A **cashier** on the rota rings the queue through while you are
   somewhere else, quickly if they are good, and a crooked one skips identification
   scans that the board will later find in the till log. A **janitor** on shift mops
-  a patch a minute, worst mess first. A **drink server** can be hired, rostered and
-  paid, but pouring drinks unattended is not wired in yet, so serve those yourself.
+  a patch a minute, worst mess first. A **drink server** on the rota works the
+  coffee station and the soda fountain along the west wall, pouring cups as
+  customers come by (five stars rarely spill a drop; one star leaves wet patches by
+  the machine for the janitor, and a dishonest one pockets the occasional cup's
+  money). On **self serve** with no server on shift, customers pour their own,
+  spill more often, and the occasional thief walks straight out the door with a
+  cup; on **employee serve** with no server on shift, a cashier on the register
+  leaves the fountain alone and you pour them yourself at the till.
   If nobody is on the till, the queue is entirely yours.
 * **Satisfaction** moves with pay and rota, and staff make requests — a shift
   change, a raise — with a deadline attached. Grant or refuse them.

@@ -34,6 +34,7 @@ const int CUST_QUEUEING = 3;
 const int CUST_SERVING  = 4;    // at the counter, being served
 const int CUST_LEAVING  = 5;
 const int CUST_GONE     = 6;
+const int CUST_TO_DRINK = 7;    // walking to the coffee station or the fountain
 
 const int ARCH_REGULAR   = 0;
 const int ARCH_TRUCKER   = 1;
@@ -139,6 +140,9 @@ class customer {
 	array<int> basket_qty;
 	bool   wants_drink;        // a coffee or a fountain drink as well
 	int    drink_kind;         // 0 coffee, 1 fountain, -1 none
+	bool   drink_poured;       // the cup has already been poured at the station
+	int    drink_cost;         // cents owed at the till for a poured cup
+	string drink_poured_by;    // the drink server who poured it, or "" for self-serve
 	/* the visit */
 	int    patience;           // in ticks, not minutes
 	int    waited;
@@ -202,6 +206,7 @@ class customer {
 	customer(const string&in n, int a) {
 		name = n; arch = a; state = CUST_ARRIVING; room = ROOM_SHOP;
 		face_target = -1; wants_drink = false; drink_kind = -1;
+		drink_poured = false; drink_cost = 0; drink_poured_by = "";
 		patience = people_patience_base(a);
 		waited = 0; served = false; bought = false; spent = 0;
 		id_checked = false; id_refused = false; came_back_for_change = false;
@@ -613,12 +618,15 @@ int people_basket_total(customer@ c) {
 	int total = 0;
 	/* A driver's basket is the litres they named at the till, priced off the
 	   sign rather than off any shelf. */
-	if (c.fuel_litres > 0) return c.fuel_litres * g_fuel_price;
-	for (uint i = 0; i < c.basket.length(); i++) {
-		product@ p = product_at(c.basket[i]);
-		if (@p is null) continue;
-		total += p.price * c.basket_qty[i];
+	if (c.fuel_litres > 0) total = c.fuel_litres * g_fuel_price;
+	else {
+		for (uint i = 0; i < c.basket.length(); i++) {
+			product@ p = product_at(c.basket[i]);
+			if (@p is null) continue;
+			total += p.price * c.basket_qty[i];
+		}
 	}
+	if (c.drink_poured and c.drink_cost > 0) total += c.drink_cost;
 	return total;
 }
 
@@ -1058,6 +1066,7 @@ int people_bigspender_pay_queue(customer@ c) {
 		int total = people_basket_total(o);
 		for (uint b = 0; b < o.basket.length(); b++) shop_sell(o.basket[b], o.basket_qty[b]);
 		if (total > 0) money_earn(total);
+		if (o.drink_poured and o.drink_cost > 0) people_drink_count_add(o);
 		o.served = true;
 		o.bought = true;
 		o.spent = total;
@@ -1379,6 +1388,9 @@ void people_drunk_another(customer@ c, uint now) {
 	c.drink_count++;
 	c.wants_drink = true;
 	c.drink_kind = random(0, 1);
+	c.drink_poured = false;
+	c.drink_cost = 0;
+	c.drink_poured_by = "";
 	c.state = CUST_ARRIVING;
 	c.face_target = random(0, FACE_COUNT - 1);
 	c.next_step_at = now + 400;
@@ -1449,6 +1461,9 @@ customer@ people_spawn(int arch = -1) {
 	if (random(1, 100) <= 25) {
 		c.wants_drink = true;
 		c.drink_kind = random(0, 1);
+		if (c.fuel_litres > 0 and (g_drinks_self_serve == 1 or staff_any_on_duty(ROLE_SERVER))) {
+			c.state = CUST_TO_DRINK;
+		}
 	}
 	g_customers.insert_last(c);
 	sfx_ui(A("register.ogg"), -14.0, 700);
@@ -1504,6 +1519,85 @@ void people_customer_finish(customer@ c) {
 	}
 }
 
+/* ==========================================================================
+   8b.  THE COFFEE STATION AND THE SODA FOUNTAIN
+   --------------------------------------------------------------------------
+   A customer who wants a coffee or a fountain drink stops by the west wall on
+   their way to the till. What happens there depends on the policy and the
+   rota:
+     * With a drink server on shift, the server pours the cup at the machine
+       and sends the customer to the counter with it on their bill.
+     * On self serve with no server on duty, the customer pours their own:
+       faster, no wage bill, the odd spill on the tiles, and a thief with no
+       basket may just walk out the front door with the cup.
+     * On employee serve with no server on duty, the cup waits for whoever
+       serves them at the counter (the player at the register, or a cashier
+       who leaves the fountain alone).
+   ========================================================================== */
+
+void people_drink_at_station(customer@ c) {
+	if (@c is null or !c.wants_drink or c.drink_poured) return;
+	int kind = (c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN;
+	if (drink_station_damaged(kind)) {
+		c.wants_drink = false;
+		c.mood -= 2;
+		people_event(c, EV_BARE);
+		people_karen_note(c, 1);
+		people_character_say(c, c.name + " finds " + drink_station_word(kind) + " knocked over and gives up on the " + drink_word(kind) + ".");
+		return;
+	}
+	worker@ srv = staff_on_duty(ROLE_SERVER);
+	if (@srv !is null) {
+		int price = staff_server_pour(srv, kind, c.name);
+		c.drink_poured = true;
+		c.drink_cost = price;
+		c.drink_poured_by = srv.name;
+		c.mood += 1;
+		return;
+	}
+	if (g_drinks_self_serve != 1) return;
+	/* Self serve, nobody on the station: the customer pours their own cup. */
+	float sx, sy;
+	drink_station_pos(kind, sx, sy);
+	sfx_at(ROOM_SHOP, sx, sy, 0.0, A("pump.mp3"), -14.0, DRINK_POUR_CUT_MS);
+	c.drink_poured = true;
+	c.drink_cost = drink_price_cents(kind);
+	c.drink_poured_by = "";
+	int spill_chance = (c.arch == ARCH_DRUNK or c.drink_count > 0) ? 28
+		: ((c.arch == ARCH_TEENAGER) ? 14 : 8);
+	if (random(1, 100) <= spill_chance) {
+		float mx, my;
+		drink_spot_pos(kind, mx, my);
+		sfx_at(ROOM_SHOP, mx, my, 0.0, A("squish.mp3"), -12.0);
+		mess_add(ROOM_SHOP, mx, my, MESS_WET);
+		say(c.name + " spills some of a " + drink_word(kind) + " on the floor by " + drink_station_word(kind) + ".", true);
+		log_line("people", c.name + " spilled a self-serve " + drink_word(kind));
+	}
+	/* Self serve is easier to walk out without paying: a shoplifter with an
+	   empty basket, or the occasional opportunistic customer, heads straight
+	   for the door with the cup. */
+	if (c.fuel_litres == 0 and c.basket.length() == 0 and (c.shoplifter or random(1, 100) <= 12)) {
+		c.drink_cost = 0;
+		people_drink_count_add(c);
+		say(c.name + " pours a " + drink_word(kind) + " at " + drink_station_word(kind)
+			+ " and walks straight for the door without paying for it.", true);
+		log_line("people", c.name + " walked out with a self-serve " + drink_word(kind));
+		people_customer_leave(c, true);
+	}
+}
+
+/* Where a customer goes after the shelf: the drink station if they want a cup
+   and someone (the server or self-serve) can pour it there, otherwise straight
+   to the till. */
+void people_head_for_drink_or_till(customer@ c) {
+	if (@c is null) return;
+	if (c.wants_drink and !c.drink_poured and (g_drinks_self_serve == 1 or staff_any_on_duty(ROLE_SERVER))) {
+		c.state = CUST_TO_DRINK;
+		return;
+	}
+	c.state = CUST_TO_TILL;
+}
+
 /* The whole crowd moves. Called once per frame by mechanics.nvgt. */
 void people_tick(uint now) {
 	/* Bodies first: a phone call or a cough happens wherever the customer
@@ -1521,7 +1615,7 @@ void people_tick(uint now) {
 			people_shop_spot(c.face_target, sx, sy);
 			if (people_step_towards(c, sx, sy)) {
 				people_fill_basket(c, c.face_target);
-				c.state = CUST_TO_TILL;
+				people_head_for_drink_or_till(c);
 			}
 			/* A rustle at the shelf is what a shoplifter sounds like. It has its own
 			   short cue: a one-shot plays its file to the end, so borrowing the shop
@@ -1529,6 +1623,19 @@ void people_tick(uint now) {
 			if (c.shoplifter and !c.rustled and random(1, 100) <= 25) {
 				c.rustled = true;
 				sfx_at(c.room, c.x, c.y, 0.0, A("rustle.mp3"), -18.0);
+			}
+		} else if (c.state == CUST_TO_DRINK) {
+			c.next_step_at = now + uint(random(400, 800));
+			float dx, dy;
+			drink_spot_pos((c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN, dx, dy);
+			if (people_step_towards(c, dx, dy)) {
+				people_drink_at_station(c);
+				if (c.state == CUST_TO_DRINK) {
+					/* Re-check the wallet now that a poured drink is on the bill. */
+					c.wallet = people_wallet_for(c);
+					c.wallet_known = true;
+					c.state = CUST_TO_TILL;
+				}
 			}
 		} else if (c.state == CUST_TO_TILL) {
 			c.next_step_at = now + uint(random(400, 800));
@@ -1588,6 +1695,7 @@ string people_state_word(customer@ c) {
 	switch (c.state) {
 		case CUST_ARRIVING: return "on the way to " + people_face_word(c.face_target);
 		case CUST_SHOPPING: return "filling a basket at " + people_face_word(c.face_target);
+		case CUST_TO_DRINK: return "at " + drink_station_word((c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN);
 		case CUST_TO_TILL:  return "walking to the till";
 		case CUST_QUEUEING:
 		{
@@ -1616,6 +1724,10 @@ string people_note_word(customer@ c) {
 		s = plural(c.fuel_litres, "litre", "litres") + " of unleaded on pump " + fuel_pump_word(c.fuel_pump);
 		if (!c.bought and c.served) s += ", and leaving without it";
 	}
+	if (c.drink_poured) {
+		string dw = "with a " + drink_word(c.drink_kind);
+		s += (s.length() > 0) ? (", " + dw) : dw;
+	}
 	if (c.on_phone) s += (s.length() > 0) ? ", on the phone" : "on the phone";
 	if (c.drink_count > 0) s += (s.length() > 0) ? ", and well on their way" : "well on their way";
 	if (c.karen_level >= 3) s += (s.length() > 0) ? ", and making a scene" : "making a scene";
@@ -1630,7 +1742,7 @@ void people_scan_occupancy() {
 		customer@ c = g_customers[i];
 		if (c.state == CUST_GONE) continue;
 		total++;
-		if (c.state == CUST_ARRIVING or c.state == CUST_SHOPPING) shopping++;
+		if (c.state == CUST_ARRIVING or c.state == CUST_SHOPPING or c.state == CUST_TO_DRINK) shopping++;
 		if (c.state == CUST_LEAVING) leaving++;
 		if (c.state == CUST_QUEUEING or c.state == CUST_SERVING) queueing++;
 		if (c.on_phone) on_phone++;

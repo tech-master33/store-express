@@ -421,6 +421,19 @@ void staff_weekly_satisfaction(int wages_paid_last_week) {
 			}
 		}
 
+		/* A drink server who kept the coffee and the fountain moving without
+		   flooding the floor has had a good week; one who spilled half of what
+		   they poured has not. */
+		if (w.role == ROLE_SERVER and w.drinks_poured > 0) {
+			if (w.drinks_spilled * 4 > w.drinks_poured) {
+				w.satisfaction -= 3;
+				s += w.name + " has had a messy week at the drinks. ";
+			} else if (w.drinks_poured >= 10 and w.drinks_spilled == 0) {
+				w.satisfaction += 2;
+				s += w.name + " kept the coffee and the fountain running without a spill. ";
+			}
+		}
+
 		if (w.satisfaction > SAT_MAX) w.satisfaction = SAT_MAX;
 		if (w.satisfaction < SAT_MIN) w.satisfaction = SAT_MIN;
 
@@ -677,6 +690,56 @@ void staff_cashier_crooked_sale(worker@ w) {
 	w.ids_skipped++;
 }
 
+/* ==========================================================================
+   9b.  THE DRINK SERVER AT THE COFFEE AND THE FOUNTAIN
+   --------------------------------------------------------------------------
+   The coffee station and the soda fountain sit along the west wall. When a
+   drink server is on the rota, they pour every cup there as the customer asks
+   for it: a five star server rarely spills a drop, a one star slops it onto
+   the tiles beside the machine where the janitor (or you) will have to mop it
+   up, and a dishonest one pockets the occasional cup's money before it ever
+   reaches the till.
+   ========================================================================== */
+
+const int DRINK_POUR_CUT_MS = 2200;
+
+int staff_server_spill_chance(worker@ w) {
+	if (@w is null) return 15;
+	int chance = (6 - w.stars) * 4 - 2;    // 5 stars: 2%, 3 stars: 10%, 1 star: 18%
+	if (chance < 2) chance = 2;
+	return chance;
+}
+
+/* A drink server on shift pours a cup at the coffee station or the fountain.
+   Returns the cents to put on the customer's bill at the till (0 if a
+   dishonest server quietly took the money for it at the counter). */
+int staff_server_pour(worker@ w, int kind, const string&in customer_name) {
+	if (@w is null) return 0;
+	float sx, sy;
+	drink_station_pos(kind, sx, sy);
+	sfx_at(ROOM_SHOP, sx, sy, 0.0, A("pump.mp3"), -13.0, DRINK_POUR_CUT_MS);
+	w.drinks_poured++;
+	if (random(1, 100) <= staff_server_spill_chance(w)) {
+		w.drinks_spilled++;
+		float mx, my;
+		drink_spot_pos(kind, mx, my);
+		sfx_at(ROOM_SHOP, mx, my, 0.0, A("squish.mp3"), -12.0);
+		mess_add(ROOM_SHOP, mx, my, MESS_WET);
+		say(w.name + " spills some of a " + drink_word(kind) + " by " + drink_station_word(kind)
+			+ " while pouring for " + customer_name + ", and pours another.", true);
+		log_line("staff", w.name + " spilled a " + drink_word(kind) + " for " + customer_name);
+	} else {
+		diag("staff", w.name + " poured a " + drink_word(kind) + " for " + customer_name);
+	}
+	int price = drink_price_cents(kind);
+	if (w.dishonest and random(1, 100) <= 15) {
+		w.drawer_short += price;
+		diag("staff", w.name + " pocketed " + money(price) + " from a " + drink_word(kind));
+		return 0;
+	}
+	return price;
+}
+
 /* Satisfaction words for the staff page. */
 string staff_how_they_are_doing(worker@ w) {
 	string s = w.name + ", " + w.stars + " star " + staff_role_name(w.role)
@@ -692,7 +755,10 @@ string staff_how_they_are_doing(worker@ w) {
 		s += staff_cashier_quota_text(w);
 		if (w.drawer_short > 0) s += "The drawer has come up " + money(w.drawer_short) + " short on their shifts. ";
 	}
-	if (w.role == ROLE_SERVER) s += plural(w.drinks_poured, "drink", "drinks") + " poured, " + plural(w.drinks_spilled, "spilled", "spilled") + ". ";
+	if (w.role == ROLE_SERVER) {
+		s += plural(w.drinks_poured, "drink", "drinks") + " poured, " + plural(w.drinks_spilled, "spilled", "spilled") + ". ";
+		if (w.drawer_short > 0) s += money(w.drawer_short) + " of drink money has not made it to the till on their shifts. ";
+	}
 	if (w.role == ROLE_JANITOR) s += plural(w.messes_mopped, "mess", "messes") + " mopped. ";
 	if (w.request_open) s += "They have asked for something and are waiting to hear back. ";
 	return s;
