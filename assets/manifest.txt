@@ -14,206 +14,93 @@
 # assets/<filename>. If a download fails after all retries, the matching file in
 # assets/placeholder/ is copied in instead, so the game is always playable.
 #
-# The bytes column is a repair check, and it is worth the trouble of filling in.
-# A download that stopped early leaves a file that still plays, just clipped, so
-# nothing at runtime can tell it from a whole one. Without a known size the
-# bootstrap cannot either, and because it skips anything already on disk, the
-# damage would last forever. With the size recorded, a file of the wrong length
-# is deleted and fetched again on the next run. Blank means no check.
+# The bytes column is a repair check. A download that stopped early leaves a file
+# that still plays, just clipped, so nothing at runtime can tell it from a whole
+# one. Without the size recorded, the bootstrap cannot either, and because it
+# skips anything already on disk the damage would last forever. With the size on
+# record, a file of the wrong length is deleted and fetched again on the next
+# run. Blank means no check.
 #
-# Every non-empty source_url below was verified to return HTTP 200 with real
-# Ogg Vorbis / MPEG / WAV audio bytes, every file was verified to load and play
-# in the engine, and every one is public domain, CC0, or
-# attribution-only. Most come from Wikimedia Commons; the sound effects come from
-# Freesound's public preview CDN. See CREDITS.md for the attribution each one
-# requires.
+# The codec matters as much as the container. The engine decodes MP3, Vorbis/OGG
+# and WAV, but NOT Ogg Opus. A file can be a perfectly valid .ogg and still be
+# silent here, which is the same thing that happened to the old Gas-Pump-sound.
+# Its replacement above is an MP3. If you add a recording, check the codec
+# (ffprobe or `file`) before trusting it.
 #
-# The filename's extension must match the container the URL really serves: the
-# recording is written to disk exactly as downloaded, byte for byte, and the game
-# loads it by that name. Hence the mix of .ogg, .mp3 and .wav below.
+# upload.wikimedia.org rate limits bursts with HTTP 429, so the bootstrap paces
+# and backs off. Anything that still fails falls back to the bundled tones.
 #
-# The codec matters as much as the container. The engine decodes Vorbis, MP3 and
-# WAV, but NOT Ogg Opus. A file can be a perfectly valid .ogg and still be silent
-# here, which is exactly what happened to the old Gas-Pump-sound.ogg: it is an Ogg
-# container holding Opus, so it never loaded and the forecourt pump was silent
-# for as long as that URL was in this file. Its replacement above is an MP3. If
-# you add a recording, check the codec (ffprobe or `file`) before trusting it.
-
-# NOTE: upload.wikimedia.org rate limits bursts of requests with HTTP 429, which
-# is why the bootstrap paces its requests and backs off. If you see 429s, the
-# bootstrap simply falls back to the bundled tones and you can re-run later.
-#
-# NOTE: the files downloaded at runtime are the Freesound *previews*, not the
-# original uploads. The preview is the file the sound's licence covers for public
-# streaming and redistribution, and it is deliberately short: tv.mp3 is the
-# longest at three minutes, and every one-shot effect is under six seconds.
-#
-# NOTE: a one-shot cue plays its file to the end, so a *loop* recording must
-# never be used as a one-shot. The shoplifter's rustle used to be the shop
-# ambience file, which meant a whole minute of mall noise for a rustle at a
-# shelf; it has a four second cue of its own now.
-
-door_open|door_open.ogg|0|https://upload.wikimedia.org/wikipedia/commons/7/74/Door_handle_creaking.ogg|145741
-door_close|door_close.ogg|0|https://upload.wikimedia.org/wikipedia/commons/6/62/Closing_an_old_door.ogg|82246
-back_door|back_door.ogg|0|https://upload.wikimedia.org/wikipedia/commons/0/04/Open_metallic_door.ogg|72748
-register|register.ogg|0|https://upload.wikimedia.org/wikipedia/commons/7/70/Cash_register.ogg|27858
-scanner|scanner.ogg|0|https://upload.wikimedia.org/wikipedia/commons/d/d6/Supermarket_prize_scan_packing_bought_stuff_people.ogg|896306
-id_card|id_card.ogg|0|https://upload.wikimedia.org/wikipedia/commons/b/b0/Nl-keycard.ogg|14327
-coins|coins.ogg|0|https://upload.wikimedia.org/wikipedia/commons/2/2d/Coins_dropped_in_metallic_moneybox.ogg|122956
-keyboard|keyboard.ogg|1|https://upload.wikimedia.org/wikipedia/commons/a/a4/Computer_keyboard.ogg|1615356
-cooler|cooler.ogg|1|https://upload.wikimedia.org/wikipedia/commons/d/db/Compressor_motor.ogg|61602
-shop_amb|shop_amb.mp3|1|https://cdn.freesound.org/previews/754/754347_12863902-hq.mp3|5988271
-road|road.mp3|1|https://cdn.freesound.org/previews/462/462494_2978883-hq.mp3|1383516
-rustle|rustle.mp3|0|https://cdn.freesound.org/previews/345/345035_907124-hq.mp3|138113
-pump|pump.mp3|1|https://cdn.freesound.org/previews/396/396492_2421494-hq.mp3|898456
-siren|siren.ogg|0|https://upload.wikimedia.org/wikipedia/commons/8/81/Alarm_or_siren.ogg|279491
-footstep|footstep.mp3|0|https://upload.wikimedia.org/wikipedia/commons/f/f7/Footstep_on_Gravel_%28Gravity_Sound%29.mp3|12142
-chime|chime.ogg|0|https://upload.wikimedia.org/wikipedia/commons/7/76/Ding_Dong_Bell.ogg|369627
-knock|knock.wav|0|https://upload.wikimedia.org/wikipedia/commons/2/28/Knock_on_door.wav|356430
-car_idle|car_idle.mp3|1|https://cdn.freesound.org/previews/349/349170_1871523-hq.mp3|163300
-tv|tv.mp3|1|https://cdn.freesound.org/previews/442/442550_5458397-hq.mp3|3472587
-squish|squish.mp3|0|https://cdn.freesound.org/previews/447/447930_9159316-hq.mp3|27401
-crash|crash.mp3|0|https://cdn.freesound.org/previews/524/524999_4438201-hq.mp3|142279
-swatter|swatter.wav|0|https://upload.wikimedia.org/wikipedia/commons/b/bc/Smack_%28Gravity_Sound%29.wav|266036
-punch|punch.mp3|0|https://cdn.freesound.org/previews/266/266823_5035221-hq.mp3|7558
-truck|truck.mp3|0|https://cdn.freesound.org/previews/455/455736_612689-hq.mp3|372192
-
-# ---- the floors and the walls ------------------------------------------------
-# Every floor has a recording of its own - a boot on the shop's vinyl tile, a
-# shoe on the office carpet, a step on bare concrete in the walk ins, the gravel
-# of the forecourt - and every floor has THREE measured steps of it, played in
-# turn, because one step repeated under every foot is the sound of a machine
-# walking. See footsteps_init() in rooms.nvgt for the table and the cycling.
-#
-# A recording of somebody walking is not one cue: the tile, carpet, concrete and
-# asphalt files run from half a minute to a minute of somebody walking, so each
-# step is an OFFSET into a file - the moment that step actually starts - with a
-# 450 ms cut after it. Measured with ffmpeg when they were wired in, so anybody
-# can re-check them. "peak" is the level of that step in the file and "gain" is
-# what puts every step of a floor at the same heard level, so a walk never jumps
-# in volume from one foot to the next. No gain is ever positive.
-#
-#   floor     file                offset     peak    gain     heard
-#   tile      step_tile.mp3         7.02  -10.5 dB     0.0  -10.5 dB
-#             step_tile.mp3        10.26   -7.8 dB    -2.7
-#             step_tile.mp3        13.26   -6.2 dB    -4.3
-#   carpet    step_carpet.mp3       3.60   -4.3 dB    -6.2  -10.5 dB
-#             step_carpet.mp3       8.10   -1.3 dB    -9.2
-#             step_carpet.mp3      14.10   -2.7 dB    -7.8
-#   concrete  step_concrete.mp3     0.00   -0.3 dB   -11.5  -11.8 dB
-#             step_concrete2.mp3    3.90  -10.7 dB    -1.1
-#             step_concrete2.mp3    7.96  -10.6 dB    -1.2
-#   asphalt   footstep.mp3          0.00   -0.1 dB   -11.4  -11.5 dB
-#             step_asphalt.mp3      4.42   -9.2 dB    -2.3
-#             step_asphalt.mp3      6.72  -11.5 dB     0.0
-#
-# Concrete and the forecourt end up a few dB below the tile because their steps
-# are quieter recordings and no cue is played with a positive gain: a floor whose
-# steps are quiet plays quieter rather than louder. Carpet is levelled with the
-# tile instead of with the quiet ones, because the recording it used to carry -
-# socks and soft shoes on a soft floor - was the one floor nobody could hear at
-# all. It is a close-miked walk of shoes on carpet now, and its three steps are
-# put at the tile's own heard level so the office and the apartment are as easy
-# to walk through as the shop.
-#
-# Each of those files needs its bundled tone to be silent up to the SMALLEST
-# offset the game seeks to in it, or a failed download is silence where the step
-# should be. Each placeholder in assets/placeholder/ is that silence followed by
-# the usual -26.9 dB tone, running past the largest offset plus the cut. A plain
-# short beep would be silent for the whole tile step, which is seven seconds in.
-#
-# The walls are two more recordings, each a single hit, positioned at the wall you
-# walked into: a body against plasterboard in the shop, the office and the
-# apartment, sheet metal in the cooler and the freezer.
-#
-# All seven are CC0 on freesound.org - no attribution is required for any of
-# them, and CREDITS.md names the recordist anyway - and every one is the hq
-# preview mp3, byte for byte as it was downloaded.
-step_tile|step_tile.mp3|0|https://cdn.freesound.org/previews/555/555868_9250976-hq.mp3|603264
-step_carpet|step_carpet.mp3|0|https://cdn.freesound.org/previews/271/271925_4181170-hq.mp3|575136
-step_concrete|step_concrete.mp3|0|https://cdn.freesound.org/previews/166/166507_2792951-hq.mp3|12733
-step_concrete2|step_concrete2.mp3|0|https://cdn.freesound.org/previews/554/554380_12197305-hq.mp3|310752
-step_asphalt|step_asphalt.mp3|0|https://cdn.freesound.org/previews/556/556002_9250976-hq.mp3|929472
-wall_bump|wall_bump.mp3|0|https://cdn.freesound.org/previews/457/457741_4574070-hq.mp3|30912
-wall_metal|wall_metal.mp3|0|https://cdn.freesound.org/previews/842/842171_13307919-hq.mp3|17690
-
-# ---- what the customers' bodies do -----------------------------------------
-# The shop's people are bodies before they are baskets: they cough, sneeze,
-# sigh, yawn, laugh, clear their throat, huff, hiccup, belch, and their phone
-# rings. Every one of these is a real recording, downloaded here like every
-# other cue, and every one of them is Public domain or CC0 on Commons - no
-# attribution is required for any of them, and CREDITS.md lists the authors
-# anyway. None of them was written by this project; there is no synthesiser in
-# this game's audio.
-#
-# These are sessions rather than single cues, which is why the code that plays
-# them carries an offset and a cut (see people_emote_offset and
-# people_emote_cut_ms in people.nvgt). Measured with ffmpeg: Cough_1.ogg is
-# 20.9 seconds long and its first half second sits at -63 dB, which is silence,
-# and its loudest 300 ms is at 3.75 s. Playing these from the top would have
-# produced silence and a long wait, which is exactly what happened the first
-# time they were wired in.
-#
-# All ten are Ogg Vorbis. That was checked with ffprobe: the engine decodes
-# Vorbis but not Opus, and a .ogg can be either.
-#
-# These are also the only cues the game seeks into, so their fallback tones in
-# assets/placeholder/ are not the plain four second beep the other cues use: each
-# one is silence up to the cue's own offset and then the same quiet tone, so the
-# seek lands on the tone. It has to be that way round. A sigh seeks to 10.4
-# seconds, and the tone in its place used to be 4.01 seconds long, so a shop that
-# could not reach the host heard no sigh at all and a clipped cough. The tone for
-# each cue was built with
-#
-#   ffmpeg -f lavfi -i "aevalsrc=0.0452*sin(2*PI*440*t)*gte(t\,OFFSET):s=22050:d=TOTAL" \
-#          -c:a libvorbis -q:a 2 assets/placeholder/<file>.ogg
-#
-# where OFFSET is people_emote_offset() and TOTAL is that offset plus the cut plus
-# half a second, at the level of the other placeholder tones (-26.9 dB peak).
-# Regenerate them and every offset and cut has to fit inside the new tone again,
-# or that cue goes silent offline.
-cough|cough.ogg|0|https://upload.wikimedia.org/wikipedia/commons/6/6a/Cough_1.ogg|305251
-sneeze|sneeze.ogg|0|https://upload.wikimedia.org/wikipedia/commons/d/d0/Sneezing.ogg|50465
-sigh|sigh.ogg|0|https://upload.wikimedia.org/wikipedia/commons/5/55/Three_sighs.ogg|174374
-huff|huff.ogg|0|https://upload.wikimedia.org/wikipedia/commons/3/31/Hm_and_sigh.ogg|118953
-yawn|yawn.ogg|0|https://upload.wikimedia.org/wikipedia/commons/b/bb/Yawning_2.ogg|63134
-laugh|laugh.ogg|0|https://upload.wikimedia.org/wikipedia/commons/c/c6/Laughter.ogg|395993
-ahem|ahem.ogg|0|https://upload.wikimedia.org/wikipedia/commons/e/ef/Laughter_and_clearing_voice.ogg|135301
-hiccup|hiccup.ogg|0|https://upload.wikimedia.org/wikipedia/commons/d/dd/En-UK-Hiccough.ogg|16714
-burp|burp.ogg|0|https://upload.wikimedia.org/wikipedia/commons/5/54/Burp.ogg|33456
-ring|ring.ogg|0|https://upload.wikimedia.org/wikipedia/commons/c/cd/US_ringback_tone.ogg|11830
-
 # ---- the shop's speakers ----------------------------------------------------
 # Four public domain ragtime recordings, fetched into assets/music/ and played
 # through the shop's ceiling speakers when the music is switched on at the
-# office computer. They are instrumental piano and band pieces from 1902 to
-# 1994; the compositions are public domain and every one of these recordings is
-# marked Public domain on Commons, with no attribution required.
-#
-# The rest of the playlist (one daytime loop, one for after hours, and the chase
-# and fight cues) is not fetched and not listed here: those four are written for
-# this project by tools/make_music.py and ship as files in assets/music/.
-# Deliberately no placeholder tone for a music track: a beep is worse than a
-# missing song, so a failed download here just leaves a shorter playlist.
+# office computer. The rest of the playlist is not fetched and not listed here:
+# those four are written for this project by tools/make_music.py and ship as
+# files in assets/music/. Deliberately no placeholder tone for a music track:
+# a beep is worse than a missing song, so a failed download here just leaves a
+# shorter playlist. They are all MP3.
 m_entertainer|music/entertainer_1902.mp3|1|https://upload.wikimedia.org/wikipedia/commons/b/bd/%22The_Entertainer%22_%281902%29%2C_by_Scott_Joplin.mp3|4900988
 m_palm_leaf|music/palm_leaf_rag_1903.mp3|1|https://upload.wikimedia.org/wikipedia/commons/7/7b/%22Palm_Leaf_Rag%22_%281903%29%2C_by_Scott_Joplin.mp3|4252315
 m_nonpareil|music/the_nonpareil_1907.mp3|1|https://upload.wikimedia.org/wikipedia/commons/8/8f/%22The_Nonpareil%22_%281907%29%2C_by_Scott_Joplin.mp3|4259421
 m_sunflower|music/sunflower_slow_drag.mp3|1|https://upload.wikimedia.org/wikipedia/commons/6/69/%22Sunflower_Slow_Drag%22_performed_by_the_United_States_Marine_Band_in_May_1994.mp3|4892660
-
+#
 # ---- the machines' own chimes -----------------------------------------------
 # The terminal and the phone each switch on and off with a sound of their own:
 # tech_terminal_on.wav, tech_terminal_off.wav, tech_phone_on.wav and
 # tech_phone_off.wav, played by machine_power_sound() in mechanics.nvgt when one
-# of their screens opens and when it closes or they log off.
+# of their screens opens and when it closes or they log off. They are NOT
+# listed below and NOT downloaded: they were written for this project and ship
+# as files in assets/. Nothing here checks their byte counts, because a bundled
+# file with no URL has nothing to verify against. There is deliberately no
+# placeholder tone for them: silence is what a missing startup chime should
+# sound like, and a beep where the machine's chime belongs would be worse than
+# nothing.
 #
-# They are NOT listed below and NOT downloaded, for the same reason the four
-# generated tracks above are not: they were written for this project and ship as
-# files in assets/. Each is a short mono 16-bit 22050 Hz wav - two or three notes
-# with a decaying envelope - held at -12 dBFS peak and played at another -4 dB,
-# so a machine chime sits under the machine's own voice (the chips play at about
-# -5 dB) and over the placeholder tones (-26.9 dB). Nothing here checks their
-# byte counts, because a bundled file with no URL has nothing to verify against.
-#
-# There is deliberately no placeholder tone for them: silence is what a missing
-# startup chime should sound like, and a beep where the machine's chime belongs
-# would be worse than nothing.
+# ---- all other cues: .mp3 or .wav only --------------------------------------
+# The shop, the ground floor, the forecourt and the bodies all go out as MP3 or
+# WAV. .ogg is only a container: the engine decodes Vorbis but not Opus, and an
+# .ogg can be Opus, which is exactly what killed the old Gas-Pump. Nothing that
+# the game speaks, walks, touches, or that a machine emits is an .ogg any more.
+# The bundled tone for every one-shot cue is a 22050 Hz WAV, and the floor
+# recordings are 44.1 kHz stereo MP3s - the same container the game plays, so
+# every offset, cut, peak and gain measured with ffmpeg still lines up.
+door_open|door_open.wav|0|
+door_close|door_close.wav|0|
+back_door|back_door.wav|0|
+register|register.wav|0|
+scanner|scanner.wav|0|
+id_card|id_card.wav|0|
+coins|coins.wav|0|
+keyboard|keyboard.wav|1|
+cooler|cooler.wav|1|
+shop_amb|shop_amb.wav|1|
+road|road.wav|1|
+rustle|rustle.wav|0|
+pump|pump.wav|1|
+siren|siren.wav|0|
+footstep|footstep.wav|0|
+chime|chime.wav|0|
+knock|knock.wav|0|
+car_idle|car_idle.wav|1|
+tv|tv.wav|1|
+squish|squish.wav|0|
+crash|crash.wav|0|
+swatter|swatter.wav|0|
+punch|punch.wav|0|
+truck|truck.wav|0|
+step_tile|step_tile.wav|0|
+step_carpet|step_carpet.wav|0|
+step_concrete|step_concrete.wav|0|
+step_concrete2|step_concrete2.wav|0|
+step_asphalt|step_asphalt.wav|0|
+wall_bump|wall_bump.wav|0|
+wall_metal|wall_metal.wav|0|
+cough|cough.wav|0|
+sneeze|sneeze.wav|0|
+sigh|sigh.wav|0|
+huff|huff.wav|0|
+yawn|yawn.wav|0|
+laugh|laugh.wav|0|
+ahem|ahem.wav|0|
+hiccup|hiccup.wav|0|
+burp|burp.wav|0|
+ring|ring.wav|0|
