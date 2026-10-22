@@ -111,7 +111,7 @@ enum interact_kind {
 	IK_COFFEE,          /* the coffee station */
 	IK_FOUNTAIN,        /* the soda fountain */
 	IK_FRIDGE_CASE,     /* a refrigerated display case */
-	IK_FROZEN_CASE,     /* a frozen food case */
+	IK_FROZEN_CASE,     /* a frozen food cases */
 	IK_COOLER_DOOR,
 	IK_FREEZER_DOOR,
 	IK_COOLER_RACK,
@@ -125,7 +125,8 @@ enum interact_kind {
 	IK_PUMP,
 	IK_AIRPUMP,
 	IK_SPEAKERS,        /* the ceiling speaker system */
-	IK_ROAD
+	IK_ROAD,
+	IK_PUBLIC_PHONE     /* a payphone on the forecourt */
 };
 
 string interact_label(int kind) {
@@ -152,6 +153,7 @@ string interact_label(int kind) {
 		case IK_AIRPUMP:        return "the air and water pump";
 		case IK_SPEAKERS:       return "the ceiling speakers";
 		case IK_ROAD:           return "the road";
+		case IK_PUBLIC_PHONE:   return "the public payphone";
 	}
 	return "nothing";
 }
@@ -1041,6 +1043,7 @@ void rooms_init() {
 	g_things.insert_last(thing(ROOM_FORECOURT, 12.5,  6.5, IK_PUMP,  "fuel pump three", true, 2));
 	g_things.insert_last(thing(ROOM_FORECOURT, 12.5, 10.5, IK_PUMP,  "fuel pump four",  true, 3));
 	g_things.insert_last(thing(ROOM_FORECOURT,  1.5,  1.5, IK_AIRPUMP, "the air and water pump", true));
+	g_things.insert_last(thing(ROOM_FORECOURT,  6.5,  1.5, IK_PUBLIC_PHONE, "the public payphone", true));
 	g_things.insert_last(thing(ROOM_FORECOURT,  8.5,  1.5, IK_ROAD,    "the road", false));
 
 	/* ---- doorways --------------------------------------------------------

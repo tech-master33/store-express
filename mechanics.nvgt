@@ -2738,6 +2738,9 @@ void mechanics_interact() {
 		case IK_SAFE:     say("The office safe. It holds the takings you have banked, " + money(g_bank) + ".", true); return;
 		case IK_TV:       say("The television is " + (g_tv_on ? "on" : "off") + ".", true); return;
 		case IK_KITCHEN_FRIDGE: say("The kitchen fridge hums.", true); return;
+		case IK_PUBLIC_PHONE:
+			say("The public payphone. A battered coin box sits beneath the handset. It crackles with line static, and there is nobody on the other end just now.", true);
+			return;
 		case IK_SPEAKERS:
 			say("The ceiling speakers. The music is " + (g_music_on ? "on" : "off")
 				+ ", playing " + music_now_text() + ", at " + g_music_volume
