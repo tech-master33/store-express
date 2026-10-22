@@ -48,6 +48,26 @@ const int ARCH_DRUNK     = 8;
 const int ARCH_INSPECTOR = 9;
 const int ARCH_COUNT     = 10;
 
+/* What a visit leaves behind, in the order it happened. Written down by
+   whoever caused it and read back when the review is written; the same list is
+   what the town remembers a person by (see people_worth_remembering). */
+const int EV_SERVED       = 1;    // served, and quickly enough
+const int EV_ID_ASKED     = 2;    // carded, without a fuss
+const int EV_PAID_FOR     = 3;    // a stranger in the queue paid for it
+const int EV_CLEARED      = 4;    // they cleared a shelf themselves
+const int EV_PRICE        = 5;    // the price of the place
+const int EV_BARE         = 6;    // the shelf was empty
+const int EV_MESS         = 7;    // something on the floor
+const int EV_QUEUE_GAVE_UP= 8;    // stood in the queue and left
+const int EV_ID_REFUSED   = 9;    // not sold what they came for
+const int EV_SHORT_CHANGE = 10;   // had to come back for their own change
+const int EV_COULD_NOT_PAY= 11;   // the money in their hand did not cover it
+const int EV_BUMPED       = 12;   // walked into in an aisle
+const int EV_KAREN        = 13;   // made a fuss about it
+const int EV_DRUNK_FALL   = 14;   // went over in the aisle
+const int EV_DRINK_REFUSED= 15;   // refused the drink they asked for
+const int EV_CHATTED      = 16;   // somebody behind the counter talked to them
+
 string people_arch_name(int a) {
 	switch (a) {
 		case ARCH_REGULAR:    return "a regular";
@@ -125,12 +145,178 @@ int people_patience_base(int a) {
 }
 
 /* ==========================================================================
+   1b.  THE FLAVOURS
+   --------------------------------------------------------------------------
+   A kind is what the shop has always known how to treat: a regular, a trucker,
+   a teenager. A flavour is which of them it is today. The alpha this game is
+   built on carries two hundred and fourteen of them, and every one brings its
+   own patience, its own feeling about a price and its own pocket. The shop here
+   knows a little over thirty, which is as many as a shop this size meets in a
+   fortnight, and every one of them is a name the shop says out loud.
+
+   The table is one record per flavour, fields separated by "|", records by
+   ";", so that it reads as a table in the file rather than as thirty calls to
+   a constructor:
+
+     name | kind | patience % | price % | lines min | lines max |
+     cash min | cash max | card min | card max | no card % | declines % |
+     what they do while they browse
+
+   Patience and price are per cent of the ordinary customer: a big spender is
+   0, which means a price over the fair one never enters their head, and the
+   price arguer is 220, which means it is all they think about. The money is
+   whole cents, and the card figures are what the card will stand, not what is
+   in the account.
+   ========================================================================== */
+
+class people_flavour {
+	string name;
+	int    kind;
+	int    patience;      // per cent of the kind's patience
+	int    price;         // per cent: how hard a price over fair puts them off
+	int    lines_min;
+	int    lines_max;
+	int    cash_min;      // cents in the pocket
+	int    cash_max;
+	int    card_min;      // cents the card will stand
+	int    card_max;
+	int    no_card;       // per cent who have no card at all
+	int    declines;      // per cent whose card is dead
+	string remark;
+	people_flavour() {
+		name = "a customer"; kind = ARCH_REGULAR;
+		patience = 100; price = 100; lines_min = 2; lines_max = 5;
+		cash_min = 800; cash_max = 9000; card_min = 4000; card_max = 40000;
+		no_card = 10; declines = 2; remark = "";
+	}
+}
+
+array<people_flavour@> g_flavours;
+
+/* The table. A flavour belongs to one kind, because the kind is what decides
+   how the shop treats them: who shoplifts, who complains, who the law takes an
+   interest in. */
+string people_flavour_table() {
+	return "a regular|" + ARCH_REGULAR + "|100|100|2|5|800|9000|4000|40000|10|2|"
+		+ "takes their time, the way somebody who knows the shop does."
+	+ ";a crossword pensioner|" + ARCH_REGULAR + "|130|160|2|5|500|4000|2000|12000|20|2|"
+		+ "reads every label twice and says the answers to the crossword out loud."
+	+ ";a widow|" + ARCH_REGULAR + "|130|150|2|4|600|6000|3000|15000|15|2|"
+		+ "buys the same four things every time, and counts the change twice."
+	+ ";a town gossip|" + ARCH_REGULAR + "|110|110|3|6|900|9000|4000|30000|10|2|"
+		+ "knows whose car is outside and says so to anybody who will listen."
+	+ ";a night nurse|" + ARCH_REGULAR + "|90|75|1|3|500|3000|3000|20000|8|2|"
+		+ "comes in for a coffee and something to eat standing up."
+	+ ";a price arguer|" + ARCH_REGULAR + "|80|220|2|5|900|6000|4000|20000|12|2|"
+		+ "reads the shelf edge first and the packet second."
+	+ ";a pushy couponer|" + ARCH_REGULAR + "|90|200|3|6|700|5000|3000|15000|15|2|"
+		+ "has the coupons out before the basket is full."
+	+ ";a receipt checker|" + ARCH_REGULAR + "|100|180|2|4|800|6000|4000|20000|10|2|"
+		+ "keeps every receipt and reads this one on the way out."
+	+ ";a college freshman|" + ARCH_REGULAR + "|100|160|1|4|300|3000|800|8000|35|4|"
+		+ "is buying the cheapest of everything and knows the price of all of it."
+	+ ";a food bank sorter|" + ARCH_REGULAR + "|110|150|3|7|900|7000|4000|20000|12|2|"
+		+ "counts what is in the basket against a list."
+	+ ";a scratch card lady|" + ARCH_REGULAR + "|120|140|2|4|400|4000|2000|10000|25|3|"
+		+ "spends longer at the scratch cards than at the shelves."
+	+ ";a lottery regular|" + ARCH_REGULAR + "|110|135|2|4|500|5000|3000|15000|18|3|"
+		+ "has the numbers written on the back of their hand."
+	+ ";a long haul trucker|" + ARCH_TRUCKER + "|80|70|4|8|1500|9000|6000|40000|6|2|"
+		+ "walks like somebody who has been sitting down for eleven hours."
+	+ ";a parcel courier|" + ARCH_TRUCKER + "|80|100|2|5|900|5000|4000|20000|10|2|"
+		+ "is watching the clock on the wall and the clock in the van both."
+	+ ";a tanker driver|" + ARCH_TRUCKER + "|80|70|3|6|1200|8000|6000|40000|6|2|"
+		+ "smells faintly of diesel and buys the biggest coffee there is."
+	+ ";an owner operator|" + ARCH_TRUCKER + "|80|70|4|9|2000|12000|8000|40000|5|2|"
+		+ "owns the truck outside and would like you to know it."
+	+ ";a bus driver|" + ARCH_TRUCKER + "|80|100|2|4|800|5000|4000|20000|10|2|"
+		+ "has thirty seconds and an opinion about the coffee."
+	+ ";a rideshare driver|" + ARCH_TRUCKER + "|80|110|1|3|700|4000|4000|25000|12|2|"
+		+ "charges the phone on the counter while they shop."
+	+ ";a teenager|" + ARCH_TEENAGER + "|100|100|1|3|300|3000|800|8000|45|4|"
+		+ "picks things up, puts them down, and looks at the door."
+	+ ";a kid with a dollar|" + ARCH_TEENAGER + "|100|240|1|2|100|200|200|2000|100|0|"
+		+ "counts their money at the shelf before they take anything."
+	+ ";a skater teen|" + ARCH_TEENAGER + "|100|130|1|3|200|2500|800|8000|50|4|"
+		+ "comes in for the drink and leaves with the drink."
+	+ ";a band kid|" + ARCH_TEENAGER + "|100|130|1|3|250|2500|800|8000|50|4|"
+		+ "is carrying a case that is bigger than the basket."
+	+ ";a shy kid|" + ARCH_TEENAGER + "|100|150|1|2|200|2000|800|8000|60|4|"
+		+ "waits to be spoken to before saying what they want."
+	+ ";a police officer|" + ARCH_POLICE + "|100|80|1|3|800|5000|4000|20000|8|2|"
+		+ "is off duty and does not want to talk about work."
+	+ ";a state trooper|" + ARCH_POLICE + "|100|80|1|3|800|5000|4000|20000|8|2|"
+		+ "stands where they can see the door."
+	+ ";a farmer|" + ARCH_FARMER + "|100|100|3|8|1000|8000|4000|20000|12|2|"
+		+ "is in boots that have been everywhere and shops like they are filling a pantry."
+	+ ";a farm matriarch|" + ARCH_FARMER + "|140|140|3|7|900|7000|4000|20000|12|2|"
+		+ "knows what everything costs and what it cost ten years ago."
+	+ ";a night shift worker|" + ARCH_NIGHTSHIFT + "|100|100|2|4|800|6000|4000|20000|12|2|"
+		+ "is buying breakfast at the wrong end of the day."
+	+ ";a hospital porter|" + ARCH_NIGHTSHIFT + "|110|110|2|4|700|5000|4000|20000|12|2|"
+		+ "smells of antiseptic and is very polite about it."
+	+ ";a big spender|" + ARCH_BIGSPENDER + "|100|0|6|14|15000|60000|40000|200000|2|1|"
+		+ "does not look at the prices, and does not look at the shelves either."
+	+ ";a contractor|" + ARCH_BIGSPENDER + "|100|10|5|12|10000|50000|40000|200000|3|1|"
+		+ "is buying for the whole site and says so loudly."
+	+ ";a complainer|" + ARCH_KAREN + "|80|170|2|6|900|7000|4000|30000|10|2|"
+		+ "is looking for a reason before they have found a shelf."
+	+ ";a calm complainer|" + ARCH_KAREN + "|80|90|2|5|900|7000|4000|30000|10|2|"
+		+ "is very reasonable about it, which is worse."
+	+ ";somebody well on their way|" + ARCH_DRUNK + "|100|55|1|3|200|2500|800|8000|50|5|"
+		+ "is having a good evening and tells you so."
+	+ ";a day drinker|" + ARCH_DRUNK + "|100|55|1|3|200|2500|800|8000|50|5|"
+		+ "is in for the same thing they are in for every afternoon."
+	+ ";an inspector|" + ARCH_INSPECTOR + "|100|100|1|2|800|5000|4000|20000|5|1|"
+		+ "is writing down what the shelves look like."
+	;
+}
+
+/* Read the table once, and never again: the indices in it are what a regular's
+   memory keeps, so the order of the records is part of the save file. */
+void people_flavour_init() {
+	g_flavours.resize(0);
+	string[]@ records = people_flavour_table().split(";");
+	for (uint i = 0; i < records.length(); i++) {
+		if (records[i].length() < 8) continue;
+		string[]@ f = records[i].split("|");
+		if (f.length() < 13) {
+			log_line("people", "flavour table record " + i + " is short, and has been skipped");
+			continue;
+		}
+		people_flavour@ fl = people_flavour();
+		fl.name = f[0];
+		fl.kind = parse_int(f[1]);
+		fl.patience = parse_int(f[2]);
+		fl.price = parse_int(f[3]);
+		fl.lines_min = parse_int(f[4]);
+		fl.lines_max = parse_int(f[5]);
+		fl.cash_min = parse_int(f[6]);
+		fl.cash_max = parse_int(f[7]);
+		fl.card_min = parse_int(f[8]);
+		fl.card_max = parse_int(f[9]);
+		fl.no_card = parse_int(f[10]);
+		fl.declines = parse_int(f[11]);
+		fl.remark = f[12];
+		if (fl.lines_max < fl.lines_min) fl.lines_max = fl.lines_min;
+		if (fl.cash_max < fl.cash_min) fl.cash_max = fl.cash_min;
+		if (fl.card_max < fl.card_min) fl.card_max = fl.card_min;
+		g_flavours.insert_last(fl);
+	}
+	log_line("people", g_flavours.length() + " flavours of customer in the town");
+}
+
+/* The flavour of a customer, or the whole of what the shop calls them, is
+   below the customer class itself: it has to know what a customer is. */
+
+/* ==========================================================================
    2.  THE PEOPLE IN THE SHOP
    ========================================================================= */
 
 class customer {
 	string name;
 	int    arch;
+	int    flavour;            // which flavour of that kind they are; see 1b
 	int    state;
 	int    room;
 	float  x, y;
@@ -158,6 +344,12 @@ class customer {
 	bool   wallet_known;       // their wallet has been counted (see sale_open)
 	bool   could_not_pay;      // the money in their hand did not cover it
 	int    short_paid;         // cents the shop let them off, if it did
+	/* The card is a second wallet, and not everybody has one: a customer with
+	   no card has to fit the basket to the cash before they reach the till,
+	   which is what people_fit_basket_to_pocket is for. */
+	bool   has_card;
+	int    card_limit;         // cents the card will stand
+	bool   card_bad;           // the card is going to be declined when it is run
 	/* What a regular remembers about last time, and says so at the counter. */
 	int    memory;             // -3 to +3
 	bool   waved_receipt;
@@ -179,6 +371,8 @@ class customer {
 	int    fuel_litres;         // litres they asked for, 0 = not a fuel visit
 	int    fuel_pump;           // the pump they are filling at, 1 to 4
 	uint   next_step_at;
+	int    step_ms;             // how long one step of theirs takes
+	bool   remarked;            // they have already said what they think of the shelves
 	int    voice;        // their slot in the voice pool, so they sound like somebody
 	/* --- the body layer -------------------------------------------------
 	   A customer is a body before they are a basket. These are the things a
@@ -205,17 +399,21 @@ class customer {
 	int    karen_level;        // 0 quiet, 3 demanding to speak to somebody
 	customer(const string&in n, int a) {
 		name = n; arch = a; state = CUST_ARRIVING; room = ROOM_SHOP;
+		flavour = -1;
 		face_target = -1; wants_drink = false; drink_kind = -1;
 		drink_poured = false; drink_cost = 0; drink_poured_by = "";
 		patience = people_patience_base(a);
 		waited = 0; served = false; bought = false; spent = 0;
 		id_checked = false; id_refused = false; came_back_for_change = false;
 		wallet = 0; wallet_known = false; could_not_pay = false; short_paid = 0;
+		has_card = false; card_limit = 0; card_bad = false;
 		memory = 0; waved_receipt = false;
 		mood = 0; price_complaints = 0; bare_shelf_hits = 0; stepped_in_mess = false;
 		shoplifter = false; rustled = false; swatted = false; swats = 0; ran = false;
 		fuel_litres = 0; fuel_pump = 1;
 		next_step_at = 0;
+		step_ms = 500;
+		remarked = false;
 		voice = -1;     // replaced by voice_pool_assign() as they come in the door
 		next_emote_at = 0;
 		next_bump_at = 0;
@@ -237,38 +435,124 @@ array<customer@> g_customers;
    from g_customers as they leave and every index after them would shift. */
 array<customer@> g_queue;
 
+/* The flavour of a customer, or null if they have none (somebody the shop put
+   here itself, or a customer from before the table was read). */
+people_flavour@ people_flavour_of(customer@ c) {
+	if (@c is null or c.flavour < 0) return null;
+	if (uint(c.flavour) >= g_flavours.length()) return null;
+	return g_flavours[uint(c.flavour)];
+}
+
+/* What the shop calls this one. The flavour name is the whole of it: "a
+   crossword pensioner" says more than "a regular", and it is what the reports
+   and the reviews say too. */
+string people_kind_word(customer@ c) {
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl !is null) return fl.name;
+	if (@c is null) return "a customer";
+	return people_arch_name(c.arch);
+}
+
+/* One of the flavours of a kind, drawn evenly. The alpha weights its two
+   hundred and fourteen of them; a shop that knows thirty does not need a
+   spreadsheet to choose between them. */
+int people_pick_flavour(int arch) {
+	int choices = 0;
+	for (uint i = 0; i < g_flavours.length(); i++) {
+		if (g_flavours[i].kind == arch) choices++;
+	}
+	if (choices == 0) return -1;
+	int r = random(1, choices);
+	for (uint i = 0; i < g_flavours.length(); i++) {
+		if (g_flavours[i].kind != arch) continue;
+		r--;
+		if (r <= 0) return int(i);
+	}
+	return -1;
+}
+
+/* How much of a queue this one will stand in. The kind sets the base and the
+   flavour scales it; the alpha puts a floor of six tenths under the scale, so
+   nobody is so impatient that one person ahead of them is enough, and half a
+   minute under the wait itself, so a queue that is moving is never abandoned
+   because the arithmetic said so. Patience is counted in ticks of half a
+   second: see people_tick. */
+int people_patience_for(customer@ c) {
+	if (@c is null) return 120;
+	int base = people_patience_base(c.arch);
+	int scale = 100;
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl !is null) scale = fl.patience;
+	double pct = double(scale) / 100.0;
+	if (pct < 0.6) pct = 0.6;
+	int p = int(double(base) * pct + 0.5);
+	if (p < 60) p = 60;
+	return p;
+}
+
 /* ==========================================================================
    2b.  WALLETS, RECEIPTS AND WHAT A REGULAR REMEMBERS
    ========================================================================= */
 
-/* Everybody walks in with a wallet, and some wallets are thinner than the
-   basket. Teenagers and drunks are the worst for it, truckers and big spenders
-   the least, and a regular who knows what things cost usually brings enough. */
+/* Everybody walks in with a wallet and a card, and both are part of who they
+   are rather than a reaction to the basket they end up carrying. The flavour
+   says what is in a pocket like theirs and what the card will stand. The draw
+   is made once, the first time the wallet is counted, and then kept: a wallet
+   that changes while its owner is standing at the shelf is not a wallet. */
 int people_wallet_for(customer@ c) {
-	int total = people_basket_total(c);
-	if (total <= 0) return random(200, 2000);
-	int thin_chance = 20;
-	switch (c.arch) {
-		case ARCH_TEENAGER:   thin_chance = 45; break;
-		case ARCH_DRUNK:      thin_chance = 35; break;
-		case ARCH_NIGHTSHIFT: thin_chance = 30; break;
-		case ARCH_TRUCKER:    thin_chance = 10; break;
-		case ARCH_BIGSPENDER: thin_chance = 5;  break;
-		case ARCH_FARMER:     thin_chance = 15; break;
+	if (@c is null) return random(800, 9000);
+	if (c.wallet_known) return c.wallet;
+	people_flavour@ fl = people_flavour_of(c);
+	int cash = random(800, 9000);
+	int card = random(4000, 40000);
+	int no_card = 10;
+	int declines = 2;
+	if (@fl !is null) {
+		cash = random(fl.cash_min, fl.cash_max);
+		card = random(fl.card_min, fl.card_max);
+		no_card = fl.no_card;
+		declines = fl.declines;
 	}
-	if (random(1, 100) <= thin_chance) return (total * random(45, 95)) / 100;
-	/* Enough, and then some: a note in the wallet rather than exact change. */
-	return total + random(1, 40) * 100;
+	c.has_card = (random(1, 100) > no_card);
+	c.card_limit = c.has_card ? card : 0;
+	c.card_bad = (c.has_card and random(1, 100) <= declines);
+	c.wallet = cash;
+	c.wallet_known = true;
+	return c.wallet;
+}
+
+/* Whether the card is going to be declined when it is run, as a per cent. The
+   till rolls against this rather than against a number of its own: a card is
+   the customer's, and so is its luck. */
+int people_card_decline_chance(customer@ c) {
+	if (@c is null) return 6;
+	if (!c.has_card) return 100;
+	if (c.card_bad) return 100;
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl is null) return 4;
+	return fl.declines;
 }
 
 /* What they remember about their last visit here, if they are a regular at all.
    A shop this small has the same faces in it every week, and they hold a
-   grudge exactly as long as they hold a good word. */
+   grudge exactly as long as they hold a good word.
+
+   The town the shop draws on is three hundred people, and this is the shop's
+   memory of them: not just the score, but who they were, so that the man who
+   came in on Tuesday comes back on Friday as the same man and not as a
+   stranger with his name. */
 class regular_memory {
 	string name;
 	int    score;      // -3 through +3
 	int    day;
-	regular_memory(const string&in n, int s, int d) { name = n; score = s; day = d; }
+	int    visits;     // how many times they have been in
+	int    kind;       // which kind they are, so the shop knows how to treat them
+	int    flavour;    // which flavour of it, so they come back as themselves
+	bool   remembered; // something about them worth remembering, see below
+	regular_memory(const string&in n, int s, int d) {
+		name = n; score = s; day = d;
+		visits = 1; kind = ARCH_REGULAR; flavour = -1; remembered = false;
+	}
 }
 
 array<regular_memory@> g_regulars;
@@ -280,11 +564,52 @@ int people_regular_lookup(const string&in name) {
 	return 0;
 }
 
+int people_regular_index(const string&in name) {
+	for (uint i = 0; i < g_regulars.length(); i++) {
+		if (g_regulars[i].name == name) return int(i);
+	}
+	return -1;
+}
+
+/* A fortnight is long enough for a shop to forget a face it has only seen once
+   or twice, unless there is something about them worth keeping. The alpha's
+   rules: fourteen days, fewer than three visits, and nothing worth
+   remembering. The roster has a ceiling as well, because a list of a thousand
+   people is not a town's memory, it is a spreadsheet. */
+const int TOWN_SIZE = 300;                 // the town the shop draws on
+const int TOWN_NEWCOMER_FLOOR = 15;        // per cent of arrivals, at least
+const int TOWN_LOYALTY_POWER = 2;          // visits squared, the way the alpha has it
+const int TOWN_FORGET_DAYS = 14;
+const int TOWN_FORGET_BELOW_VISITS = 3;
+const int TOWN_ROSTER_MOST = 150;
+
 void people_regular_forget(int day) {
 	for (int i = int(g_regulars.length()) - 1; i >= 0; i--) {
-		if (day - g_regulars[i].day > 28) g_regulars.remove_at(uint(i));
+		bool old = (day - g_regulars[i].day) > TOWN_FORGET_DAYS;
+		bool thin = g_regulars[i].visits < TOWN_FORGET_BELOW_VISITS;
+		if (old and thin and !g_regulars[i].remembered) {
+			g_regulars.remove_at(uint(i));
+		}
 	}
-	while (g_regulars.length() > 40) g_regulars.remove_at(0);
+	while (g_regulars.length() > TOWN_ROSTER_MOST) g_regulars.remove_at(0);
+}
+
+/* What the town talks about. The alpha keeps twelve reasons to remember
+   somebody, and they are all of them things the shop did to them rather than
+   things it sold them: change that was short, change that was given back, a
+   card refused, a stranger paying for the line, being talked to like a
+   person. Nothing here is worth a fortnight of memory. */
+bool people_worth_remembering(customer@ c) {
+	if (@c is null) return false;
+	if (c.short_paid > 0) return true;
+	if (c.could_not_pay) return true;
+	if (c.id_refused) return true;
+	for (uint i = 0; i < c.events.length(); i++) {
+		int e = c.events[i];
+		if (e == EV_PAID_FOR or e == EV_CHATTED or e == EV_SHORT_CHANGE
+			or e == EV_COULD_NOT_PAY or e == EV_ID_REFUSED) return true;
+	}
+	return false;
 }
 
 /* How the visit went, as a single number a customer carries to their next one. */
@@ -301,18 +626,28 @@ int people_visit_score(customer@ c) {
 	return 0;
 }
 
-/* Written down when they leave, and read out at the till when they come back. */
+/* Written down when they leave, and read out at the till when they come back.
+   The visit count is what makes a face a regular: it is the weight the town
+   draws them with, and the thing that keeps them out of the forgetting. */
 void people_regular_remember(customer@ c) {
 	if (@c is null) return;
 	int score = people_visit_score(c);
-	for (uint i = 0; i < g_regulars.length(); i++) {
-		if (g_regulars[i].name == c.name) {
-			g_regulars[i].score = score;
-			g_regulars[i].day = int(g_current_day);
-			return;
-		}
+	int idx = people_regular_index(c.name);
+	if (idx >= 0) {
+		regular_memory@ r = g_regulars[uint(idx)];
+		r.score = score;
+		r.day = int(g_current_day);
+		r.visits++;
+		r.kind = c.arch;
+		r.flavour = c.flavour;
+		r.remembered = people_worth_remembering(c);
+		return;
 	}
-	g_regulars.insert_last(regular_memory(c.name, score, int(g_current_day)));
+	regular_memory@ r = regular_memory(c.name, score, int(g_current_day));
+	r.kind = c.arch;
+	r.flavour = c.flavour;
+	r.remembered = people_worth_remembering(c);
+	g_regulars.insert_last(r);
 }
 
 /* What they say, at the counter, about last time. Empty for a first visit. */
@@ -534,18 +869,30 @@ string people_reviews_text() {
    4.  HOW BUSY IT IS
    ========================================================================= */
 
+/* The alpha's rush hours: eleven bands over the day, each with the rate of the
+   hour before it, so the shop has a shape rather than three spikes. The bands
+   at the ends of the night are the shop's own decision: only a store that is
+   open for them has anybody in them. */
+double people_rush_rate(int h) {
+	if (h == 0 or h == 1) return 1.2;
+	if (h >= 2 and h < 5) return 0.2;
+	if (h < 7) return 0.7;
+	if (h < 9) return 1.5;
+	if (h < 11) return 0.4;
+	if (h < 12) return 0.8;
+	if (h < 13) return 1.6;
+	if (h < 16) return 0.6;
+	if (h < 18) return 1.3;
+	if (h < 20) return 0.9;
+	return 0.3;
+}
+
 /* People per game hour, before the patience of the queue is taken into account. */
 double people_arrivals_per_hour() {
 	double base = 4.0 + (g_reputation - 3.0) * 2.6;   // reputation is the main lever
 	if (base < 0.5) base = 0.5;
 	int h = int(g_current_hour);
-	/* A morning rush, a lunch bump and an evening peak, the way a real forecourt
-	   shop trades. */
-	if (h >= 7 and h < 9)   base *= 1.5;
-	else if (h >= 12 and h < 14) base *= 1.4;
-	else if (h >= 17 and h < 20) base *= 1.6;
-	else if (h >= 21)       base *= 0.9;
-	else if (h < 7)         base *= 0.4;
+	base *= people_rush_rate(h);
 	if (g_hours_24h and (h >= 23 or h < 6)) base *= 0.5;
 	return base;
 }
@@ -640,18 +987,87 @@ bool people_basket_has_restricted(customer@ c) {
 
 int people_basket_lines(customer@ c) { return int(c.basket.length()); }
 
+/* How many lines they take. The flavour says it, and the kind says it when
+   there is no flavour to ask. */
+int people_flavour_lines(customer@ c) {
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl !is null) return random(fl.lines_min, fl.lines_max);
+	return people_basket_lines((@c is null) ? ARCH_REGULAR : c.arch);
+}
+
+/* ---- what a price does to them ---------------------------------------------
+   Up to fifteen per cent over the fair price nobody thinks about it, and no
+   dice are rolled at all. Past that the appetite falls away with the excess:
+   at a quarter over an ordinary customer keeps about three quarters of it, at
+   half over about a third, and it never falls below the floor. The curve and
+   the numbers are the alpha's own; the sensitivity is what makes the price
+   arguer stop at a shelf a big spender never looks twice at. */
+const double PRICE_FALLOFF = 3.0;
+const double PRICE_FLOOR = 0.05;
+const int    POCKET_OVERSHOOT_PCT = 10;
+
+double people_price_appetite(customer@ c, int over_pct) {
+	if (over_pct <= PRICE_TOLERANCE_PCT) return 1.0;
+	double excess = double(over_pct - PRICE_TOLERANCE_PCT) / 100.0;
+	double sens = 1.0;
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl !is null) sens = double(fl.price) / 100.0;
+	/* Somebody who has had a few drinks is not counting. */
+	int level = (@c is null) ? 0 : people_drunk_level(c);
+	if (level == 1) sens *= 0.8;
+	else if (level >= 2) sens *= 0.5;
+	double a = PRICE_FLOOR + (1.0 - PRICE_FLOOR) * exp(-PRICE_FALLOFF * excess * sens);
+	if (a < PRICE_FLOOR) a = PRICE_FLOOR;
+	if (a > 1.0) a = 1.0;
+	return a;
+}
+
+/* Nobody without a card fills a basket they cannot pay for. The alpha fits it
+   to the pocket before they leave the shelf: a second unit goes back first,
+   then the line itself, and up to a tenth over the pocket is allowed because
+   people do not count to the penny. Somebody with a working card has nothing
+   to fit, because the card is the rest of the money. */
+void people_fit_basket_to_pocket(customer@ c) {
+	if (@c is null) return;
+	if (c.has_card and !c.card_bad) return;
+	int pocket = c.wallet + (c.wallet * POCKET_OVERSHOOT_PCT) / 100;
+	if (c.drink_poured and c.drink_cost > 0) pocket -= c.drink_cost;
+	if (pocket < 0) pocket = 0;
+	int guard = 0;
+	while (c.basket.length() > 0 and people_basket_total(c) > pocket and guard < 60) {
+		guard++;
+		uint last = c.basket.length() - 1;
+		if (c.basket_qty[last] > 1) { c.basket_qty[last] -= 1; continue; }
+		c.basket.remove_at(last);
+		c.basket_qty.remove_at(last);
+	}
+}
+
+/* What they say about the shelves, in their own voice, once a visit. Nobody
+   narrates their own shopping; some of them do mutter. */
+void people_flavour_remark(customer@ c) {
+	if (@c is null or c.remarked) return;
+	people_flavour@ fl = people_flavour_of(c);
+	if (@fl is null or fl.remark.length() == 0) return;
+	if (random(1, 100) > 35) return;
+	c.remarked = true;
+	people_character_say(c, c.name + " " + fl.remark);
+}
+
 /* What somebody actually takes off a face. Price matters: over about fifteen
    percent above fair they buy fewer, and eventually nothing at all. */
 void people_fill_basket(customer@ c, int face) {
+	if (@c is null) return;
+	/* The money came in with them, rather than out of the basket. */
+	people_wallet_for(c);
 	/* A big spender takes a third of the face before they take anything else,
 	   and does not stand there choosing. */
 	if (c.arch == ARCH_BIGSPENDER and !c.cleared_shelf) {
 		people_clear_shelf(c, face);
-		c.wallet = people_wallet_for(c);
-		c.wallet_known = true;
+		people_fit_basket_to_pocket(c);
 		return;
 	}
-	int wanted = people_basket_lines(c.arch);
+	int wanted = people_flavour_lines(c);
 	int picked = 0;
 	int tries = 0;
 	while (picked < wanted and tries < wanted * 6) {
@@ -668,10 +1084,15 @@ void people_fill_basket(customer@ c, int face) {
 		if (p.stock <= 0) { c.bare_shelf_hits++; people_karen_note(c, 1); continue; }
 		int over = shop_price_over_fair(found);
 		if (over > PRICE_TOLERANCE_PCT) {
-			/* Further over, people buy fewer, and then stop buying that line. */
-			int refuse_chance = (over - PRICE_TOLERANCE_PCT) * 3;
-			if (refuse_chance > 90) refuse_chance = 90;
-			if (random(1, 100) <= refuse_chance) { c.price_complaints++; people_karen_note(c, 1); continue; }
+			/* The appetite is the chance they take the line at all. At a
+			   quarter over, a price arguer is down to a fifth of theirs, and a
+			   big spender's is a flat one: they never look. */
+			double appetite = people_price_appetite(c, over);
+			if (double(random(1, 10000)) / 10000.0 > appetite) {
+				c.price_complaints++;
+				people_karen_note(c, 1);
+				continue;
+			}
 		}
 		int qty = 1;
 		if (c.arch == ARCH_BIGSPENDER) qty = random(1, 4);
@@ -682,15 +1103,15 @@ void people_fill_basket(customer@ c, int face) {
 		c.basket_qty.insert_last(qty);
 		picked++;
 	}
-	/* Whatever is in their hand, which may not be enough for the basket they just
-	   filled. */
-	c.wallet = people_wallet_for(c);
-	c.wallet_known = true;
+	/* What is in their hand may not be enough for the basket they have just
+	   filled, so the basket is fitted to it before they turn round. */
+	people_fit_basket_to_pocket(c);
 	if (c.price_complaints > 0 and random(1, 100) <= 40) {
 		people_event(c, EV_PRICE);
-		people_character_say(c, c.name + " mutters about the prices. " + people_arch_name(c.arch)
+		people_character_say(c, c.name + " mutters about the prices. " + people_kind_word(c)
 			+ " does not think much of what you are charging.");
 	}
+	people_flavour_remark(c);
 }
 
 /* ==========================================================================
@@ -935,7 +1356,7 @@ bool people_emote_worth_saying(int e) {
 void people_emote_say(customer@ c, int e) {
 	if (@c is null) return;
 	string where = (c.state == CUST_QUEUEING) ? "in the queue" : ("in " + room_name(c.room));
-	people_character_say(c, c.name + ", " + people_arch_name(c.arch) + " " + where + ", "
+	people_character_say(c, c.name + ", " + people_kind_word(c) + " " + where + ", "
 		+ people_emote_word(e) + ".");
 }
 
@@ -950,23 +1371,8 @@ void people_emote_once(customer@ c, uint now) {
    A review is not a score, it is a small story with up to three things in it,
    in the order they happened. This is where those things are written down, as
    they happen, by whoever caused them. The eighth oldest is dropped, which is
-   far more than any review needs. */
-const int EV_SERVED       = 1;    // served, and quickly enough
-const int EV_ID_ASKED     = 2;    // carded, without a fuss
-const int EV_PAID_FOR     = 3;    // a stranger in the queue paid for it
-const int EV_CLEARED      = 4;    // they cleared a shelf themselves
-const int EV_PRICE        = 5;    // the price of the place
-const int EV_BARE         = 6;    // the shelf was empty
-const int EV_MESS         = 7;    // something on the floor
-const int EV_QUEUE_GAVE_UP= 8;    // stood in the queue and left
-const int EV_ID_REFUSED   = 9;    // not sold what they came for
-const int EV_SHORT_CHANGE = 10;   // had to come back for their own change
-const int EV_COULD_NOT_PAY= 11;   // the money in their hand did not cover it
-const int EV_BUMPED       = 12;   // walked into in an aisle
-const int EV_KAREN        = 13;   // made a fuss about it
-const int EV_DRUNK_FALL   = 14;   // went over in the aisle
-const int EV_DRINK_REFUSED= 15;   // refused the drink they asked for
-const int EV_CHATTED      = 16;   // somebody behind the counter talked to them
+   far more than any review needs. The codes themselves are at the top of the
+   file, because what a customer remembers is declared before it is used. */
 
 void people_event(customer@ c, int code) {
 	if (@c is null) return;
@@ -1426,12 +1832,97 @@ int people_pick_archetype() {
 	return ARCH_DRUNK;
 }
 
+/* ---- the town -------------------------------------------------------------
+   A shop on this road draws on a town of a few hundred people, and the faces
+   in it are the same faces. The alpha keeps a town of three hundred with a
+   floor under how many of a day's customers are people nobody has seen before,
+   and weighs the regulars by the square of their visits, so the couple who
+   come in every morning come in every morning and the man who came once in
+   March does not come back because of it. */
+
+/* How heavily a face is drawn: the square of their visits, capped so that one
+   person who comes in every day cannot own the door. */
+int people_town_weight(int visits) {
+	int v = visits;
+	if (v < 1) v = 1;
+	if (v > 30) v = 30;
+	int w = 1;
+	for (int i = 0; i < TOWN_LOYALTY_POWER; i++) w *= v;
+	return w;
+}
+
+int people_town_pick_resident() {
+	uint n = g_regulars.length();
+	if (n == 0) return -1;
+	int total = 0;
+	for (uint i = 0; i < n; i++) total += people_town_weight(g_regulars[i].visits);
+	if (total <= 0) return -1;
+	int r = random(1, total);
+	for (uint i = 0; i < n; i++) {
+		r -= people_town_weight(g_regulars[i].visits);
+		if (r <= 0) return int(i);
+	}
+	return int(n) - 1;
+}
+
+/* A name the shop has not already got. Two people may share a name in a town
+   of three hundred, but not in the shop's own memory of it. */
+string people_new_name() {
+	for (int tries = 0; tries < 12; tries++) {
+		string n = staff_pick_name();
+		if (people_regular_index(n) < 0) return n;
+	}
+	return staff_pick_name();
+}
+
+/* How fast they walk. The alpha's three bands: most of a crowd walks at a
+   clip, some amble, and a few are slow enough to be in the way. Drawn once, so
+   a fast walker stays fast for the whole visit, and in milliseconds, because
+   that is what the step timer counts. */
+int people_walk_pace() {
+	int r = random(1, 100);
+	if (r <= 65) return random(272, 408);
+	if (r <= 80) return random(408, 600);
+	return random(600, 800);
+}
+
 customer@ people_spawn(int arch = -1) {
-	if (arch < 0) arch = people_pick_archetype();
+	/* Who is it: somebody the shop knows, or somebody new? */
+	bool known = false;
+	int  ri = -1;
+	if (arch < 0) {
+		int residents = int(g_regulars.length());
+		int newcomer_pct = 100 - (residents * 100) / TOWN_SIZE;
+		if (newcomer_pct < TOWN_NEWCOMER_FLOOR) newcomer_pct = TOWN_NEWCOMER_FLOOR;
+		if (residents > 0 and random(1, 100) > newcomer_pct) {
+			ri = people_town_pick_resident();
+			if (ri >= 0) known = true;
+		}
+	}
+	customer@ c;
+	if (known) {
+		regular_memory@ r = g_regulars[uint(ri)];
+		arch = r.kind;
+		c = customer(r.name, arch);
+		c.flavour = r.flavour;
+		/* A regular from a save written before the flavours existed has a
+		   kind but no flavour; they are given one and it is kept. */
+		people_flavour@ f = people_flavour_of(c);
+		if (@f is null) {
+			c.flavour = people_pick_flavour(arch);
+			r.flavour = c.flavour;
+		}
+	} else {
+		if (arch < 0) arch = people_pick_archetype();
+		c = customer(people_new_name(), arch);
+		c.flavour = people_pick_flavour(arch);
+	}
+	/* How long a queue they will stand in, and how fast they walk. */
+	c.patience = people_patience_for(c);
+	c.step_ms = people_walk_pace();
 	/* A shoplifter is not a kind of person, it is something a person does. Teenagers
 	   are the worst for it, nobody's gran ever. */
 	bool lift = (random(1, 100) <= people_shoplift_chance(arch));
-	customer@ c = customer(staff_pick_name(), arch);
 	c.shoplifter = lift;
 	c.room = ROOM_SHOP;
 	c.x = 4.5; c.y = 1.5;          // just inside the front door
@@ -1610,7 +2101,7 @@ void people_tick(uint now) {
 		if (now < c.next_step_at) continue;
 
 		if (c.state == CUST_ARRIVING) {
-			c.next_step_at = now + uint(random(400, 800));
+			c.next_step_at = now + uint(c.step_ms);
 			float sx, sy;
 			people_shop_spot(c.face_target, sx, sy);
 			if (people_step_towards(c, sx, sy)) {
@@ -1625,20 +2116,21 @@ void people_tick(uint now) {
 				sfx_at(c.room, c.x, c.y, 0.0, A("rustle.mp3"), -18.0);
 			}
 		} else if (c.state == CUST_TO_DRINK) {
-			c.next_step_at = now + uint(random(400, 800));
+			c.next_step_at = now + uint(c.step_ms);
 			float dx, dy;
 			drink_spot_pos((c.drink_kind == DRINK_COFFEE) ? DRINK_COFFEE : DRINK_FOUNTAIN, dx, dy);
 			if (people_step_towards(c, dx, dy)) {
 				people_drink_at_station(c);
 				if (c.state == CUST_TO_DRINK) {
-					/* Re-check the wallet now that a poured drink is on the bill. */
-					c.wallet = people_wallet_for(c);
-					c.wallet_known = true;
+					/* The poured drink is on the bill now, so the basket is
+					   fitted to the pocket again, and somebody without a card
+					   puts something back before they reach the till. */
+					people_fit_basket_to_pocket(c);
 					c.state = CUST_TO_TILL;
 				}
 			}
 		} else if (c.state == CUST_TO_TILL) {
-			c.next_step_at = now + uint(random(400, 800));
+			c.next_step_at = now + uint(c.step_ms);
 			float qx, qy;
 			people_queue_spot(int(g_queue.length()), qx, qy);
 			if (people_step_towards(c, qx, qy)) {
@@ -1781,7 +2273,7 @@ void people_scan_occupancy() {
 		for (uint i = 0; i < g_customers.length() and shown < 8; i++) {
 			customer@ c = g_customers[i];
 			if (c.state == CUST_GONE or c.state == CUST_LEAVING) continue;
-			where += c.name + ", " + people_arch_name(c.arch) + ", " + people_state_word(c) + ", "
+			where += c.name + ", " + people_kind_word(c) + ", " + people_state_word(c) + ", "
 				+ dir_word(c.x - g_px, c.y - g_py) + ", "
 				+ tiles_away(int(dist(c.x, c.y, g_px, g_py) + 0.5));
 			string note = people_note_word(c);
@@ -1830,5 +2322,6 @@ void people_init() {
 	g_reputation = 3.0;
 	g_visits_today = 0;
 	g_visits_window = 0;
+	people_flavour_init();
 	log_line("people", "people module ready, reputation 3 stars");
 }

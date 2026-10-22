@@ -622,7 +622,7 @@ void main() {
 	/* show_window returns a game_window handle rather than a bool, despite what
 	   the reference page says. Without a window there is no keyboard input, so
 	   there is no game. */
-	game_window@ win = show_window("Store Express");
+	game_window@ win = show_window("Store Express v0.1");
 	if (@win is null) {
 		log_line("main", "FATAL: the window could not be created");
 		say_local("Store Express could not create its window, so it cannot run.", true);

@@ -751,10 +751,19 @@ void sale_money_in(int cents, bool from_card) {
 	board_note_sale(false, g_sale_id_checked);
 }
 
-/* Take the money. A card never opens the drawer, and can be declined. */
+/* Take the money. A card never opens the drawer, and can be declined. Whether
+   this card is one of the dead ones is the customer's own bad luck: the chance
+   comes from them, not from the till (see people_card_decline_chance). */
 void sale_take_card() {
+	customer@ c = g_sale_customer;
+	if (@c !is null and !c.has_card) {
+		sfx_ui(A("knock.wav"), -10.0);
+		say("They do not have a card on them. It is cash or nothing.", true);
+		return;
+	}
 	sfx_ui(A("id_card.ogg"), -6.0);
-	if (random(1, 100) <= 6) {
+	int bad = people_card_decline_chance(c);
+	if (random(1, 100) <= bad) {
 		sfx_ui(A("knock.wav"), -10.0);
 		say("The card is declined.", true);
 		/* They either pay cash instead, or have nothing else. */
@@ -764,7 +773,6 @@ void sale_take_card() {
 			return;
 		}
 		say("They have nothing else on them. The sale is off, and the goods go back on the shelves.", true);
-		customer@ c = g_sale_customer;
 		for (uint i = 0; i < g_sale_line.length(); i++) {
 			if (g_sale_scanned[i] != 1) continue;
 			product@ p = product_at(g_sale_line[i]);
@@ -1069,7 +1077,7 @@ void sale_open() {
 	sfx_ui(A("register.ogg"), -16.0, 700);
 	string s = "";
 	if (g_sale_fuel) {
-		s = c.name + ", " + people_arch_name(c.arch) + ", at the counter here for "
+		s = c.name + ", " + people_kind_word(c) + ", at the counter here for "
 			+ plural(c.fuel_litres, "litre", "litres") + " of unleaded on pump " + fuel_pump_word(c.fuel_pump)
 			+ ". At " + money(g_fuel_price) + " a litre that is " + money(c.fuel_litres * g_fuel_price) + ".";
 		if (g_sale_fuel_litres < c.fuel_litres) {
@@ -1079,7 +1087,7 @@ void sale_open() {
 			s += " The tank is dry, so there is nothing you can sell them.";
 		}
 	} else {
-		s = c.name + ", " + people_arch_name(c.arch) + ", at the counter with "
+		s = c.name + ", " + people_kind_word(c) + ", at the counter with "
 			+ plural(people_basket_lines(c), "line", "lines") + " in their basket.";
 	}
 	if (g_sale_id_needed) s += " Something in there is age restricted, so it needs an identification scan.";
@@ -1126,7 +1134,13 @@ void sale_page_build() {
 		return;
 	}
 	if (sale_all_scanned() and (int(g_sale_total) > 0)) {
-		p.add("Run the card for " + money(g_sale_total), ACT_SERVE_CARD);
+		/* Only somebody with a card in their pocket can have it run. Whether it
+		   goes through is the card's business, and the customer's: see
+		   sale_take_card. */
+		customer@ pc = g_sale_customer;
+		if (@pc is null or pc.has_card) {
+			p.add("Run the card for " + money(g_sale_total), ACT_SERVE_CARD);
+		}
 		if (sale_wallet_covers_all()) {
 			p.add("Take " + money(g_sale_total) + ", the exact money", ACT_SERVE_CASH_EXACT);
 			int rounded = ((g_sale_total / 500) + 1) * 500;
@@ -2144,7 +2158,9 @@ void save_game(bool quiet = false) {
 	   the score when they next walk in. */
 	for (uint i = 0; i < g_regulars.length(); i++) {
 		f.write("regular=" + g_regulars[i].name + "," + g_regulars[i].score + ","
-			+ g_regulars[i].day + "\r\n");
+			+ g_regulars[i].day + "," + g_regulars[i].visits + ","
+			+ g_regulars[i].kind + "," + g_regulars[i].flavour + ","
+			+ (g_regulars[i].remembered ? 1 : 0) + "\r\n");
 	}
 	for (uint i = 0; i < FACE_COUNT + 1; i++) { /* placeholder so the format is obvious */ break; }
 	f.close();
@@ -2283,7 +2299,17 @@ void load_game_from(int slot) {
 				if (p.cost < 1) p.cost = 1;
 			}
 		} else if (key == "regular" and parts.length() >= 3) {
-			g_regulars.insert_last(regular_memory(parts[0], parse_int(parts[1]), parse_int(parts[2])));
+			regular_memory@ r = regular_memory(parts[0], parse_int(parts[1]), parse_int(parts[2]));
+			/* A save written before the town existed carries a name, a score
+			   and a day and nothing else, and reads back as somebody who has
+			   been in once. */
+			if (parts.length() >= 4) r.visits = parse_int(parts[3]);
+			if (parts.length() >= 5) r.kind = parse_int(parts[4]);
+			if (parts.length() >= 6) r.flavour = parse_int(parts[5]);
+			if (parts.length() >= 7) r.remembered = (parse_int(parts[6]) != 0);
+			if (r.visits < 1) r.visits = 1;
+			if (r.kind < 0 or r.kind >= ARCH_COUNT) r.kind = ARCH_REGULAR;
+			g_regulars.insert_last(r);
 		} else if (key == "draft" and parts.length() >= 2) {
 			int idx = parse_int(parts[0]);
 			if (idx >= 0 and uint(idx) < g_draft_qty.length()) g_draft_qty[idx] = parse_int(parts[1]);
@@ -2485,6 +2511,9 @@ void world_new_day() {
 	staff_maybe_request();
 	staff_request_deadlines();
 	people_reputation_update();
+	/* A fortnight of not coming in is enough for the shop to forget a face it
+	   has only seen once or twice, unless there is something worth keeping. */
+	people_regular_forget(int(g_current_day));
 	shop_check_deliveries();
 	/* An open position brings five more applicants every Monday. */
 	if (int(g_current_day_of_week) == MONDAY) staff_applicant_morning();
