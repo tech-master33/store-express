@@ -522,6 +522,9 @@ class order_rec {
 }
 
 array<order_rec@> g_orders;
+/* Stock that came on the truck but would not fit on the shelves goes here,
+   to be restocked by staff later when there is room. */
+array<int> g_backroom_qty;
 
 /* The truck comes Monday at half past six. Anything ordered Monday through
    Saturday comes on the next Monday; order on Sunday and it waits a whole extra
@@ -642,16 +645,29 @@ void shop_cancel_order(int index) {
    anything that does not fit is paid for and lost. */
 void shop_delivery_arrive(order_rec@ o) {
 	int delivered = 0, wasted = 0, lines_short = 0;
+	if (g_backroom_qty.length() != g_catalog.length()) {
+		g_backroom_qty.resize(g_catalog.length());
+		for (uint i = 0; i < g_backroom_qty.length(); i++) g_backroom_qty[i] = 0;
+	}
 	for (uint i = 0; i < o.qty.length() and i < g_catalog.length(); i++) {
 		int qty = o.qty[i];
 		if (qty <= 0) continue;
 		product@ p = g_catalog[i];
 		int room = p.capacity - p.stock;
-		if (room <= 0) { wasted += qty; lines_short++; continue; }
+		if (room <= 0) {
+			g_backroom_qty[i] += qty;
+			wasted += qty;
+			lines_short++;
+			continue;
+		}
 		int take = (qty > room) ? room : qty;
 		p.stock += take;
 		delivered += take;
-		if (qty > take) { wasted += qty - take; lines_short++; }
+		if (qty > take) {
+			g_backroom_qty[i] += qty - take;
+			wasted += qty - take;
+			lines_short++;
+		}
 	}
 	shop_reset_sold_counters();
 	sfx_ui(A("truck.mp3"), -6.0);
@@ -1126,6 +1142,8 @@ void shop_init() {
 	catalog_build();
 	g_draft_qty.resize(0);
 	g_orders.resize(0);
+	g_backroom_qty.resize(g_catalog.length());
+	for (uint i = 0; i < g_backroom_qty.length(); i++) g_backroom_qty[i] = 0;
 	shop_market_clear();
 	log_line("shop", "shelves stocked: " + g_catalog.length() + " lines across "
 		+ FACE_COUNT + " faces");

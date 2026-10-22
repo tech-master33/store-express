@@ -276,6 +276,36 @@ string staff_cashier_quota_text(worker@ w) {
 	return s;
 }
 
+/* Smarter restocking for cashiers: if a shelf face is low and there's stock
+   in the backroom, restock a few units when things are quiet. */
+void staff_restocker_tick() {
+	worker@ w = staff_on_duty(ROLE_CASHIER);
+	if (@w is null) return;
+	if (g_backroom_qty.length() != g_catalog.length()) return;
+	if (int(g_current_minute) % 3 != 0) return;
+	int best = -1;
+	int need = 0;
+	for (uint i = 0; i < g_catalog.length(); i++) {
+		if (g_backroom_qty[i] <= 0) continue;
+		product@ p = g_catalog[i];
+		if (p.stock >= p.capacity) continue;
+		if (p.capacity <= 0) continue;
+		int room = p.capacity - p.stock;
+		if (room > 10) continue;
+		if (room > need) { need = room; best = int(i); }
+	}
+	if (best < 0) return;
+	product@ p = product_at(best);
+	if (@p is null) return;
+	int take = (g_backroom_qty[best] < 4) ? g_backroom_qty[best] : 4;
+	if (take < 1) take = 1;
+	if (take > need) take = need;
+	p.stock += take;
+	g_backroom_qty[best] -= take;
+	w.messes_mopped += 0;
+	diag("staff", w.name + " restocked " + take + " " + p.name + " from the backroom");
+}
+
 /* ---- what a cashier talks about when the till is quiet -------------------
    A shop with a person behind the counter is not the same shop as a till on its
    own, and the difference is mostly the talking. */

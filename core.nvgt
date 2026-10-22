@@ -43,6 +43,9 @@ const int OPEN_MINUTE  = 7 * 60;    // 7:00 am
 const int CLOSE_MINUTE = 22 * 60;   // 10:00 pm
 const int WAKE_MINUTE  = 6 * 60;    // you always wake at 6:00 am
 
+/* Save file format version. Bump when save layout changes. */
+const int SAVE_VERSION = 1;
+
 /* The clock the design calls for: one full shop day, 7 am to 10 pm, per real
    hour. That is 900 game minutes over 3600 real seconds, so a quarter of a game
    minute passes per real second. config.ini can override it. */

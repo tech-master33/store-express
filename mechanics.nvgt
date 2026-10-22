@@ -2073,6 +2073,7 @@ void save_game(bool quiet = false) {
 		return;
 	}
 	f.write("store_express_save=2\r\n");
+	f.write("save_version=" + SAVE_VERSION + "\r\n");
 	f.write("name=" + g_store_name + "\r\n");
 	f.write("slot=" + g_slot + "\r\n");
 	f.write("cash=" + g_cash + "\r\n");
@@ -2124,6 +2125,12 @@ void save_game(bool quiet = false) {
 	for (uint i = 0; i < g_draft_qty.length(); i++) {
 		if (g_draft_qty[i] <= 0) continue;
 		f.write("draft=" + i + "," + g_draft_qty[i] + "\r\n");
+	}
+	if (g_backroom_qty.length() == g_catalog.length()) {
+		for (uint i = 0; i < g_backroom_qty.length(); i++) {
+			if (g_backroom_qty[i] <= 0) continue;
+			f.write("backroom=" + i + "," + g_backroom_qty[i] + "\r\n");
+		}
 	}
 	/* The tank under the forecourt and the sign above it belong to this store,
 	   like the machines' speech: one line, litres, price, cost, and any tanker
@@ -2193,6 +2200,12 @@ int save_get_int(const string&in key, int fallback) {
 void load_game_from(int slot) {
 	g_slot = slot;
 	if (!file_exists(slot_path(slot))) { say("That slot is empty.", true); return; }
+	int sv = save_get_int("save_version", 0);
+	if (sv == 0) {
+		log_line("save", "save version not found, treating as legacy save");
+	} else if (sv != SAVE_VERSION) {
+		log_line("save", "save version " + sv + " vs current " + SAVE_VERSION);
+	}
 	g_store_name = save_get("name", "Store Express");
 	g_cash = save_get_int("cash", 250000);
 	g_arrears = save_get_int("arrears", 0);
@@ -2313,6 +2326,13 @@ void load_game_from(int slot) {
 		} else if (key == "draft" and parts.length() >= 2) {
 			int idx = parse_int(parts[0]);
 			if (idx >= 0 and uint(idx) < g_draft_qty.length()) g_draft_qty[idx] = parse_int(parts[1]);
+		} else if (key == "backroom" and parts.length() >= 2) {
+			if (g_backroom_qty.length() != g_catalog.length()) {
+				g_backroom_qty.resize(g_catalog.length());
+				for (uint i = 0; i < g_backroom_qty.length(); i++) g_backroom_qty[i] = 0;
+			}
+			int idx = parse_int(parts[0]);
+			if (idx >= 0 and uint(idx) < g_backroom_qty.length()) g_backroom_qty[idx] = parse_int(parts[1]);
 		} else if (key == "fuel" and parts.length() >= 5) {
 			g_fuel_litres = parse_int(parts[0]);
 			g_fuel_price = parse_int(parts[1]);
@@ -2563,6 +2583,7 @@ void clock_advance_one_minute() {
 	shop_check_deliveries();
 	mess_tick_minute();
 	staff_janitor_minute_tick();
+	staff_restocker_tick();
 	trouble_tick_minute();
 	if (int(g_current_minute) == 0) world_hour_struck();
 	if (g_in_jail) jail_step();
